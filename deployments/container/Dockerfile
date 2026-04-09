@@ -101,7 +101,7 @@ ENV BASH_STATIC_GIT_REF=${BASH_STATIC_GIT_REF}
 WORKDIR /bashbuild
 COPY hack/build-bash-static.sh .
 RUN bash /bashbuild/build-bash-static.sh
-RUN cd /bashbuild/bash-static/releases && ./bash*-static --version && mv bash-*-static /bashbuild/bash && file /bashbuild/bash
+RUN cd /bashbuild/bash-static/releases && mv bash-*-static /bashbuild/bash && file /bashbuild/bash
 
 # option 2:
 # FROM registry.k8s.io/nv-dra-driver-gpu/nvidia-dra-driver-gpu:v25.12.0-dev-839e966a AS bash
