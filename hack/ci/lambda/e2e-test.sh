@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Copyright The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# e2e-test.sh -- DRA GPU e2e tests on Lambda Cloud.
+# Sources shared Lambda CI library from test-infra (available via Prow extra_refs).
+#
+# Required env: LAMBDA_API_KEY_FILE, JOB_NAME, BUILD_ID, ARTIFACTS (set by Prow)
+# Optional env: GPU_TYPE (default: gpu_1x_a10), K8S_VERSION (default: latest stable)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Locate shared library from test-infra checkout (Prow extra_refs).
+TESTINFRA_DIR="$(go env GOPATH)/src/k8s.io/test-infra"
+source "${TESTINFRA_DIR}/experiment/lambda/lib/lambda-common.sh"
+
+# --- Launch Lambda instance ---
+lambda_init_and_launch
+
+# --- Download k8s binaries ---
+K8S_VERSION="${K8S_VERSION:-}"
+if [ -n "${K8S_VERSION}" ]; then
+  lambda_download_k8s /tmp/k8s-bins "${K8S_VERSION}"
+else
+  lambda_download_k8s /tmp/k8s-bins
+fi
+
+# --- Compute git metadata before transfer ---
+# The remote host needs GIT_COMMIT_SHORT for the BATS runner image tag.
+# Compute it here where we have a real git repo.
+GIT_COMMIT_SHORT="$(git rev-parse --short=8 HEAD)"
+export GIT_COMMIT_SHORT
+
+# --- Transfer artifacts ---
+# Exclude .git (GIT_COMMIT_SHORT is passed explicitly), .claude, dist, _output.
+# vendor/ is included (Dockerfile uses -mod=vendor).
+lambda_rsync_to /tmp/k8s-bins/ "ubuntu@${LAMBDA_INSTANCE_IP}:/tmp/k8s-bins/"
+lambda_rsync_to --exclude=.git --exclude=.claude --exclude=dist --exclude=_output \
+  ./ "ubuntu@${LAMBDA_INSTANCE_IP}:/tmp/dra-driver-nvidia-gpu/"
+
+# --- Setup cluster (generic, from test-infra) ---
+# Pass DRA-specific options as env vars: CDI for device injection, Docker for
+# BATS harness, node label for the Helm chart's DaemonSet affinity.
+# `env VAR=val` is used because `bash -s VAR=val` makes them positional args, not env.
+lambda_remote env \
+  ENABLE_CDI=true \
+  ENABLE_DOCKER=true \
+  NODE_LABELS=nvidia.com/gpu.present=true \
+  bash -s < "${TESTINFRA_DIR}/experiment/lambda/lib/setup-k8s-node.sh"
+
+# --- Build driver image on Lambda and load into containerd ---
+lambda_remote bash -s <<EOF
+set -euxo pipefail
+cd /tmp/dra-driver-nvidia-gpu
+docker buildx use default 2>/dev/null || true
+make -f deployments/container/Makefile build DOCKER_BUILD_OPTIONS="--load" CI=true
+IMAGE_REF=\$(make -f deployments/container/Makefile -s print-IMAGE)
+docker save "\${IMAGE_REF}" | sudo ctr -n k8s.io images import -
+echo "Image loaded: \${IMAGE_REF}"
+EOF
+
+# --- Detect GPU capabilities for dynamic test filtering ---
+GPU_COUNT=$(lambda_remote nvidia-smi -L | wc -l)
+echo "Detected ${GPU_COUNT} GPU(s) on Lambda instance (type: ${LAMBDA_GPU_TYPE})"
+
+# Build filter tags based on what the instance can handle.
+FILTER='!version-specific'
+if [ "${GPU_COUNT}" -lt 2 ]; then
+  FILTER="${FILTER},!multi-gpu"
+fi
+# busGrind is slow and can hang on V100/A10 — only run on faster GPUs.
+case "${LAMBDA_GPU_TYPE}" in
+  *v100*|*a10) FILTER="${FILTER},!gpu-busgrind" ;;
+esac
+echo "Test filter: ${FILTER}"
+
+# --- Run BATS tests ---
+# Tests local artifacts: local chart + local image built from the PR.
+# This is a real presubmit -- it validates the repo's code, chart, and specs.
+lambda_remote bash -s <<EOF
+set -euxo pipefail
+cd /tmp/dra-driver-nvidia-gpu
+
+# Build the BATS runner image.
+# GIT_COMMIT_SHORT was computed on the Prow pod; pass it explicitly so
+# versions.mk doesn't need a functional .git directory on the remote host.
+docker buildx use default 2>/dev/null || true
+make -f tests/bats/Makefile runner-image GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}
+
+export KUBECONFIG=\$HOME/.kube/config
+export CI=true
+export TEST_NVIDIA_DRIVER_ROOT=/
+export TEST_CHART_LOCAL=true
+export SKIP_CLEANUP=true
+export DISABLE_COMPUTE_DOMAINS=true
+export TEST_FILTER_TAGS='${FILTER}'
+export GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}
+
+make -f tests/bats/Makefile tests-gpu-single GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}
+EOF
+
+# --- Collect artifacts ---
+# CI=true in the Makefile sets TMPDIR=$(CURDIR), so artifacts land under the repo dir.
+lambda_collect_artifacts /tmp/dra-driver-nvidia-gpu/k8s-dra-driver-gpu-tests-out-ubuntu/
+
+# Cluster debug info
+lambda_remote bash -s <<'DEBUGEOF' > "${ARTIFACTS}/cluster-debug.txt" 2>&1 || true
+export KUBECONFIG=$HOME/.kube/config
+echo "=== nvidia-smi ===" && nvidia-smi
+echo "=== nvidia driver version ===" && cat /sys/module/nvidia/version
+echo "=== nodes ===" && kubectl get nodes -o wide
+echo "=== pods (all namespaces) ===" && kubectl get pods -A -o wide
+echo "=== pod describe (driver namespace) ===" && kubectl describe pods -n dra-driver-nvidia-gpu
+echo "=== resourceslices ===" && kubectl get resourceslices -A -o yaml
+echo "=== deviceclasses ===" && kubectl get deviceclass -o yaml
+echo "=== resourceclaims ===" && kubectl get resourceclaims -A -o yaml
+echo "=== events ===" && kubectl get events -A --sort-by=.lastTimestamp
+echo "=== kubelet-plugin logs (gpus) ===" && kubectl logs -n dra-driver-nvidia-gpu -l dra-driver-nvidia-gpu-component=kubelet-plugin -c gpus --tail=500
+echo "=== kubelet-plugin logs (compute-domains) ===" && kubectl logs -n dra-driver-nvidia-gpu -l dra-driver-nvidia-gpu-component=kubelet-plugin -c compute-domains --tail=200
+echo "=== controller logs ===" && kubectl logs -n dra-driver-nvidia-gpu -l dra-driver-nvidia-gpu-component=controller --tail=200
+echo "=== containerd config ===" && sudo grep -E "enable_cdi|default_runtime|nvidia" /etc/containerd/config.toml
+echo "=== kubelet logs (last 100 lines) ===" && sudo journalctl -u kubelet --no-pager -n 100
+DEBUGEOF

@@ -5,6 +5,9 @@ setup_file () {
   load 'helpers.sh'
   _common_setup
   local _iargs=("--set" "logVerbosity=6")
+  if [ "${DISABLE_COMPUTE_DOMAINS:-}" = "true" ]; then
+    _iargs+=("--set" "resources.computeDomains.enabled=false")
+  fi
   iupgrade_wait "${TEST_CHART_REPO}" "${TEST_CHART_VERSION}" _iargs
 }
 
@@ -43,7 +46,7 @@ bats::on_failure() {
 }
 
 
-# bats test_tags=fastfeedback
+# bats test_tags=fastfeedback,multi-gpu
 @test "GPUs: 2 pod(s), 1 full GPU each" {
   local _specpath="tests/bats/specs/gpu-2pods-2gpus.yaml"
 
@@ -120,7 +123,7 @@ bats::on_failure() {
 
 
 
-# bats test_tags=fastfeedback
+# bats test_tags=fastfeedback,version-specific
 @test "GPUs: inspect device attributes in resource slice (gpu)" {
   local reference=(
     "architecture"

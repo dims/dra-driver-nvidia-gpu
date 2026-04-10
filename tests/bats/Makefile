@@ -103,7 +103,9 @@ DOCKER_ENVS = \
 	--env TEST_GPU_STRESS_DELAY=$(TEST_GPU_STRESS_DELAY) \
 	--env TEST_CRD_UPGRADE_TARGET_GIT_REF=$(TEST_CRD_UPGRADE_TARGET_GIT_REF) \
 	--env TEST_NVIDIA_DRIVER_ROOT=$(TEST_NVIDIA_DRIVER_ROOT) \
-	--env TEST_EXPECTED_IMAGE_SPEC_SUBSTRING=$(TEST_EXPECTED_IMAGE_SPEC_SUBSTRING)
+	--env TEST_EXPECTED_IMAGE_SPEC_SUBSTRING=$(TEST_EXPECTED_IMAGE_SPEC_SUBSTRING) \
+	--env SKIP_CLEANUP=$(SKIP_CLEANUP) \
+	--env DISABLE_COMPUTE_DOMAINS=$(DISABLE_COMPUTE_DOMAINS)
 
 DOCKER_UID := $(shell id -u)
 DOCKER_GID := $(shell id -g)
@@ -126,8 +128,12 @@ define RUN_BATS
 	docker run --rm $(DOCKER_RUN_FLAGS) $(DOCKER_MOUNTS) $(DOCKER_ENVS) \
 	  -u $(DOCKER_USER) --entrypoint /bin/bash $(BATS_IMAGE) \
 	  -c "set -ex; cd /cwd; stat $${_RUNDIR}; cat /kubeconfig | head -n2; kubectl get nodes; \
-	      echo 'Running k8s cluster cleanup (invasive)...'; \
-	      bash tests/bats/cleanup-from-previous-run.sh 2>&1 | tee -a $${_RUNDIR}/cleanup.outerr; \
+	      if [ \"\$${SKIP_CLEANUP:-}\" != 'true' ]; then \
+	          echo 'Running k8s cluster cleanup (invasive)...'; \
+	          bash tests/bats/cleanup-from-previous-run.sh 2>&1 | tee -a $${_RUNDIR}/cleanup.outerr; \
+	      else \
+	          echo 'Skipping cleanup (SKIP_CLEANUP=true, ephemeral instance)'; \
+	      fi; \
 	      set +x; echo '--- STARTING TEST SUITE ---'; set -x; \
 	      TMPDIR="$${_RUNDIR}" bats $(BATS_ARGS) $(1) \
       "
@@ -161,7 +167,15 @@ runner-image:
 # suite/file 'setup' in bats, but we'd lose output on success). During dev, you
 # may want to add --show-output-of-passing-tests (and read bats docs for other
 # cmdline args).
-.PHONY: tests-gpu tests-cd
+.PHONY: tests-gpu tests-gpu-single tests-cd
+
+# Single-GPU-safe subset. Suitable for CI environments with one GPU and no
+# GPU Operator (e.g., Lambda Cloud). Excludes test_basics.bats (expects GPU
+# Operator + clean state), MIG, stress, and upgrade tests.
+tests-gpu-single: runner-image
+	$(call RUN_BATS, \
+		tests/bats/test_gpu_basic.bats \
+		tests/bats/test_gpu_cuda_workloads.bats)
 
 # Run a subset covering mainly the GPU plugin
 tests-gpu: runner-image

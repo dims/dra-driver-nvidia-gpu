@@ -83,8 +83,10 @@ iupgrade_wait() {
   kubectl get pods -n dra-driver-nvidia-gpu
 
   # That one should be obvious now, but make that guarantee explicit for
-  # consuming tests.
-  kubectl wait --for=condition=READY pods -A -l dra-driver-nvidia-gpu-component=controller --timeout=10s
+  # consuming tests. Skip when compute domains are disabled (no controller deployment).
+  if [ "${DISABLE_COMPUTE_DOMAINS:-}" != "true" ]; then
+    kubectl wait --for=condition=READY pods -A -l dra-driver-nvidia-gpu-component=controller --timeout=10s
+  fi
   # maybe: check version on labels (to confirm that we set labels correctly)
   log "iupgrade_wait: done"
 }
