@@ -18,9 +18,11 @@
 export TEST_HELM_RELEASE_NAME="dra-driver-nvidia-gpu-batssuite"
 
 
-# Extend PATH, for example for the `nvmm` utility.
+# Extend PATH for the `nvmm` utility. NVMM_PATH allows overriding the
+# directory containing `nvmm` — set it to `tests/bats/lib/lambda` on
+# Lambda CI (no GPU Operator) so the no-op stub is used instead.
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-export PATH="${SELF_DIR}/lib:${PATH}"
+export PATH="${NVMM_PATH:-${SELF_DIR}/lib}:${PATH}"
 
 
 _common_setup() {

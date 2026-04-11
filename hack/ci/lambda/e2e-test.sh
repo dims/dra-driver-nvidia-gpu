@@ -95,6 +95,17 @@ case "${LAMBDA_GPU_TYPE}" in
 esac
 echo "Test filter: ${FILTER}, compute domains disabled: ${DISABLE_CD}"
 
+# --- Pre-cleanup: MIG teardown on host ---
+# Run MIG cleanup directly on the host where nvidia-smi is available.
+# The BATS Docker container doesn't have nvidia-smi, so cleanup-from-previous-run.sh
+# uses the lambda/nvmm no-op stub. We handle MIG cleanup here instead.
+# IMPORTANT: Skip on A100 — disabling MIG mode on cloud VM A100s can put the
+# GPU in an unrecoverable state (#883).
+case "${LAMBDA_GPU_TYPE}" in
+  *a100*) echo "Skipping MIG cleanup on A100" ;;
+  *) lambda_remote sh -c 'nvidia-smi mig -dci 2>/dev/null; nvidia-smi mig -dgi 2>/dev/null; nvidia-smi -mig 0 2>/dev/null; echo "MIG cleanup done"' || true ;;
+esac
+
 # --- Run BATS tests ---
 # Tests local artifacts: local chart + local image built from the PR.
 # This is a real presubmit -- it validates the repo's code, chart, and specs.
@@ -112,10 +123,11 @@ export KUBECONFIG=\$HOME/.kube/config
 export CI=true
 export TEST_NVIDIA_DRIVER_ROOT=/
 export TEST_CHART_LOCAL=true
-export SKIP_CLEANUP=true
 export DISABLE_COMPUTE_DOMAINS=${DISABLE_CD}
 export TEST_FILTER_TAGS='${FILTER}'
 export GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}
+# Use lambda nvmm stub (no GPU Operator). MIG cleanup is handled above on the host.
+export NVMM_PATH=/cwd/tests/bats/lib/lambda
 
 make -f tests/bats/Makefile tests-gpu-single GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}
 EOF
