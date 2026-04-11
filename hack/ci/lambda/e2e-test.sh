@@ -71,6 +71,30 @@ docker save "\${IMAGE_REF}" | sudo ctr -n k8s.io images import -
 echo "Image loaded: \${IMAGE_REF}"
 EOF
 
+# --- Detect GPU capabilities for dynamic test filtering ---
+GPU_COUNT=$(lambda_remote nvidia-smi -L | wc -l)
+echo "Detected ${GPU_COUNT} GPU(s) on Lambda instance (type: ${LAMBDA_GPU_TYPE})"
+
+# Build filter tags based on what the instance can handle.
+FILTER='!version-specific'
+if [ "${GPU_COUNT}" -lt 2 ]; then
+  FILTER="${FILTER},!multi-gpu"
+fi
+# busGrind is slow and can hang on V100/A10 — only run on faster GPUs.
+case "${LAMBDA_GPU_TYPE}" in
+  *v100*|*a10) FILTER="${FILTER},!gpu-busgrind" ;;
+esac
+
+# Detect whether compute domains should be disabled.
+# Compute domains (IMEX channels) require NVSwitch fabric with fabric manager,
+# which is only available on GB200/GB300 NVL systems. On all other GPU types,
+# disable compute domains to avoid the compute-domains container crashing.
+DISABLE_CD=true
+case "${LAMBDA_GPU_TYPE}" in
+  *gb200*|*gb300*|*b200*) DISABLE_CD=false ;;
+esac
+echo "Test filter: ${FILTER}, compute domains disabled: ${DISABLE_CD}"
+
 # --- Run BATS tests ---
 # Tests local artifacts: local chart + local image built from the PR.
 # This is a real presubmit -- it validates the repo's code, chart, and specs.
@@ -89,10 +113,8 @@ export CI=true
 export TEST_NVIDIA_DRIVER_ROOT=/
 export TEST_CHART_LOCAL=true
 export SKIP_CLEANUP=true
-export DISABLE_COMPUTE_DOMAINS=true
-# !multi-gpu: skip 2-GPU test on single-GPU instances
-# !version-specific: skip attribute list test (attributes depend on host NVIDIA driver version)
-export TEST_FILTER_TAGS='!multi-gpu,!version-specific'
+export DISABLE_COMPUTE_DOMAINS=${DISABLE_CD}
+export TEST_FILTER_TAGS='${FILTER}'
 export GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}
 
 make -f tests/bats/Makefile tests-gpu-single GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}
