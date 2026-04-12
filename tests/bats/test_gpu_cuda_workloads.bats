@@ -32,8 +32,9 @@ bats::on_failure() {
   local _podname="pod-cuda-demo"
 
   kubectl apply -f "${_specpath}"
-  # Longer timeout — installs cuda-demo-suite package at runtime
-  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pods "${_podname}" --timeout=600s
+  # Longer timeout — installs cuda-demo-suite package at runtime.
+  # arm64 (GH200) apt mirrors can be significantly slower than amd64.
+  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pods "${_podname}" --timeout=900s
 
   run kubectl logs "${_podname}"
   assert_output --partial "NVIDIA-SMI"
@@ -74,4 +75,56 @@ bats::on_failure() {
 
   kubectl delete -f "${_specpath}"
   kubectl wait --for=delete "job/${_jobname}" --timeout=30s
+}
+
+
+# bats test_tags=gpu-workloads,multi-gpu
+@test "GPUs: Deployment with 2 replicas gets distinct GPUs simultaneously" {
+  local _specpath="tests/bats/specs/gpu-job-rct-parallel.yaml"
+  local _deployname="gpu-deploy-parallel"
+
+  kubectl apply -f "${_specpath}"
+
+  # Deployment Available condition proves 2 replicas are Running simultaneously,
+  # each holding a distinct GPU via its own ResourceClaimTemplate instance.
+  kubectl wait --for=condition=Available "deployment/${_deployname}" --timeout=60s
+
+  # Verify 2 ready replicas
+  local ready
+  ready=$(kubectl get deployment "${_deployname}" -o jsonpath='{.status.readyReplicas}')
+  [ "${ready}" -eq 2 ]
+
+  # Collect GPU UUIDs from each pod and verify they are different
+  local -a uuids=()
+  for pod in $(kubectl get pods -l "app=${_deployname}" -o name); do
+    local logs
+    logs=$(kubectl logs "${pod}")
+    echo "${logs}" | grep -q "UUID: GPU-"
+    local uid
+    uid=$(echo "${logs}" | grep -o "GPU-[a-f0-9-]*")
+    uuids+=("${uid}")
+  done
+  [ "${#uuids[@]}" -eq 2 ]
+  assert_not_equal "${uuids[0]}" "${uuids[1]}"
+
+  kubectl delete -f "${_specpath}"
+  kubectl wait --for=delete pods -l "app=${_deployname}" --timeout=30s
+}
+
+
+# bats test_tags=gpu-workloads,gpu-busgrind
+@test "GPUs: busGrind memory bandwidth stress test" {
+  local _specpath="tests/bats/specs/gpu-cuda-busgrind.yaml"
+  local _podname="pod-cuda-busgrind"
+
+  kubectl apply -f "${_specpath}"
+  # busGrind can take several minutes on slower GPUs
+  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pods "${_podname}" --timeout=900s
+
+  run kubectl logs "${_podname}"
+  assert_output --partial "NVIDIA-SMI"
+  assert_output --partial "busGrind"
+
+  kubectl delete -f "${_specpath}"
+  kubectl wait --for=delete pods "${_podname}" --timeout=30s
 }
