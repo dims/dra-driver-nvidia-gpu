@@ -13,6 +13,9 @@ setup_file () {
   kubectl delete resourceslices.resource.k8s.io --all
 
   local _iargs=("--set" "logVerbosity=6" "--set" "featureGates.DynamicMIG=true")
+  if [ "${DISABLE_COMPUTE_DOMAINS:-}" = "true" ]; then
+    _iargs+=("--set" "resources.computeDomains.enabled=false")
+  fi
   iupgrade_wait "${TEST_CHART_REPO}" "${TEST_CHART_VERSION}" _iargs
   run kubectl logs \
     -l dra-driver-nvidia-gpu-component=kubelet-plugin \
@@ -57,7 +60,7 @@ confirm_mig_mode_disabled_all_nodes() {
 }
 
 
-# bats test_tags=fastfeedback
+# bats test_tags=fastfeedback,dynmig,version-specific
 @test "DynMIG: inspect device attributes in resource slice (gpu)" {
   local reference=(
     "architecture"
@@ -80,7 +83,7 @@ confirm_mig_mode_disabled_all_nodes() {
 }
 
 
-# bats test_tags=fastfeedback
+# bats test_tags=fastfeedback,dynmig,version-specific
 @test "DynMIG: inspect device attributes in resource slice (mig)" {
   local reference=(
     "architecture"
@@ -104,7 +107,7 @@ confirm_mig_mode_disabled_all_nodes() {
 }
 
 
-# bats test_tags=fastfeedback
+# bats test_tags=fastfeedback,dynmig
 @test "DynMIG: 1 pod, 1 MIG" {
   confirm_mig_mode_disabled_all_nodes
   kubectl apply -f tests/bats/specs/gpu-simple-mig.yaml
@@ -127,7 +130,7 @@ confirm_mig_mode_disabled_all_nodes() {
 }
 
 
-# bats test_tags=fastfeedback
+# bats test_tags=fastfeedback,dynmig
 @test "DynMIG: 1 pod, 2 containers (1 MIG each)" {
   confirm_mig_mode_disabled_all_nodes
 
@@ -159,9 +162,12 @@ confirm_mig_mode_disabled_all_nodes() {
 }
 
 
-# bats test_tags=fastfeedback
+# bats test_tags=fastfeedback,dynmig
 @test "DynMIG: 1 pod, 1 MIG + TimeSlicing config" {
   local _iargs=("--set" "logVerbosity=6" "--set" "featureGates.DynamicMIG=true" "--set" "featureGates.TimeSlicingSettings=true")
+  if [ "${DISABLE_COMPUTE_DOMAINS:-}" = "true" ]; then
+    _iargs+=("--set" "resources.computeDomains.enabled=false")
+  fi
   iupgrade_wait "${TEST_CHART_REPO}" "${TEST_CHART_VERSION}" _iargs
 
   confirm_mig_mode_disabled_all_nodes

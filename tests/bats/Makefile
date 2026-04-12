@@ -170,13 +170,14 @@ runner-image:
 # cmdline args).
 .PHONY: tests-gpu tests-gpu-single tests-cd
 
-# Single-GPU-safe subset. Suitable for CI environments with one GPU and no
-# GPU Operator (e.g., Lambda Cloud). Excludes test_basics.bats (expects GPU
-# Operator + clean state), MIG, stress, and upgrade tests.
+# Lambda CI subset. Excludes test_basics.bats (expects GPU Operator + clean
+# state), static MIG, stress, and upgrade tests. DynMIG tests are included
+# but tagged 'dynmig' — auto-skipped on non-MIG GPUs via TEST_FILTER_TAGS.
 tests-gpu-single: runner-image
 	$(call RUN_BATS, \
 		tests/bats/test_gpu_basic.bats \
-		tests/bats/test_gpu_cuda_workloads.bats)
+		tests/bats/test_gpu_cuda_workloads.bats \
+		tests/bats/test_gpu_dynmig.bats)
 
 # Run a subset covering mainly the GPU plugin
 tests-gpu: runner-image

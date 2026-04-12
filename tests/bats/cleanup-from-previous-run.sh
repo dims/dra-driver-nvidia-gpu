@@ -104,7 +104,8 @@ set -e
 bash tests/bats/clean-state-dirs-all-nodes.sh
 
 # Remove any stray MIG devices and disable MIG mode on all nodes.
-nvmm all sh -c 'nvidia-smi mig -dci; nvidia-smi mig -dgi; nvidia-smi -mig 0'
+# Non-fatal: MIG may not be supported on all GPU types (V100, A10).
+nvmm all sh -c 'nvidia-smi mig -dci; nvidia-smi mig -dgi; nvidia-smi -mig 0' || echo "nvmm MIG cleanup skipped (non-fatal)"
 
 set +x
 echo "cleanup: done"

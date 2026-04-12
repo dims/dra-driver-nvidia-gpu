@@ -84,11 +84,13 @@ fi
 case "${LAMBDA_GPU_TYPE}" in
   *v100*|*a10) FILTER="${FILTER},!gpu-busgrind" ;;
 esac
+# Dynamic MIG requires MIG-capable GPUs (A100/H100/GH200/B200).
+case "${LAMBDA_GPU_TYPE}" in
+  *a100*|*h100*|*gh200*|*b200*) ;;
+  *) FILTER="${FILTER},!dynmig" ;;
+esac
 
 # Detect whether compute domains should be disabled.
-# Compute domains (IMEX channels) require NVSwitch fabric with fabric manager,
-# which is only available on GB200/GB300 NVL systems. On all other GPU types,
-# disable compute domains to avoid the compute-domains container crashing.
 DISABLE_CD=true
 case "${LAMBDA_GPU_TYPE}" in
   *gb200*|*gb300*|*b200*) DISABLE_CD=false ;;
@@ -97,8 +99,8 @@ echo "Test filter: ${FILTER}, compute domains disabled: ${DISABLE_CD}"
 
 # --- Pre-cleanup: MIG teardown on host ---
 # Run MIG cleanup directly on the host where nvidia-smi is available.
-# The BATS Docker container doesn't have nvidia-smi, so cleanup-from-previous-run.sh
-# uses the lambda/nvmm no-op stub. We handle MIG cleanup here instead.
+# The BATS Docker container uses the lambda nvmm stub (no-op)
+# for nvmm calls within tests. We handle MIG cleanup here instead.
 # IMPORTANT: Skip on A100 — disabling MIG mode on cloud VM A100s can put the
 # GPU in an unrecoverable state (#883).
 case "${LAMBDA_GPU_TYPE}" in
