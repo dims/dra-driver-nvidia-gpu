@@ -100,14 +100,20 @@ tar -xzf "${RELEASE_VERSION}.tar.gz"
 helm template nvidia-dra-driver-gpu \
     "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu" \
     --namespace nvidia-dra-driver-gpu \
+    --api-versions resource.k8s.io/v1 \
+    --set controllerOwnedCDCliques.admissionEnabled=true \
     --set featureGates.ControllerOwnedCDCliques=true \
     --set kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled=true \
     --set controller.leaderElection.enabled=true \
     --set-json 'controllerOwnedCDCliques.canaryNamespaces=["my-canary-namespace"]' \
+    --show-only templates/controllerownedcdc-installation.yaml \
     --show-only templates/validatingadmissionpolicy.yaml \
     --show-only templates/validatingadmissionpolicybinding.yaml \
     > controller-owned-admission.yaml
 kubectl apply -f controller-owned-admission.yaml
+
+# The rendered objects carry this release's Helm ownership metadata. The
+# later ordinary Helm upgrade adopts them without --take-ownership.
 
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquesnapshots.yaml"
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquereservations.yaml"
@@ -161,23 +167,90 @@ controller:
   leaderElection:
     enabled: true
 controllerOwnedCDCliques:
+  admissionEnabled: true
   canaryNamespaces:
   - my-canary-namespace
 ```
 
-Alpha supports one chart installation in one fixed primary driver namespace.
+Alpha requires Kubernetes v1.34 or newer with the served
+`resource.k8s.io/v1` API. Kubernetes v1.32/v1.33 beta DRA APIs remain supported
+by legacy-v1 only. Alpha supports one chart installation in one fixed primary
+driver namespace and is not supported on OpenShift until SCC bindings are
+covered by the same immutable admission boundary.
 Do not install another release, rename or move the controller ServiceAccount,
 or migrate the control namespace while controller-owned admission policies or
 state exist. The policies are cluster-scoped and authorize the exact release
 ServiceAccount identities; multiple releases would overwrite or conjunctively
 conflict with one another. Additional driver namespaces remain legacy-only.
 
+The chart enforces this boundary with a fixed, zero-permission ClusterRole
+named `controller-owned-cdc-installation.dra-driver-nvidia-gpu`. It records the
+Helm release, primary control namespace, controller ServiceAccount, and kubelet
+plugin ServiceAccount as immutable annotations and carries the canary namespace
+allowlist as parameters for every safety policy. `helm install`/`helm upgrade`
+uses a live lookup and rejects a different release or namespace before
+rendering namespaced resources. The installation policy denies identity changes
+or deletion of the ClusterRole marker, and the controller checks the recorded
+identity at startup. Client-only `helm template` cannot perform a live lookup.
+Do not use `helm template | kubectl apply` to install or upgrade the chart:
+multi-document apply is not transactional. The retained RBAC-binding policy
+prevents an offline second render from transferring the protected controller or
+kubelet ClusterRoles and the protected namespaced Roles/RoleBindings. It may
+still leave unprivileged partial objects. Use live
+`helm upgrade --atomic` for the chart after the admission-first bootstrap.
+
+Before enabling `admissionEnabled` on brownfield, inventory and remove every
+other driver release, controller/kubelet workload, and associated RBAC. The
+guard prevents a new competing installation; it does not revoke privileges
+which a different legacy release already holds. The primary control namespace
+is a trusted administrative namespace: do not grant tenants permission to
+create Pods, Jobs, ReplicaSets, or other workloads using the protected ServiceAccounts.
+Also inventory the two new GVRs and reserved ComputeDomain/Node metadata before
+enabling admission. A prior default install may have installed the CRDs while
+the opt-in policies were disabled; preexisting protocol markers, reservations,
+snapshots, isolation labels, or controller attestations must be absent or
+explicitly audited before Phase 2.
+
+Upgrading the existing release in place with the same release name, namespace,
+and ServiceAccount names is supported. The first upgrade which introduces this
+guard must render `controllerownedcdc-installation.yaml` before the policies
+and bindings; it creates the installation ClusterRole and changes the policies to
+read their subjects and canary namespaces from it. Those resources carry
+`helm.sh/resource-policy: keep`, so Helm retains the safety boundary on
+uninstall or rollback. Do not change any value which changes a marker-recorded
+identity: `nameOverride`/`fullnameOverride` when they alter protected workload
+names, `serviceAccount.name`, `namespaceOverride`, the Helm release name, or the
+Helm namespace. A purely cosmetic override which leaves every recorded
+ServiceAccount, workload, Role, and binding name identical is not a distinct
+installation identity.
+
+There is intentionally no ordinary Helm uninstall, old-chart rollback, or
+namespace-migration path while alpha controller-v1 state exists. A future
+explicit decommission procedure must
+first inventory and remove every controller-v1 ComputeDomain and snapshot,
+verify the whole-clique reset/fence, and account for retained reservations. Only
+then may a cluster administrator mark the protected admission objects with
+`resource.nvidia.com/unsafe-controller-owned-cdc-decommission=approved` and
+remove the binding, policies, and retained CRDs/state in a reviewed order. The
+workload policy permits the exact marker-recorded legacy controller and kubelet
+workload names so the admission-first brownfield rollout can overlap old
+binaries. That compatibility is not evidence that an old-chart rollback is
+safe. A rollback to a chart predating controller-v1 requires verified zero
+controller state and a tested RBAC/workload rollback or the reviewed
+decommission first. That
+annotation is an unsafe administrative authorization, not fence evidence.
+
 Only trusted operators should be able to create ComputeDomains in an allowed
-canary namespace. The node-bound admission policy limits the kubelet plugin to
-driver-owned metadata on its own Node, but the ComputeDomain membership label
-is not proof that a DRA claim authorized that membership. Use exclusive,
-controlled canary Nodes until membership is derived from an allocation or a
-controller-issued attestation.
+canary namespace. For controller-v1, the controller derives Node membership
+from an exact live scheduled Pod, its generated and allocated ResourceClaim,
+the Pod UID-qualified `reservedFor` entry and Node selection, the canonical
+ResourceClaimTemplate, and the persisted protocol. It then writes a UID-bearing
+Node attestation; the snapshot expected set ignores an unattested label.
+Legacy-v1 keeps the old kubelet-written label for brownfield and rollback
+compatibility, but it cannot authorize controller-v1 membership. Use an entire
+virgin or externally reset clique and keep legacy scheduling excluded because
+claim-derived attestation happens after scheduling and is not an atomic
+cross-protocol scheduling lock.
 
 Keep leader election and topology publication enabled while any persisted
 controller-v1 ComputeDomain exists, including after disabling the feature gate

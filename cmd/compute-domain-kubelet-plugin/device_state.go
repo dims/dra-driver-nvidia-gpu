@@ -592,14 +592,11 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, cs *resourceapi.Reso
 	for c := range configResultsMap {
 		switch config := c.(type) {
 		case *configapi.ComputeDomainChannelConfig:
-			// Host-managed mode never adds the ComputeDomain node label, so
-			// there is nothing to remove here.
-			if s.config.imexConfig.EffectiveHostManaged() {
+			if s.config.imexConfig.EffectiveHostManaged() || configapi.EffectiveComputeDomainCliqueProtocol(config.Protocol) == configapi.ComputeDomainCliqueProtocolControllerV1 {
 				continue
 			}
-			// If a channel type, remove the ComputeDomain label from the node
 			if err := s.computeDomainManager.RemoveNodeLabel(ctx, config.DomainID); err != nil {
-				return fmt.Errorf("error removing Node label for ComputeDomain: %w", err)
+				return fmt.Errorf("error removing legacy Node label for ComputeDomain: %w", err)
 			}
 		case *configapi.ComputeDomainDaemonConfig:
 			// If a daemon type, unprepare the new ComputeDomain daemon.
@@ -658,7 +655,6 @@ func (s *DeviceState) applyComputeDomainChannelConfigHostManaged(ctx context.Con
 	if err := s.computeDomainManager.AssertComputeDomainNamespace(ctx, claim.Namespace, config.DomainID); err != nil {
 		return nil, permanentError{fmt.Errorf("error asserting ComputeDomain's namespace: %w", err)}
 	}
-
 	configState := DeviceConfigState{
 		Type:          ComputeDomainChannelType,
 		ComputeDomain: config.DomainID,
@@ -710,9 +706,10 @@ func (s *DeviceState) applyComputeDomainChannelConfigDriverManaged(ctx context.C
 	if err := s.computeDomainManager.AssertComputeDomainNamespace(ctx, claim.Namespace, config.DomainID); err != nil {
 		return nil, permanentError{fmt.Errorf("error asserting ComputeDomain's namespace: %w", err)}
 	}
-
-	if err := s.computeDomainManager.AddNodeLabel(ctx, config.DomainID); err != nil {
-		return nil, fmt.Errorf("error adding Node label for ComputeDomain: %w", err)
+	if configapi.EffectiveComputeDomainCliqueProtocol(config.Protocol) == configapi.ComputeDomainCliqueProtocolLegacyV1 {
+		if err := s.computeDomainManager.AddNodeLabel(ctx, config.DomainID); err != nil {
+			return nil, fmt.Errorf("error adding legacy Node label for ComputeDomain: %w", err)
+		}
 	}
 
 	if err := s.computeDomainManager.AssertComputeDomainReady(ctx, config.DomainID, config.Protocol); err != nil {
@@ -751,13 +748,12 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 	if config.Protocol != persistedProtocol {
 		return nil, permanentError{fmt.Errorf("daemon claim clique protocol %q does not match ComputeDomain protocol %q", config.Protocol, persistedProtocol)}
 	}
-	// The daemon claim is the last node-local gate before a per-CD IMEX Pod is
-	// configured. Honor a reservation owned by another ComputeDomain for both
-	// protocols so legacy rollback cannot bypass a controller-v1 tombstone.
 	if err := s.computeDomainManager.AssertPhysicalCliqueAvailable(ctx, config.DomainID); err != nil {
-		return nil, permanentError{err}
+		// Reservation ownership is durable, but the API read used to prove it
+		// can fail transiently. Keep Prepare retryable rather than checkpointing
+		// a timeout, 429, or short API outage as a permanent claim failure.
+		return nil, err
 	}
-
 	// Get the list of claim requests this config is being applied over.
 	var requests []string
 	for _, r := range results {

@@ -304,11 +304,15 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 			withoutFence.Finalizers = slices.DeleteFunc(withoutFence.Finalizers, func(finalizer string) bool {
 				return finalizer == nvapi.ComputeDomainCliqueSnapshotFinalizer
 			})
-			if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, withoutFence, metav1.UpdateOptions{}); err != nil {
+			_, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, withoutFence, metav1.UpdateOptions{})
+			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerRemove, err)
+			if err != nil {
 				return err
 			}
 		}
-		if err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Delete(ctx, snapshot.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &snapshot.UID}}); err != nil && !apierrors.IsNotFound(err) {
+		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Delete(ctx, snapshot.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &snapshot.UID}})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationDelete, err)
+		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
 	}
@@ -391,7 +395,6 @@ func (m *ComputeDomainManager) addFinalizer(ctx context.Context, cd *nvapi.Compu
 			cd,
 			featuregates.Enabled(featuregates.ControllerOwnedCDCliques),
 			m.config.controllerOwnedCDCliquesAvailable,
-			m.config.maxNodesPerIMEXDomain,
 		)
 		if err != nil {
 			return err
@@ -415,7 +418,7 @@ func (m *ComputeDomainManager) addFinalizer(ctx context.Context, cd *nvapi.Compu
 	return nil
 }
 
-func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnabled, snapshotAPIAvailable bool, capacity int) (nvapi.ComputeDomainCliqueProtocol, error) {
+func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnabled, snapshotAPIAvailable bool) (nvapi.ComputeDomainCliqueProtocol, error) {
 	requested := nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueRequestedProtocolAnnotation])
 	if requested != "" {
 		if err := nvapi.ValidateComputeDomainCliqueProtocol(requested); err != nil {
@@ -431,9 +434,6 @@ func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnable
 	}
 	if cd.Spec.NumNodes <= 0 {
 		return "", fmt.Errorf("controller-v1 requires spec.numNodes to declare the complete expected Node set")
-	}
-	if cd.Spec.NumNodes > capacity {
-		return "", fmt.Errorf("controller-v1 spec.numNodes %d exceeds the configured IMEX clique capacity %d", cd.Spec.NumNodes, capacity)
 	}
 	if !controllerEnabled || !snapshotAPIAvailable {
 		return "", fmt.Errorf("controller-v1 was requested but the ControllerOwnedCDCliques feature gate and snapshot API are not both available")

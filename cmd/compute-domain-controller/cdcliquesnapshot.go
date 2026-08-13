@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/client-go/informers"
 	appslisters "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	resourcelisters "k8s.io/client-go/listers/resource/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -45,6 +47,7 @@ import (
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/metrics"
 	nvinformers "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/informers/externalversions"
+	nvlisters "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/listers/resource/v1beta1"
 )
 
 const (
@@ -55,6 +58,16 @@ const (
 	gpuCliqueNodeLabelKey                      = "nvidia.com/gpu.clique"
 	computeDomainCliqueStartupAnnotationKey    = "resource.nvidia.com/computeDomainCliqueStartupID"
 	computeDomainCliqueCapabilityAnnotationKey = "resource.nvidia.com/computeDomainCliqueProtocolCapability"
+	computeDomainUIDIndex                      = "computeDomainUID"
+	computeDomainCliqueIndex                   = "computeDomainClique"
+	podComputeDomainNodeIndex                  = "computeDomainNode"
+	workloadPodNodeIndex                       = "workloadNode"
+	workloadPodClaimIndex                      = "workloadClaim"
+	workloadPodTemplateIndex                   = "workloadClaimTemplate"
+	workloadPodUIDIndex                        = "workloadPodUID"
+	computeDomainAttestationAnnotationKey      = "resource.nvidia.com/computeDomainAttestation"
+	controllerOwnedCliqueIsolationLabelKey     = "resource.nvidia.com/controllerOwnedComputeDomain"
+	physicalCliqueIndex                        = "physicalClique"
 )
 
 type snapshotWriteBarrier struct {
@@ -70,30 +83,47 @@ type snapshotWriteBarrier struct {
 type ControllerOwnedCliqueManager struct {
 	config *ManagerConfig
 
-	clusterCoreFactory    informers.SharedInformerFactory
-	namespacedCoreFactory informers.SharedInformerFactory
-	computeDomainFactory  nvinformers.SharedInformerFactory
-	nvidiaFactory         nvinformers.SharedInformerFactory
-	computeDomainInformer cache.SharedIndexInformer
-	podInformer           cache.SharedIndexInformer
-	nodeInformer          cache.SharedIndexInformer
-	daemonSetInformer     cache.SharedIndexInformer
-	snapshotInformer      cache.SharedIndexInformer
-	podLister             corelisters.PodLister
-	nodeLister            corelisters.NodeLister
-	daemonSetLister       appslisters.DaemonSetLister
-	barrierMu             sync.Mutex
-	writeBarriers         map[string]snapshotWriteBarrier
-	batchMu               sync.Mutex
-	batchStarted          map[string]time.Time
-	batchLastChanged      map[string]time.Time
-	batchSignature        map[string]string
-	pendingMu             sync.Mutex
-	pendingScopes         map[string]snapshotScope
+	workloadCoreFactory     informers.SharedInformerFactory
+	namespacedCoreFactory   informers.SharedInformerFactory
+	computeDomainFactory    nvinformers.SharedInformerFactory
+	nvidiaFactory           nvinformers.SharedInformerFactory
+	computeDomainInformer   cache.SharedIndexInformer
+	podInformer             cache.SharedIndexInformer
+	workloadPodInformer     cache.SharedIndexInformer
+	resourceClaimInformer   cache.SharedIndexInformer
+	claimTemplateInformer   cache.SharedIndexInformer
+	reservationInformer     cache.SharedIndexInformer
+	attestationNodeInformer cache.SharedIndexInformer
+	nodeInformer            cache.SharedIndexInformer
+	daemonSetInformer       cache.SharedIndexInformer
+	snapshotInformer        cache.SharedIndexInformer
+	nodeLister              corelisters.NodeLister
+	attestationNodeLister   corelisters.NodeLister
+	resourceClaimLister     resourcelisters.ResourceClaimLister
+	claimTemplateLister     resourcelisters.ResourceClaimTemplateLister
+	reservationLister       nvlisters.ComputeDomainCliqueReservationLister
+	daemonSetLister         appslisters.DaemonSetLister
+	nodeStateMu             sync.RWMutex
+	nodeStates              map[string]selectedNodeState
+	domainNodeSummaries     map[string]selectedNodeSummary
+	barrierMu               sync.Mutex
+	writeBarriers           map[string]snapshotWriteBarrier
+	batchMu                 sync.Mutex
+	batchStarted            map[string]time.Time
+	batchLastChanged        map[string]time.Time
+	batchSignature          map[string]string
+	pendingMu               sync.Mutex
+	pendingScopes           map[string]snapshotScope
+	reservationMu           sync.RWMutex
+	validatedReservations   map[string]nvapi.ComputeDomainCliqueReservationSpec
+	reservationLocksMu      sync.Mutex
+	reservationLocks        map[string]*sync.Mutex
+	liveAttestationCheck    func(*corev1.Node) bool
 
-	queue     workqueue.TypedRateLimitingInterface[string]
-	waitGroup sync.WaitGroup
-	cancel    context.CancelFunc
+	queue            workqueue.TypedRateLimitingInterface[string]
+	attestationQueue workqueue.TypedRateLimitingInterface[string]
+	waitGroup        sync.WaitGroup
+	cancel           context.CancelFunc
 }
 
 type snapshotScope struct {
@@ -101,17 +131,56 @@ type snapshotScope struct {
 	cliqueID         string
 }
 
+// selectedNodeState is the small routing and expected-set projection kept for
+// each selected Node. Reconciliation still reads the authoritative Node
+// objects from the informer index; this projection only prevents every clique
+// from repeatedly listing every Node in a multi-clique ComputeDomain.
+type selectedNodeState struct {
+	computeDomainUID string
+	cliqueID         string
+	topologyReady    bool
+}
+
+type selectedNodeSummary struct {
+	selected      int
+	topologyReady int
+}
+
+func observeCliqueAPIAction(resource, operation string, err error) {
+	result := metrics.CliqueAPIResultSuccess
+	if apierrors.IsAlreadyExists(err) {
+		result = metrics.CliqueAPIResultAlreadyExists
+	} else if apierrors.IsNotFound(err) {
+		result = metrics.CliqueAPIResultNotFound
+	} else if apierrors.IsConflict(err) {
+		result = metrics.CliqueAPIResultConflict
+	} else if apierrors.IsTooManyRequests(err) {
+		result = metrics.CliqueAPIResultThrottled
+	} else if apierrors.IsForbidden(err) {
+		result = metrics.CliqueAPIResultForbidden
+	} else if apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
+		result = metrics.CliqueAPIResultTimeout
+	} else if err != nil {
+		result = metrics.CliqueAPIResultError
+	}
+	mutated := err == nil && operation != metrics.CliqueAPIOperationGet && operation != metrics.CliqueAPIOperationWriteBarrierGet
+	metrics.ObserveCliqueAPIAction(
+		string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+		resource,
+		operation,
+		result,
+		mutated,
+	)
+}
+
 func NewControllerOwnedCliqueManager(config *ManagerConfig) *ControllerOwnedCliqueManager {
 	selector := &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
 		Key: computeDomainLabelKey, Operator: metav1.LabelSelectorOpExists,
 	}}}
-	clusterCoreFactory := informers.NewSharedInformerFactoryWithOptions(
-		config.clientsets.Core,
-		informerResyncPeriod,
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = metav1.FormatLabelSelector(selector)
-		}),
-	)
+	// Workload Pods and their claims cannot be filtered by the routing label:
+	// those are the facts from which the controller derives authorization.
+	workloadCoreFactory := informers.NewSharedInformerFactory(config.clientsets.Core, 0)
+	sharedNodeInformer := workloadCoreFactory.Core().V1().Nodes().Informer()
 	namespacedCoreFactory := informers.NewSharedInformerFactoryWithOptions(
 		config.clientsets.Core,
 		informerResyncPeriod,
@@ -126,38 +195,54 @@ func NewControllerOwnedCliqueManager(config *ManagerConfig) *ControllerOwnedCliq
 		nvinformers.WithNamespace(config.driverNamespace),
 	)
 	computeDomainFactory := nvinformers.NewSharedInformerFactory(config.clientsets.Nvidia, informerResyncPeriod)
+	resourceClaimInformer := workloadCoreFactory.Resource().V1().ResourceClaims().Informer()
+	claimTemplateInformer := workloadCoreFactory.Resource().V1().ResourceClaimTemplates().Informer()
+	reservationInformer := computeDomainFactory.Resource().V1beta1().ComputeDomainCliqueReservations().Informer()
 
 	m := &ControllerOwnedCliqueManager{
-		config:                config,
-		clusterCoreFactory:    clusterCoreFactory,
-		namespacedCoreFactory: namespacedCoreFactory,
-		computeDomainFactory:  computeDomainFactory,
-		nvidiaFactory:         nvidiaFactory,
-		computeDomainInformer: computeDomainFactory.Resource().V1beta1().ComputeDomains().Informer(),
-		podInformer:           namespacedCoreFactory.Core().V1().Pods().Informer(),
-		nodeInformer:          clusterCoreFactory.Core().V1().Nodes().Informer(),
-		daemonSetInformer:     namespacedCoreFactory.Apps().V1().DaemonSets().Informer(),
-		snapshotInformer:      nvidiaFactory.Resource().V1beta1().ComputeDomainCliqueSnapshots().Informer(),
-		podLister:             namespacedCoreFactory.Core().V1().Pods().Lister(),
-		nodeLister:            clusterCoreFactory.Core().V1().Nodes().Lister(),
-		daemonSetLister:       namespacedCoreFactory.Apps().V1().DaemonSets().Lister(),
-		writeBarriers:         make(map[string]snapshotWriteBarrier),
-		batchStarted:          make(map[string]time.Time),
-		batchLastChanged:      make(map[string]time.Time),
-		batchSignature:        make(map[string]string),
-		pendingScopes:         make(map[string]snapshotScope),
+		config:                  config,
+		workloadCoreFactory:     workloadCoreFactory,
+		namespacedCoreFactory:   namespacedCoreFactory,
+		computeDomainFactory:    computeDomainFactory,
+		nvidiaFactory:           nvidiaFactory,
+		computeDomainInformer:   computeDomainFactory.Resource().V1beta1().ComputeDomains().Informer(),
+		podInformer:             namespacedCoreFactory.Core().V1().Pods().Informer(),
+		workloadPodInformer:     workloadCoreFactory.Core().V1().Pods().Informer(),
+		resourceClaimInformer:   resourceClaimInformer,
+		claimTemplateInformer:   claimTemplateInformer,
+		reservationInformer:     reservationInformer,
+		attestationNodeInformer: sharedNodeInformer,
+		nodeInformer:            sharedNodeInformer,
+		daemonSetInformer:       namespacedCoreFactory.Apps().V1().DaemonSets().Informer(),
+		snapshotInformer:        nvidiaFactory.Resource().V1beta1().ComputeDomainCliqueSnapshots().Informer(),
+		nodeLister:              corelisters.NewNodeLister(sharedNodeInformer.GetIndexer()),
+		attestationNodeLister:   workloadCoreFactory.Core().V1().Nodes().Lister(),
+		resourceClaimLister:     resourcelisters.NewResourceClaimLister(resourceClaimInformer.GetIndexer()),
+		claimTemplateLister:     resourcelisters.NewResourceClaimTemplateLister(claimTemplateInformer.GetIndexer()),
+		reservationLister:       nvlisters.NewComputeDomainCliqueReservationLister(reservationInformer.GetIndexer()),
+		daemonSetLister:         namespacedCoreFactory.Apps().V1().DaemonSets().Lister(),
+		nodeStates:              make(map[string]selectedNodeState),
+		domainNodeSummaries:     make(map[string]selectedNodeSummary),
+		writeBarriers:           make(map[string]snapshotWriteBarrier),
+		batchStarted:            make(map[string]time.Time),
+		batchLastChanged:        make(map[string]time.Time),
+		batchSignature:          make(map[string]string),
+		pendingScopes:           make(map[string]snapshotScope),
+		validatedReservations:   make(map[string]nvapi.ComputeDomainCliqueReservationSpec),
+		reservationLocks:        make(map[string]*sync.Mutex),
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: snapshotQueueName},
+		),
+		attestationQueue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.DefaultTypedControllerRateLimiter[string](),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "compute-domain-node-attestations"},
 		),
 	}
 	return m
 }
 
-func (m *ControllerOwnedCliqueManager) Start(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	m.cancel = cancel
-
+func (m *ControllerOwnedCliqueManager) addInformerIndexes() error {
 	if err := m.computeDomainInformer.AddIndexers(cache.Indexers{
 		"uid": func(obj any) ([]string, error) {
 			cd, ok := obj.(*nvapi.ComputeDomain)
@@ -170,7 +255,7 @@ func (m *ControllerOwnedCliqueManager) Start(ctx context.Context) error {
 		return fmt.Errorf("adding ComputeDomain UID index: %w", err)
 	}
 	if err := m.snapshotInformer.AddIndexers(cache.Indexers{
-		"computeDomainUID": func(obj any) ([]string, error) {
+		computeDomainUIDIndex: func(obj any) ([]string, error) {
 			snapshot, ok := obj.(*nvapi.ComputeDomainCliqueSnapshot)
 			if !ok {
 				return nil, fmt.Errorf("expected ComputeDomainCliqueSnapshot, got %T", obj)
@@ -188,29 +273,51 @@ func (m *ControllerOwnedCliqueManager) Start(ctx context.Context) error {
 		return fmt.Errorf("adding snapshot ComputeDomain UID index: %w", err)
 	}
 	if err := m.nodeInformer.AddIndexers(cache.Indexers{
-		"computeDomainUID": func(obj any) ([]string, error) {
-			node, ok := obj.(*corev1.Node)
-			if !ok {
-				return nil, fmt.Errorf("expected Node, got %T", obj)
-			}
-			if uid := node.Labels[computeDomainLabelKey]; uid != "" {
-				return []string{uid}, nil
-			}
-			return nil, nil
-		},
-		"computeDomainClique": func(obj any) ([]string, error) {
-			node, ok := obj.(*corev1.Node)
-			if !ok {
-				return nil, fmt.Errorf("expected Node, got %T", obj)
-			}
-			uid, cliqueID := node.Labels[computeDomainLabelKey], node.Labels[gpuCliqueNodeLabelKey]
-			if uid != "" && cliqueID != "" {
-				return []string{uid + "\x00" + cliqueID}, nil
-			}
-			return nil, nil
-		},
+		computeDomainCliqueIndex: nodeComputeDomainCliqueIndexKeys,
 	}); err != nil {
 		return fmt.Errorf("adding Node clique indexes: %w", err)
+	}
+	if err := m.podInformer.AddIndexers(cache.Indexers{
+		podComputeDomainNodeIndex: podComputeDomainNodeIndexKeys,
+	}); err != nil {
+		return fmt.Errorf("adding Pod ComputeDomain/Node index: %w", err)
+	}
+	if err := m.workloadPodInformer.AddIndexers(cache.Indexers{
+		workloadPodNodeIndex:     workloadPodNodeIndexKeys,
+		workloadPodClaimIndex:    workloadPodClaimIndexKeys,
+		workloadPodTemplateIndex: workloadPodTemplateIndexKeys,
+		workloadPodUIDIndex:      workloadPodUIDIndexKeys,
+	}); err != nil {
+		return fmt.Errorf("adding workload Pod attestation indexes: %w", err)
+	}
+	if err := m.attestationNodeInformer.AddIndexers(cache.Indexers{
+		physicalCliqueIndex: func(obj any) ([]string, error) {
+			node, ok := obj.(*corev1.Node)
+			if !ok {
+				return nil, fmt.Errorf("expected Node, got %T", obj)
+			}
+			keys := []string{}
+			if cliqueID := node.Labels[gpuCliqueNodeLabelKey]; cliqueID != "" {
+				keys = append(keys, cliqueID)
+			}
+			if startupCliqueID := node.Annotations[computeDomainCliqueStartupAnnotationKey]; startupCliqueID != "" {
+				keys = append(keys, startupCliqueID)
+			}
+			slices.Sort(keys)
+			return slices.Compact(keys), nil
+		},
+	}); err != nil {
+		return fmt.Errorf("adding physical clique Node index: %w", err)
+	}
+	return nil
+}
+
+func (m *ControllerOwnedCliqueManager) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	m.cancel = cancel
+
+	if err := m.addInformerIndexes(); err != nil {
+		return err
 	}
 
 	handler := cache.ResourceEventHandlerFuncs{AddFunc: m.enqueueObject, UpdateFunc: func(_, current any) { m.enqueueObject(current) }, DeleteFunc: m.enqueueObject}
@@ -219,15 +326,47 @@ func (m *ControllerOwnedCliqueManager) Start(ctx context.Context) error {
 			return fmt.Errorf("adding controller-owned clique event handler: %w", err)
 		}
 	}
-	if _, err := m.nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: m.enqueueObject,
+	if _, err := m.workloadPodInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: m.enqueueWorkloadPod,
 		UpdateFunc: func(previous, current any) {
-			// The old view is required when a topology or ComputeDomain label is
-			// removed; otherwise the affected active snapshot waits for resync.
-			m.enqueueObject(previous)
-			m.enqueueObject(current)
+			m.enqueueWorkloadPod(previous)
+			m.enqueueWorkloadPod(current)
 		},
-		DeleteFunc: m.enqueueObject,
+		DeleteFunc: m.enqueueWorkloadPod,
+	}); err != nil {
+		return fmt.Errorf("adding workload Pod attestation event handler: %w", err)
+	}
+	if _, err := m.resourceClaimInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: m.enqueueResourceClaim,
+		UpdateFunc: func(previous, current any) {
+			m.enqueueResourceClaim(previous)
+			m.enqueueResourceClaim(current)
+		},
+		DeleteFunc: m.enqueueResourceClaim,
+	}); err != nil {
+		return fmt.Errorf("adding ResourceClaim attestation event handler: %w", err)
+	}
+	if _, err := m.claimTemplateInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: m.enqueueClaimTemplate,
+		UpdateFunc: func(previous, current any) {
+			m.enqueueClaimTemplate(previous)
+			m.enqueueClaimTemplate(current)
+		},
+		DeleteFunc: m.enqueueClaimTemplate,
+	}); err != nil {
+		return fmt.Errorf("adding ResourceClaimTemplate attestation event handler: %w", err)
+	}
+	if _, err := m.attestationNodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(current any) { m.enqueueAttestationNodeChange(nil, current) },
+		UpdateFunc: m.enqueueAttestationNodeChange,
+		DeleteFunc: func(previous any) { m.enqueueAttestationNodeChange(previous, nil) },
+	}); err != nil {
+		return fmt.Errorf("adding Node attestation event handler: %w", err)
+	}
+	if _, err := m.nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(current any) { m.handleNodeEvent(nil, current) },
+		UpdateFunc: m.handleNodeEvent,
+		DeleteFunc: func(previous any) { m.handleNodeEvent(previous, nil) },
 	}); err != nil {
 		return fmt.Errorf("adding controller-owned clique Node event handler: %w", err)
 	}
@@ -241,19 +380,34 @@ func (m *ControllerOwnedCliqueManager) Start(ctx context.Context) error {
 		return fmt.Errorf("adding ComputeDomain event handler: %w", err)
 	}
 
-	m.clusterCoreFactory.Start(ctx.Done())
+	m.workloadCoreFactory.Start(ctx.Done())
 	m.namespacedCoreFactory.Start(ctx.Done())
 	m.computeDomainFactory.Start(ctx.Done())
 	m.nvidiaFactory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), m.podInformer.HasSynced, m.nodeInformer.HasSynced, m.daemonSetInformer.HasSynced, m.computeDomainInformer.HasSynced, m.snapshotInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), m.podInformer.HasSynced, m.workloadPodInformer.HasSynced,
+		m.resourceClaimInformer.HasSynced, m.claimTemplateInformer.HasSynced,
+		m.reservationInformer.HasSynced,
+		m.attestationNodeInformer.HasSynced,
+		m.nodeInformer.HasSynced, m.daemonSetInformer.HasSynced, m.computeDomainInformer.HasSynced, m.snapshotInformer.HasSynced) {
 		return fmt.Errorf("controller-owned clique informer cache sync failed")
 	}
+	// Informer handlers are asynchronous relative to HasSynced. Rebuild this
+	// small aggregate from the authoritative cache before workers begin, then
+	// let ordinary handlers maintain it incrementally.
+	m.rebuildSelectedNodeState()
 
 	for range 4 {
 		m.waitGroup.Add(1)
 		go func() {
 			defer m.waitGroup.Done()
 			m.runWorker(ctx)
+		}()
+	}
+	for range 2 {
+		m.waitGroup.Add(1)
+		go func() {
+			defer m.waitGroup.Done()
+			m.runAttestationWorker(ctx)
 		}()
 	}
 	return nil
@@ -264,6 +418,7 @@ func (m *ControllerOwnedCliqueManager) Stop() {
 		m.cancel()
 	}
 	m.queue.ShutDown()
+	m.attestationQueue.ShutDown()
 	m.waitGroup.Wait()
 }
 
@@ -273,18 +428,6 @@ func (m *ControllerOwnedCliqueManager) enqueueObject(obj any) {
 		m.enqueuePod(object)
 	case cache.DeletedFinalStateUnknown:
 		m.enqueueObject(object.Obj)
-	case *corev1.Node:
-		cdUID := object.Labels[computeDomainLabelKey]
-		cliqueID := object.Labels[gpuCliqueNodeLabelKey]
-		if cdUID == "" || cliqueID == "" {
-			return
-		}
-		key := m.config.driverNamespace + "/" + snapshotName(cdUID, cliqueID)
-		m.pendingMu.Lock()
-		m.pendingScopes[key] = snapshotScope{computeDomainUID: cdUID, cliqueID: cliqueID}
-		m.pendingMu.Unlock()
-		m.queue.Add(key)
-		m.enqueueExistingForComputeDomain(cdUID)
 	case *appsv1.DaemonSet:
 		cdUID := object.Labels[computeDomainLabelKey]
 		if cdUID != "" {
@@ -293,6 +436,186 @@ func (m *ControllerOwnedCliqueManager) enqueueObject(obj any) {
 	case *nvapi.ComputeDomainCliqueSnapshot:
 		m.queue.Add(object.Namespace + "/" + object.Name)
 	}
+}
+
+func nodeComputeDomainCliqueIndexKeys(obj any) ([]string, error) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return nil, fmt.Errorf("expected Node, got %T", obj)
+	}
+	uid, cliqueID := node.Labels[computeDomainLabelKey], node.Labels[gpuCliqueNodeLabelKey]
+	if uid == "" || cliqueID == "" || !validNodeAttestation(node, nvapi.ComputeDomainCliqueProtocolControllerV1) {
+		return nil, nil
+	}
+	return []string{uid + "\x00" + cliqueID}, nil
+}
+
+func podComputeDomainNodeIndexKeys(obj any) ([]string, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil, fmt.Errorf("expected Pod, got %T", obj)
+	}
+	uid := pod.Labels[computeDomainLabelKey]
+	if uid == "" || pod.Spec.NodeName == "" {
+		return nil, nil
+	}
+	return []string{uid + "\x00" + pod.Spec.NodeName}, nil
+}
+
+func selectedNodeStateFor(node *corev1.Node) (selectedNodeState, bool) {
+	if node == nil {
+		return selectedNodeState{}, false
+	}
+	state := selectedNodeState{
+		computeDomainUID: node.Labels[computeDomainLabelKey],
+		cliqueID:         node.Labels[gpuCliqueNodeLabelKey],
+	}
+	if state.computeDomainUID == "" {
+		return selectedNodeState{}, false
+	}
+	if !validNodeAttestation(node, nvapi.ComputeDomainCliqueProtocolControllerV1) {
+		return selectedNodeState{}, false
+	}
+	state.topologyReady = state.cliqueID != "" &&
+		node.Annotations[computeDomainCliqueStartupAnnotationKey] == state.cliqueID &&
+		node.Annotations[computeDomainCliqueCapabilityAnnotationKey] == string(nvapi.ComputeDomainCliqueProtocolControllerV1)
+	return state, true
+}
+
+func (m *ControllerOwnedCliqueManager) enqueueNodeState(state selectedNodeState) {
+	if state.computeDomainUID == "" || state.cliqueID == "" {
+		return
+	}
+	key := m.config.driverNamespace + "/" + snapshotName(state.computeDomainUID, state.cliqueID)
+	m.pendingMu.Lock()
+	m.pendingScopes[key] = snapshotScope{computeDomainUID: state.computeDomainUID, cliqueID: state.cliqueID}
+	m.pendingMu.Unlock()
+	m.queue.Add(key)
+}
+
+func addSelectedNodeSummary(summary selectedNodeSummary, state selectedNodeState) selectedNodeSummary {
+	summary.selected++
+	if state.topologyReady {
+		summary.topologyReady++
+	}
+	return summary
+}
+
+func removeSelectedNodeSummary(summary selectedNodeSummary, state selectedNodeState) selectedNodeSummary {
+	summary.selected--
+	if state.topologyReady {
+		summary.topologyReady--
+	}
+	return summary
+}
+
+func expectedSetReadyForSummary(summary selectedNodeSummary, expected int) bool {
+	return expected > 0 && summary.selected == expected && summary.topologyReady == expected
+}
+
+func (m *ControllerOwnedCliqueManager) expectedNodeCount(cdUID string) (int, bool) {
+	objects, err := m.computeDomainInformer.GetIndexer().ByIndex("uid", cdUID)
+	if err != nil || len(objects) != 1 {
+		return 0, false
+	}
+	cd, ok := objects[0].(*nvapi.ComputeDomain)
+	if !ok || cd.DeletionTimestamp != nil || cd.Spec.NumNodes <= 0 {
+		return 0, false
+	}
+	return cd.Spec.NumNodes, true
+}
+
+func (m *ControllerOwnedCliqueManager) handleNodeEvent(previous, current any) {
+	unwrap := func(obj any) *corev1.Node {
+		if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+			obj = tombstone.Obj
+		}
+		node, _ := obj.(*corev1.Node)
+		return node
+	}
+	previousNode, currentNode := unwrap(previous), unwrap(current)
+	var name string
+	if currentNode != nil {
+		name = currentNode.Name
+	} else if previousNode != nil {
+		name = previousNode.Name
+	} else {
+		return
+	}
+	m.nodeStateMu.Lock()
+	trackedPrevious, tracked := m.nodeStates[name]
+	previousState, previousSelected := selectedNodeStateFor(previousNode)
+	if tracked {
+		previousState, previousSelected = trackedPrevious, true
+	}
+	currentState, currentSelected := selectedNodeStateFor(currentNode)
+	affected := make(map[string]selectedNodeSummary, 2)
+	if previousSelected {
+		affected[previousState.computeDomainUID] = m.domainNodeSummaries[previousState.computeDomainUID]
+	}
+	if currentSelected {
+		affected[currentState.computeDomainUID] = m.domainNodeSummaries[currentState.computeDomainUID]
+	}
+	if tracked {
+		summary := removeSelectedNodeSummary(m.domainNodeSummaries[trackedPrevious.computeDomainUID], trackedPrevious)
+		if summary.selected == 0 {
+			delete(m.domainNodeSummaries, trackedPrevious.computeDomainUID)
+		} else {
+			m.domainNodeSummaries[trackedPrevious.computeDomainUID] = summary
+		}
+		delete(m.nodeStates, name)
+	}
+	if currentSelected {
+		m.nodeStates[name] = currentState
+		m.domainNodeSummaries[currentState.computeDomainUID] = addSelectedNodeSummary(m.domainNodeSummaries[currentState.computeDomainUID], currentState)
+	}
+	after := make(map[string]selectedNodeSummary, len(affected))
+	for cdUID := range affected {
+		after[cdUID] = m.domainNodeSummaries[cdUID]
+	}
+	m.nodeStateMu.Unlock()
+
+	// Only the old and new clique receive an ordinary Node event. A broadcast
+	// to all cliques is necessary only when the domain-wide expected-set barrier
+	// transitions, not for every Node annotation/condition update.
+	if previousSelected {
+		m.enqueueNodeState(previousState)
+	}
+	if currentSelected {
+		m.enqueueNodeState(currentState)
+	}
+	for cdUID, before := range affected {
+		expected, found := m.expectedNodeCount(cdUID)
+		if found && expectedSetReadyForSummary(before, expected) != expectedSetReadyForSummary(after[cdUID], expected) {
+			m.enqueueExistingForComputeDomain(cdUID)
+		}
+	}
+}
+
+func (m *ControllerOwnedCliqueManager) rebuildSelectedNodeState() {
+	m.nodeStateMu.Lock()
+	defer m.nodeStateMu.Unlock()
+	m.nodeStates = make(map[string]selectedNodeState)
+	m.domainNodeSummaries = make(map[string]selectedNodeSummary)
+	for _, obj := range m.nodeInformer.GetStore().List() {
+		node, ok := obj.(*corev1.Node)
+		if !ok {
+			continue
+		}
+		state, selected := selectedNodeStateFor(node)
+		if !selected {
+			continue
+		}
+		m.nodeStates[node.Name] = state
+		m.domainNodeSummaries[state.computeDomainUID] = addSelectedNodeSummary(m.domainNodeSummaries[state.computeDomainUID], state)
+	}
+}
+
+func (m *ControllerOwnedCliqueManager) expectedSetReady(cdUID string, expected int) bool {
+	m.nodeStateMu.RLock()
+	summary := m.domainNodeSummaries[cdUID]
+	m.nodeStateMu.RUnlock()
+	return expectedSetReadyForSummary(summary, expected)
 }
 
 func (m *ControllerOwnedCliqueManager) enqueuePod(pod *corev1.Pod) {
@@ -316,7 +639,7 @@ func (m *ControllerOwnedCliqueManager) enqueuePod(pod *corev1.Pod) {
 }
 
 func (m *ControllerOwnedCliqueManager) enqueueExistingForComputeDomain(cdUID string) {
-	objects, err := m.snapshotInformer.GetIndexer().ByIndex("computeDomainUID", cdUID)
+	objects, err := m.snapshotInformer.GetIndexer().ByIndex(computeDomainUIDIndex, cdUID)
 	if err != nil {
 		return
 	}
@@ -379,6 +702,7 @@ func (m *ControllerOwnedCliqueManager) informerObservedLastWrite(ctx context.Con
 			return false, nil, splitErr
 		}
 		current, getErr := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).Get(ctx, name, metav1.GetOptions{})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationWriteBarrierGet, getErr)
 		if getErr != nil {
 			return false, nil, fmt.Errorf("verify stalled snapshot write barrier: %w", getErr)
 		}
@@ -497,11 +821,13 @@ func (m *ControllerOwnedCliqueManager) createSnapshotForPodSet(ctx context.Conte
 		return nil
 	}
 	// Reserve the physical clique before the namespaced snapshot exists. The
-	// API-server-atomic singleton closes both controller-v1/controller-v1 and
-	// controller-v1/legacy formation races. Strict v1 deliberately retains this
+	// API-server-atomic singleton closes controller-v1/controller-v1 races. The
+	// separate whole-clique isolation boundary prevents legacy formation; the
+	// legacy check and this Create are not themselves one atomic transaction.
+	// Strict v1 deliberately retains this
 	// reservation even if formation never reaches generation one: object
 	// absence is not proof that no old runtime acquired the topology.
-	if err := m.reservePhysicalClique(ctx, owner, cliqueID); err != nil {
+	if err := m.reservePhysicalClique(ctx, owner, cliqueID, nvapi.ComputeDomainCliqueProtocolControllerV1); err != nil {
 		return err
 	}
 	controller := true
@@ -526,11 +852,7 @@ func (m *ControllerOwnedCliqueManager) createSnapshotForPodSet(ctx context.Conte
 		},
 	}
 	created, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).Create(ctx, snapshot, metav1.CreateOptions{})
-	writeResult := "success"
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		writeResult = "error"
-	}
-	metrics.ObserveCliqueWrite(string(nvapi.ComputeDomainCliqueProtocolControllerV1), "create", writeResult)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationCreate, err)
 	if apierrors.IsAlreadyExists(err) {
 		return nil
 	}
@@ -548,7 +870,7 @@ func physicalCliqueReservationName(cliqueID string) string {
 	return "clique-" + hex.EncodeToString(digest[:])
 }
 
-func (m *ControllerOwnedCliqueManager) reservePhysicalClique(ctx context.Context, owner *nvapi.ComputeDomain, cliqueID string) error {
+func (m *ControllerOwnedCliqueManager) reservePhysicalClique(ctx context.Context, owner *nvapi.ComputeDomain, cliqueID string, protocol nvapi.ComputeDomainCliqueProtocol) error {
 	reservation := &nvapi.ComputeDomainCliqueReservation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   physicalCliqueReservationName(cliqueID),
@@ -559,26 +881,71 @@ func (m *ControllerOwnedCliqueManager) reservePhysicalClique(ctx context.Context
 			ComputeDomainUID:       owner.UID,
 			ComputeDomainName:      owner.Name,
 			ComputeDomainNamespace: owner.Namespace,
-			Protocol:               nvapi.ComputeDomainCliqueProtocolControllerV1,
+			Protocol:               protocol,
 		},
 	}
-	created, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Create(ctx, reservation, metav1.CreateOptions{})
-	if err == nil {
-		if created.Spec != reservation.Spec {
-			return fmt.Errorf("created physical clique reservation %q has unexpected scope", created.Name)
-		}
+	if protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		return fmt.Errorf("physical clique reservations are controller-v1 only, got %q", protocol)
+	}
+	// Serialize only callers for this physical clique. Different cliques keep
+	// reconciling concurrently, while the normal first-formation path performs
+	// one Create instead of racing into an avoidable AlreadyExists plus GET.
+	lock := m.reservationLock(reservation.Name)
+	lock.Lock()
+	defer lock.Unlock()
+	if m.reservationMatchesMemo(reservation.Name, reservation.Spec) {
 		return nil
+	}
+	if m.reservationLister != nil {
+		existing, err := m.reservationLister.Get(reservation.Name)
+		if err == nil {
+			return m.validateAndRememberReservation(existing, reservation.Spec)
+		}
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("read cached physical clique reservation %q: %w", reservation.Name, err)
+		}
+	}
+	created, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Create(ctx, reservation, metav1.CreateOptions{})
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationCreate, err)
+	if err == nil {
+		return m.validateAndRememberReservation(created, reservation.Spec)
 	}
 	if !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("reserve physical clique %q: %w", cliqueID, err)
 	}
 	existing, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, reservation.Name, metav1.GetOptions{})
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err)
 	if err != nil {
 		return fmt.Errorf("read existing physical clique reservation %q: %w", reservation.Name, err)
 	}
-	if existing.Spec != reservation.Spec {
-		return fmt.Errorf("physical clique %q is still reserved by unfenced ComputeDomain %s/%s UID %q", cliqueID, existing.Spec.ComputeDomainNamespace, existing.Spec.ComputeDomainName, existing.Spec.ComputeDomainUID)
+	return m.validateAndRememberReservation(existing, reservation.Spec)
+}
+
+func (m *ControllerOwnedCliqueManager) reservationLock(name string) *sync.Mutex {
+	m.reservationLocksMu.Lock()
+	defer m.reservationLocksMu.Unlock()
+	lock := m.reservationLocks[name]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.reservationLocks[name] = lock
 	}
+	return lock
+}
+
+func (m *ControllerOwnedCliqueManager) reservationMatchesMemo(name string, expected nvapi.ComputeDomainCliqueReservationSpec) bool {
+	m.reservationMu.RLock()
+	defer m.reservationMu.RUnlock()
+	actual, found := m.validatedReservations[name]
+	return found && actual == expected
+}
+
+func (m *ControllerOwnedCliqueManager) validateAndRememberReservation(reservation *nvapi.ComputeDomainCliqueReservation, expected nvapi.ComputeDomainCliqueReservationSpec) error {
+	if reservation.Spec != expected {
+		return fmt.Errorf("physical clique %q is still reserved by unfenced ComputeDomain %s/%s UID %q", expected.CliqueID, reservation.Spec.ComputeDomainNamespace, reservation.Spec.ComputeDomainName, reservation.Spec.ComputeDomainUID)
+	}
+	m.reservationMu.Lock()
+	m.validatedReservations[reservation.Name] = reservation.Spec
+	m.reservationMu.Unlock()
 	return nil
 }
 
@@ -590,6 +957,40 @@ func snapshotName(cdUID, cliqueID string) string {
 	return strings.ToLower(fmt.Sprintf("%s.%s", cdUID, hex.EncodeToString(digest[:8])))
 }
 
+func selectedNodesForClique(indexer cache.Indexer, cdUID, cliqueID string) ([]*corev1.Node, error) {
+	objects, err := indexer.ByIndex(computeDomainCliqueIndex, cdUID+"\x00"+cliqueID)
+	if err != nil {
+		return nil, err
+	}
+	nodes := make([]*corev1.Node, 0, len(objects))
+	for _, object := range objects {
+		node, ok := object.(*corev1.Node)
+		if !ok {
+			return nil, fmt.Errorf("unexpected clique Node cache object %T", object)
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+func candidatePodsForNodes(indexer cache.Indexer, cdUID string, nodes []*corev1.Node) ([]*corev1.Pod, error) {
+	pods := make([]*corev1.Pod, 0, len(nodes))
+	for _, node := range nodes {
+		objects, err := indexer.ByIndex(podComputeDomainNodeIndex, cdUID+"\x00"+node.Name)
+		if err != nil {
+			return nil, err
+		}
+		for _, object := range objects {
+			pod, ok := object.(*corev1.Pod)
+			if !ok {
+				return nil, fmt.Errorf("unexpected daemon Pod cache object %T", object)
+			}
+			pods = append(pods, pod)
+		}
+	}
+	return pods, nil
+}
+
 func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snapshot *nvapi.ComputeDomainCliqueSnapshot) error {
 	if snapshot.DeletionTimestamp != nil {
 		if snapshot.Status.Generation == 0 && !snapshotEverPublished(snapshot) && slices.Contains(snapshot.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer) {
@@ -598,6 +999,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 				return finalizer == nvapi.ComputeDomainCliqueSnapshotFinalizer
 			})
 			result, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, updated, metav1.UpdateOptions{})
+			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerRemove, err)
 			if err == nil {
 				m.recordWrite(snapshot.Namespace+"/"+snapshot.Name, result.ResourceVersion)
 			}
@@ -607,12 +1009,6 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		// verifier exists. Do not remove the finalizer or recreate/reassign its
 		// slots merely because its owners are being deleted.
 		return nil
-	}
-	pods, err := m.podLister.Pods(snapshot.Namespace).List(labels.SelectorFromSet(labels.Set{
-		computeDomainLabelKey: string(snapshot.Spec.ComputeDomainUID),
-	}))
-	if err != nil {
-		return err
 	}
 	owners, err := m.computeDomainInformer.GetIndexer().ByIndex("uid", string(snapshot.Spec.ComputeDomainUID))
 	if err != nil {
@@ -628,25 +1024,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 	if owner.DeletionTimestamp != nil || owner.Spec.NumNodes <= 0 {
 		return fmt.Errorf("controller-v1 ComputeDomain is deleting or lacks a positive expected Node count")
 	}
-	allNodeObjects, err := m.nodeInformer.GetIndexer().ByIndex("computeDomainUID", string(snapshot.Spec.ComputeDomainUID))
-	if err != nil {
-		return err
-	}
-	allSelectedNodes := make([]*corev1.Node, 0, len(allNodeObjects))
-	allSelectedTopologyReady := true
-	for _, object := range allNodeObjects {
-		node, ok := object.(*corev1.Node)
-		if !ok {
-			return fmt.Errorf("unexpected selected Node cache object %T", object)
-		}
-		if node.Labels[gpuCliqueNodeLabelKey] == "" ||
-			node.Annotations[computeDomainCliqueStartupAnnotationKey] != node.Labels[gpuCliqueNodeLabelKey] ||
-			node.Annotations[computeDomainCliqueCapabilityAnnotationKey] != string(nvapi.ComputeDomainCliqueProtocolControllerV1) {
-			allSelectedTopologyReady = false
-		}
-		allSelectedNodes = append(allSelectedNodes, node)
-	}
-	expectedSetReady := len(allSelectedNodes) == owner.Spec.NumNodes && allSelectedTopologyReady
+	expectedSetReady := m.expectedSetReady(string(snapshot.Spec.ComputeDomainUID), owner.Spec.NumNodes)
 	ds, err := m.daemonSetFor(snapshot.Namespace, owner)
 	if err != nil {
 		return err
@@ -661,20 +1039,16 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		return err
 	}
 
-	members := make([]nvapi.ComputeDomainCliqueMember, 0, len(pods))
 	handoffBlocked := false
-	selectedNodeObjects, err := m.nodeInformer.GetIndexer().ByIndex("computeDomainClique", string(snapshot.Spec.ComputeDomainUID)+"\x00"+snapshot.Spec.CliqueID)
+	selectedNodes, err := selectedNodesForClique(m.nodeInformer.GetIndexer(), string(snapshot.Spec.ComputeDomainUID), snapshot.Spec.CliqueID)
 	if err != nil {
 		return err
 	}
-	selectedNodes := make([]*corev1.Node, 0, len(selectedNodeObjects))
-	for _, object := range selectedNodeObjects {
-		node, ok := object.(*corev1.Node)
-		if !ok {
-			return fmt.Errorf("unexpected clique Node cache object %T", object)
-		}
-		selectedNodes = append(selectedNodes, node)
+	pods, err := candidatePodsForNodes(m.podInformer.GetIndexer(), string(snapshot.Spec.ComputeDomainUID), selectedNodes)
+	if err != nil {
+		return err
 	}
+	members := make([]nvapi.ComputeDomainCliqueMember, 0, len(pods))
 	// Do not durably reserve a partial arrival set. Waiting for the declared
 	// domain-wide expected set makes allocation independent of scheduler and
 	// informer event order while DaemonSet Pods continue starting in parallel.
@@ -794,13 +1168,22 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		m.queue.AddAfter(key, snapshotDebounceWindow)
 		return nil
 	}
+	if snapshot.Status.Generation == 0 {
+		for _, node := range selectedNodes {
+			if !m.nodeAttestationIsLive(node) {
+				m.attestationQueue.Add(node.Name)
+				m.queue.AddAfter(key, snapshotDebounceWindow)
+				return nil
+			}
+		}
+	}
 	if snapshot.Status.Generation == 0 && !m.batchAllowsInitialWrite(key, selectedNodes, members, complete) {
 		return nil
 	}
 	// Existing/pre-created snapshots must pass through the same cluster-scoped
 	// ownership boundary before any status write. This also closes the CRD-first
 	// rollout interval if a canonical object was seeded before writer admission.
-	if err := m.reservePhysicalClique(ctx, owner, snapshot.Spec.CliqueID); err != nil {
+	if err := m.reservePhysicalClique(ctx, owner, snapshot.Spec.CliqueID, nvapi.ComputeDomainCliqueProtocolControllerV1); err != nil {
 		return err
 	}
 	if complete {
@@ -811,6 +1194,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		withFinalizer := snapshot.DeepCopy()
 		withFinalizer.Finalizers = append(withFinalizer.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer)
 		result, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, withFinalizer, metav1.UpdateOptions{})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerAdd, err)
 		if err == nil {
 			m.recordWrite(key, result.ResourceVersion)
 		}
@@ -844,14 +1228,16 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 	updated.Status.Hash = publishedHash
 	updated.Status.ObservedGeneration = snapshot.Generation
 	updated.Status.Generation = desiredGeneration
+	publishedNodes := make(map[types.UID]struct{}, len(members))
+	if publishedPhase == nvapi.ComputeDomainCliqueSnapshotPhaseActive && complete {
+		for i := range members {
+			publishedNodes[members[i].NodeUID] = struct{}{}
+		}
+	}
 	for i := range updated.Status.Assignments {
-		for _, member := range members {
-			if updated.Status.Assignments[i].NodeUID == member.NodeUID {
-				if publishedPhase == nvapi.ComputeDomainCliqueSnapshotPhaseActive && complete {
-					updated.Status.Assignments[i].EverPublished = true
-					updated.Status.Assignments[i].LastAuthorizedGeneration = updated.Status.Generation
-				}
-			}
+		if _, found := publishedNodes[updated.Status.Assignments[i].NodeUID]; found {
+			updated.Status.Assignments[i].EverPublished = true
+			updated.Status.Assignments[i].LastAuthorizedGeneration = updated.Status.Generation
 		}
 	}
 	if allocationBlocked || handoffBlocked {
@@ -891,15 +1277,18 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		return nil
 	}
 	result, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-	writeResult := "success"
-	if err != nil {
-		writeResult = "error"
-	}
-	metrics.ObserveCliqueWrite(string(nvapi.ComputeDomainCliqueProtocolControllerV1), "update_status", writeResult)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, err)
 	if err == nil {
 		m.recordWrite(snapshot.Namespace+"/"+snapshot.Name, result.ResourceVersion)
 	}
 	return err
+}
+
+func (m *ControllerOwnedCliqueManager) nodeAttestationIsLive(node *corev1.Node) bool {
+	if m.liveAttestationCheck != nil {
+		return m.liveAttestationCheck(node)
+	}
+	return m.liveNodeAttestationAuthorized(node)
 }
 
 func snapshotEverPublished(snapshot *nvapi.ComputeDomainCliqueSnapshot) bool {
@@ -1028,6 +1417,9 @@ func (m *ControllerOwnedCliqueManager) batchAllowsInitialWrite(key string, nodes
 	return true
 }
 
+// firstFreeIndex is retained as an independently tested primitive. The bulk
+// allocator below builds its free-index list once instead of rescanning it for
+// each selected Node.
 func firstFreeIndex(used map[int]struct{}, capacity int) int {
 	for index := range capacity {
 		if _, exists := used[index]; !exists {
@@ -1070,15 +1462,23 @@ func allocateSelectedNodes(
 		return cmp.Compare(a.Name, b.Name)
 	})
 	blocked := false
+	free := make([]int, 0, capacity-len(used))
+	for index := range capacity {
+		if _, exists := used[index]; !exists {
+			free = append(free, index)
+		}
+	}
+	nextFree := 0
 	for _, node := range ordered {
 		if _, exists := byNode[node.UID]; exists {
 			continue
 		}
-		index := firstFreeIndex(used, capacity)
-		if index < 0 {
+		if nextFree >= len(free) {
 			blocked = true
 			continue
 		}
+		index := free[nextFree]
+		nextFree++
 		assignments = append(assignments, nvapi.ComputeDomainCliqueAssignment{
 			NodeName: node.Name, NodeUID: node.UID, Index: index,
 			State: nvapi.ComputeDomainCliqueAssignmentStateBound,

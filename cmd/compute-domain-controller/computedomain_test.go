@@ -80,7 +80,7 @@ func TestSelectComputeDomainCliqueProtocol(t *testing.T) {
 			if test.finalized {
 				cd.Finalizers = []string{computeDomainFinalizer}
 			}
-			got, err := selectComputeDomainCliqueProtocol(cd, test.gate, test.api, 18)
+			got, err := selectComputeDomainCliqueProtocol(cd, test.gate, test.api)
 			if test.wantErr {
 				require.Error(t, err)
 				return
@@ -91,15 +91,16 @@ func TestSelectComputeDomainCliqueProtocol(t *testing.T) {
 	}
 }
 
-func TestSelectComputeDomainCliqueProtocolRejectsDeclaredSizeAboveCapacity(t *testing.T) {
+func TestSelectComputeDomainCliqueProtocolAllowsDomainAcrossMultipleCliques(t *testing.T) {
 	cd := &nvapi.ComputeDomain{
 		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
 			nvapi.ComputeDomainCliqueRequestedProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
 		}},
-		Spec: nvapi.ComputeDomainSpec{NumNodes: 19},
+		Spec: nvapi.ComputeDomainSpec{NumNodes: 144},
 	}
-	_, err := selectComputeDomainCliqueProtocol(cd, true, true, 18)
-	require.ErrorContains(t, err, "exceeds the configured IMEX clique capacity")
+	protocol, err := selectComputeDomainCliqueProtocol(cd, true, true)
+	require.NoError(t, err)
+	require.Equal(t, nvapi.ComputeDomainCliqueProtocolControllerV1, protocol)
 }
 
 // NewComputeDomainManager only stores clientsets on the informer factories it

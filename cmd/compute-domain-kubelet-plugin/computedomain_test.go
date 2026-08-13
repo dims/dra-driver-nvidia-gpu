@@ -54,6 +54,7 @@ func TestComputeDomainManagerStartsWithoutSnapshotAPI(t *testing.T) {
 	})
 	coreClient := &recordingCoreClient{}
 	manager := newTestComputeDomainManager(t, nvidiaClient, coreClient, "")
+	manager.controllerOwnedEnabled = func() bool { return true }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	require.NoError(t, manager.Start(ctx))
@@ -71,6 +72,7 @@ func TestComputeDomainManagerStartsWithoutSnapshotAPI(t *testing.T) {
 func TestComputeDomainManagerStartsSnapshotInformerWhenAPIExists(t *testing.T) {
 	nvidiaClient := nvfake.NewSimpleClientset()
 	manager := newTestComputeDomainManager(t, nvidiaClient, &recordingCoreClient{}, "clique-a")
+	manager.controllerOwnedEnabled = func() bool { return true }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	require.NoError(t, manager.Start(ctx))
@@ -87,6 +89,26 @@ func TestComputeDomainManagerStartsSnapshotInformerWhenAPIExists(t *testing.T) {
 	}
 }
 
+func TestComputeDomainManagerLegacyDefaultSkipsControllerReaders(t *testing.T) {
+	nvidiaClient := nvfake.NewSimpleClientset()
+	coreClient := &recordingCoreClient{}
+	manager := newTestComputeDomainManager(t, nvidiaClient, coreClient, "clique-a")
+	manager.controllerOwnedEnabled = func() bool { return false }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, manager.Start(ctx))
+	require.False(t, manager.controllerReadersOn)
+	require.False(t, manager.snapshotAPIAvailable)
+	cancel()
+	require.NoError(t, manager.Stop())
+
+	for _, action := range nvidiaClient.Actions() {
+		require.NotEqual(t, "computedomaincliquesnapshots", action.GetResource().Resource)
+	}
+	coreClient.assertNoInformerFor(t, "pods")
+	coreClient.assertNoInformerFor(t, "nodes")
+}
+
 func TestSetGPUCliqueLabelRejectsRestartTopologyChange(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: testNodeName,
@@ -101,6 +123,37 @@ func TestSetGPUCliqueLabelRejectsRestartTopologyChange(t *testing.T) {
 
 	require.Equal(t, "old-clique", node.Annotations[computeDomainCliqueStartupAnnotationKey])
 	require.Empty(t, node.Labels[gpuCliqueLabelKey])
+}
+
+func TestStopPreservesVerifiedGPUCliqueLabel(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName, Labels: map[string]string{gpuCliqueLabelKey: "clique-a"}}}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(), coreClient, "clique-a")
+	manager.config.flags.gpuCliqueLabelEnabled = true
+	require.NoError(t, manager.Stop())
+	require.Equal(t, "clique-a", node.Labels[gpuCliqueLabelKey])
+}
+
+func TestLegacyNodeLabelHonorsControllerReservation(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName, Labels: map[string]string{gpuCliqueLabelKey: "clique-a"}}}
+	reservationName := "clique-" + hex.EncodeToString(sha256Sum("clique-a"))
+	reservation := &nvapi.ComputeDomainCliqueReservation{
+		ObjectMeta: metav1.ObjectMeta{Name: reservationName},
+		Spec: nvapi.ComputeDomainCliqueReservationSpec{
+			CliqueID: "clique-a", ComputeDomainUID: types.UID("other-cd"), ComputeDomainName: "other",
+			ComputeDomainNamespace: "other-ns", Protocol: nvapi.ComputeDomainCliqueProtocolControllerV1,
+		},
+	}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(reservation), coreClient, "clique-a")
+	err := manager.AddNodeLabel(context.Background(), "legacy-cd")
+	require.ErrorContains(t, err, "remains reserved")
+	require.Empty(t, node.Labels[computeDomainLabelKey])
+}
+
+func sha256Sum(value string) []byte {
+	digest := sha256.Sum256([]byte(value))
+	return digest[:]
 }
 
 func TestSetGPUCliqueLabelRejectsMissingRestartTopology(t *testing.T) {
@@ -132,6 +185,28 @@ func TestRefreshGPUCliqueIDInvalidatesNonemptyToEmpty(t *testing.T) {
 	require.Error(t, manager.assertTopologyValid())
 }
 
+func TestRefreshGPUCliqueIDInvalidatesEmptyToNonempty(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(), coreClient, "")
+	manager.controllerReadersOn = true
+	manager.getCliqueIDFunc = func() (string, error) { return "new-clique", nil }
+	err := manager.refreshGPUCliqueID(context.Background())
+	require.ErrorContains(t, err, `changed from "" to "new-clique"`)
+	require.Error(t, manager.assertTopologyValid())
+	require.Empty(t, manager.CliqueID(), "dynamic discovery must not change startup-scoped readers or daemon identity")
+}
+
+func TestRefreshGPUCliqueIDLegacyAdoptsLateNonemptyClique(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: testNodeName}}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(), coreClient, "")
+	manager.getCliqueIDFunc = func() (string, error) { return "late-clique", nil }
+	require.NoError(t, manager.refreshGPUCliqueID(context.Background()))
+	require.NoError(t, manager.assertTopologyValid())
+	require.Equal(t, "late-clique", manager.CliqueID())
+}
+
 func TestRefreshGPUCliqueIDInvalidatesOnDiscoveryError(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: testNodeName,
@@ -151,22 +226,6 @@ func TestRefreshGPUCliqueIDInvalidatesOnDiscoveryError(t *testing.T) {
 	require.Error(t, manager.assertTopologyValid())
 	require.Empty(t, node.Labels[gpuCliqueLabelKey])
 	require.Equal(t, "old-clique", node.Annotations[computeDomainCliqueStartupAnnotationKey])
-}
-
-func TestPhysicalCliqueReservationBlocksDifferentComputeDomain(t *testing.T) {
-	cliqueID := "clique-a"
-	digest := sha256.Sum256([]byte(cliqueID))
-	reservation := &nvapi.ComputeDomainCliqueReservation{
-		ObjectMeta: metav1.ObjectMeta{Name: "clique-" + hex.EncodeToString(digest[:])},
-		Spec: nvapi.ComputeDomainCliqueReservationSpec{
-			CliqueID: cliqueID, ComputeDomainUID: types.UID("old-cd"),
-			ComputeDomainName: "old", ComputeDomainNamespace: "tenant-a",
-			Protocol: nvapi.ComputeDomainCliqueProtocolControllerV1,
-		},
-	}
-	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(reservation), &recordingCoreClient{}, cliqueID)
-	require.ErrorContains(t, manager.AssertPhysicalCliqueAvailable(context.Background(), "new-cd"), "remains reserved")
-	require.NoError(t, manager.AssertPhysicalCliqueAvailable(context.Background(), "old-cd"))
 }
 
 func TestControllerOwnedReadinessUsesExactCachedIdentityAndReceipt(t *testing.T) {
@@ -428,6 +487,17 @@ func (c *recordingCoreClient) assertInformerScope(t *testing.T, resource, namesp
 	t.Fatalf("no core informer call found for %s", resource)
 }
 
+func (c *recordingCoreClient) assertNoInformerFor(t *testing.T, resource string) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, call := range c.calls {
+		if call.resource == resource && (call.verb == "list" || call.verb == "watch") {
+			t.Fatalf("unexpected core informer %s for %s", call.verb, resource)
+		}
+	}
+}
+
 func (c *recordingCoreClient) getNodeCalls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -490,6 +560,15 @@ func (n *recordingNodes) Get(_ context.Context, name string, _ metav1.GetOptions
 		return node.DeepCopy(), nil
 	}
 	return nil, apierrors.NewNotFound(corev1.Resource("nodes"), name)
+}
+
+func (n *recordingNodes) Update(_ context.Context, node *corev1.Node, _ metav1.UpdateOptions) (*corev1.Node, error) {
+	n.client.record(recordedCoreCall{verb: "update", resource: "nodes"})
+	if n.client.nodes[node.Name] == nil {
+		return nil, apierrors.NewNotFound(corev1.Resource("nodes"), node.Name)
+	}
+	n.client.nodes[node.Name] = node.DeepCopy()
+	return node.DeepCopy(), nil
 }
 
 func (n *recordingNodes) Patch(_ context.Context, name string, _ types.PatchType, data []byte, _ metav1.PatchOptions, _ ...string) (*corev1.Node, error) {

@@ -3,7 +3,11 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "dra-driver-nvidia-gpu.name" . }}-clusterrole-controller
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerRoleName" . }}
+  {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCObjectIdentity" . | nindent 4 }}
+  {{- end }}
 rules:
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomains"]
@@ -13,13 +17,20 @@ rules:
   verbs: ["update"]
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomaincliquereservations"]
-  verbs: ["get", "list", "create"]
+  verbs: ["get", "list", "watch", "create"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["resource.k8s.io"]
   resources: ["resourceclaimtemplates"]
   verbs: ["get", "list", "watch", "create", "update", "delete"]
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "create", "update"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles"]
+  resourceNames: [{{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . | quote }}]
+  verbs: ["get"]
 - apiGroups: [""]
   resources: ["nodes"]
   verbs: ["get", "list", "watch", "update"]
@@ -42,14 +53,18 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "dra-driver-nvidia-gpu.name" $ }}-clusterrole-binding-controller-{{ include "dra-driver-nvidia-gpu.namespace" . }}
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerBindingName" . }}
+  {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCObjectIdentity" . | nindent 4 }}
+  {{- end }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "dra-driver-nvidia-gpu.serviceAccountName" $ }}-controller
     namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
 roleRef:
   kind: ClusterRole
-  name: {{ include "dra-driver-nvidia-gpu.name" $ }}-clusterrole-controller
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerRoleName" . }}
   apiGroup: rbac.authorization.k8s.io
 
 {{- range $namespace := splitList "," (include "dra-driver-nvidia-gpu.namespaces" .) }}
@@ -57,8 +72,12 @@ roleRef:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "dra-driver-nvidia-gpu.name" $ }}-role-controller
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceRoleName" $ }}
   namespace: {{ $namespace }}
+  {{- if $.Values.controllerOwnedCDCliques.admissionEnabled }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCObjectIdentity" $ | nindent 4 }}
+  {{- end }}
 rules:
 - apiGroups: ["apps"]
   resources: ["daemonsets"]
@@ -76,15 +95,19 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "dra-driver-nvidia-gpu.name" $ }}-role-binding-controller
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceBindingName" $ }}
   namespace: {{ $namespace }}
+  {{- if $.Values.controllerOwnedCDCliques.admissionEnabled }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCObjectIdentity" $ | nindent 4 }}
+  {{- end }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "dra-driver-nvidia-gpu.serviceAccountName" $ }}-controller
     namespace: {{ include "dra-driver-nvidia-gpu.namespace" $ }}
 roleRef:
   kind: Role
-  name: {{ include "dra-driver-nvidia-gpu.name" $ }}-role-controller
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceRoleName" $ }}
   apiGroup: rbac.authorization.k8s.io
 {{- end }}
 {{- end }}

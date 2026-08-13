@@ -52,6 +52,8 @@ import (
 
 const (
 	computeDomainLabelKey                      = "resource.nvidia.com/computeDomain"
+	computeDomainAttestationAnnotationKey      = "resource.nvidia.com/computeDomainAttestation"
+	controllerOwnedCliqueIsolationLabelKey     = "resource.nvidia.com/controllerOwnedComputeDomain"
 	computeDomainCliqueLabelKey                = "resource.nvidia.com/computeDomain.cliqueID"
 	computeDomainCliqueStartupAnnotationKey    = "resource.nvidia.com/computeDomainCliqueStartupID"
 	computeDomainCliqueCapabilityAnnotationKey = "resource.nvidia.com/computeDomainCliqueProtocolCapability"
@@ -83,6 +85,7 @@ type ComputeDomainManager struct {
 	snapshotInformer     cache.SharedIndexInformer
 	snapshotLister       nvlisters.ComputeDomainCliqueSnapshotLister
 	snapshotAPIAvailable bool
+	controllerReadersOn  bool
 	podFactory           informers.SharedInformerFactory
 	podInformer          cache.SharedIndexInformer
 	podLister            corev1listers.PodLister
@@ -96,7 +99,8 @@ type ComputeDomainManager struct {
 	cliqueID        string
 	topologyInvalid bool
 
-	getCliqueIDFunc func() (string, error)
+	getCliqueIDFunc        func() (string, error)
+	controllerOwnedEnabled func() bool
 }
 
 type ComputeDomainDaemonSettings struct {
@@ -160,6 +164,9 @@ func NewComputeDomainManager(config *Config, getCliqueIDFunc func() (string, err
 		configFilesRoot:      configFilesRoot,
 		cliqueID:             cliqueID,
 		getCliqueIDFunc:      getCliqueIDFunc,
+		controllerOwnedEnabled: func() bool {
+			return featuregates.Enabled(featuregates.ControllerOwnedCDCliques)
+		},
 	}
 
 	return m, nil
@@ -208,25 +215,26 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 		return fmt.Errorf("error adding indexer for UIDs: %w", err)
 	}
 
-	m.snapshotAPIAvailable, err = m.probeSnapshotAPI(ctx)
-	if err != nil {
-		return err
+	m.computeDomainFactory.Start(ctx.Done())
+	if !cache.WaitForCacheSync(ctx.Done(), m.informer.HasSynced) {
+		return fmt.Errorf("ComputeDomain informer cache sync failed")
 	}
 
-	factories := []interface{ Start(<-chan struct{}) }{
-		m.computeDomainFactory,
-		m.podFactory,
-		m.nodeFactory,
-	}
-	if m.snapshotAPIAvailable {
-		factories = append(factories, m.snapshotFactory)
-	}
-	for _, factory := range factories {
-		m.waitGroup.Add(1)
-		go func() {
-			defer m.waitGroup.Done()
-			factory.Start(ctx.Done())
-		}()
+	// A legacy-only node does not need three additional Pod, Node, and full
+	// snapshot LIST/WATCH streams. Start controller-v1 readers only when the
+	// gate admits new controller-v1 domains or the cache proves that persisted
+	// controller-v1 state must keep working after the gate is disabled.
+	m.controllerReadersOn = m.controllerOwnedEnabled() || m.hasPersistedControllerV1()
+	if m.controllerReadersOn {
+		m.snapshotAPIAvailable, err = m.probeSnapshotAPI(ctx)
+		if err != nil {
+			return err
+		}
+		m.podFactory.Start(ctx.Done())
+		m.nodeFactory.Start(ctx.Done())
+		if m.snapshotAPIAvailable {
+			m.snapshotFactory.Start(ctx.Done())
+		}
 	}
 
 	m.waitGroup.Add(1)
@@ -235,12 +243,14 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 		m.periodicCleanup(ctx)
 	}()
 
-	syncs := []cache.InformerSynced{m.informer.HasSynced, m.podInformer.HasSynced, m.nodeInformer.HasSynced}
-	if m.snapshotAPIAvailable {
-		syncs = append(syncs, m.snapshotInformer.HasSynced)
-	}
-	if !cache.WaitForCacheSync(ctx.Done(), syncs...) {
-		return fmt.Errorf("informer cache sync for ComputeDomains failed")
+	if m.controllerReadersOn {
+		syncs := []cache.InformerSynced{m.podInformer.HasSynced, m.nodeInformer.HasSynced}
+		if m.snapshotAPIAvailable {
+			syncs = append(syncs, m.snapshotInformer.HasSynced)
+		}
+		if !cache.WaitForCacheSync(ctx.Done(), syncs...) {
+			return fmt.Errorf("controller-v1 readiness informer cache sync failed")
+		}
 	}
 
 	if m.config.flags.gpuCliqueLabelEnabled {
@@ -258,6 +268,16 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 	}
 
 	return nil
+}
+
+func (m *ComputeDomainManager) hasPersistedControllerV1() bool {
+	for _, object := range m.informer.GetStore().List() {
+		cd, ok := object.(*nvapi.ComputeDomain)
+		if ok && nvapi.EffectiveComputeDomainCliqueProtocol(nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation])) == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+			return true
+		}
+	}
+	return false
 }
 
 // probeSnapshotAPI lets legacy-only installations start before the snapshot
@@ -281,15 +301,10 @@ func (m *ComputeDomainManager) Stop() error {
 		m.cancelContext()
 	}
 	m.waitGroup.Wait()
-
-	if m.config.flags.gpuCliqueLabelEnabled {
-		rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := m.RemoveGPUCliqueLabel(rmCtx); err != nil {
-			klog.Errorf("error removing %s node label: %v", gpuCliqueLabelKey, err)
-		}
-	}
-
+	// Preserve the last verified topology label across an ordinary plugin
+	// rollout. A transient removal can delete the daemon Pod and quarantine an
+	// already-published controller-v1 slot. Validation paths still remove it
+	// when the actual hardware identity changes or becomes unverifiable.
 	return nil
 }
 
@@ -692,49 +707,48 @@ func (m *ComputeDomainManager) AssertComputeDomainNamespace(ctx context.Context,
 	return nil
 }
 
+// AddNodeLabel publishes the legacy-v1 routing projection. controller-v1 uses
+// the controller's claim-derived attestation instead, so a kubelet can never
+// authorize itself into a controller-owned snapshot.
 func (m *ComputeDomainManager) AddNodeLabel(ctx context.Context, cdUID string) error {
 	if err := m.assertTopologyValid(); err != nil {
 		return err
 	}
-	// A retained controller-v1 reservation is a durable warning that an old
-	// runtime on this physical clique may still own its indices. Check before
-	// publishing the Node selection label, then repeat at daemon-claim Prepare
-	// to close the interval between these two lifecycle steps.
 	if err := m.AssertPhysicalCliqueAvailable(ctx, cdUID); err != nil {
 		return err
 	}
-
 	node, err := m.config.clientsets.Core.CoreV1().Nodes().Get(ctx, m.config.flags.nodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error retrieving Node: %w", err)
 	}
-
-	currentValue, exists := node.Labels[computeDomainLabelKey]
-	if exists && currentValue != cdUID {
-		return fmt.Errorf("label already exists for a different ComputeDomain")
+	if node.Annotations[computeDomainAttestationAnnotationKey] != "" {
+		return fmt.Errorf("controller-owned ComputeDomain attestation already exists on Node")
 	}
-
-	if exists && currentValue == cdUID {
+	if owner := node.Labels[controllerOwnedCliqueIsolationLabelKey]; owner != "" {
+		return fmt.Errorf("physical clique is isolated for controller-owned ComputeDomain %q", owner)
+	}
+	if current, exists := node.Labels[computeDomainLabelKey]; exists {
+		if current != cdUID {
+			return fmt.Errorf("label already exists for a different ComputeDomain")
+		}
 		return nil
 	}
-
-	newNode := node.DeepCopy()
-	if newNode.Labels == nil {
-		newNode.Labels = make(map[string]string)
+	updated := node.DeepCopy()
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
 	}
-	newNode.Labels[computeDomainLabelKey] = cdUID
-
-	if _, err = m.config.clientsets.Core.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{}); err != nil {
+	updated.Labels[computeDomainLabelKey] = cdUID
+	if _, err := m.config.clientsets.Core.CoreV1().Nodes().Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("error updating Node with label: %w", err)
 	}
-
 	return nil
 }
 
-// AssertPhysicalCliqueAvailable prevents a new daemon from starting on a
-// clique reserved by a different, potentially still-running ComputeDomain.
-// It is deliberately protocol-neutral: a retained controller-v1 tombstone
-// must also stop legacy-v1 from reusing the same hardware indices.
+// AssertPhysicalCliqueAvailable prevents legacy-v1 from entering a physical
+// clique retained by an unfenced controller-v1 stream. Legacy formation does
+// not create a permanent reservation of its own: brownfield racks must remain
+// reusable, and controller-v1 canaries are restricted to virgin or externally
+// quiesced whole cliques until a verified legacy retirement protocol exists.
 func (m *ComputeDomainManager) AssertPhysicalCliqueAvailable(ctx context.Context, cdUID string) error {
 	if err := m.assertTopologyValid(); err != nil {
 		return err
@@ -761,29 +775,21 @@ func (m *ComputeDomainManager) AssertPhysicalCliqueAvailable(ctx context.Context
 	return nil
 }
 
-// RemoveNodeLabel() attempts removal and returns no error if the label was
-// removed or didn't exist in the first place.
+// RemoveNodeLabel removes only a legacy routing projection. A controller
+// attestation is controller-owned and is deliberately left untouched.
 func (m *ComputeDomainManager) RemoveNodeLabel(ctx context.Context, cdUID string) error {
 	node, err := m.config.clientsets.Core.CoreV1().Nodes().Get(ctx, m.config.flags.nodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error retrieving Node: %w", err)
 	}
-
-	if _, exists := node.Labels[computeDomainLabelKey]; !exists {
+	if node.Annotations[computeDomainAttestationAnnotationKey] != "" || node.Labels[computeDomainLabelKey] != cdUID {
 		return nil
 	}
-
-	if node.Labels[computeDomainLabelKey] != cdUID {
-		return nil
-	}
-
-	newNode := node.DeepCopy()
-	delete(newNode.Labels, computeDomainLabelKey)
-
-	if _, err := m.config.clientsets.Core.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{}); err != nil {
+	updated := node.DeepCopy()
+	delete(updated.Labels, computeDomainLabelKey)
+	if _, err := m.config.clientsets.Core.CoreV1().Nodes().Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("error updating Node to remove label: %w", err)
 	}
-
 	return nil
 }
 
@@ -886,8 +892,10 @@ func (m *ComputeDomainManager) periodicGPUCliqueIDRefresh(ctx context.Context) {
 	}
 }
 
-// refreshGPUCliqueLabel re-reads the GPU clique ID and, if it differs from
-// the last known value, updates the in-memory state and the node label.
+// refreshGPUCliqueID re-reads the GPU clique ID. Topology is fixed for this
+// plugin process because the snapshot watch and any running daemon were scoped
+// at startup; every change, including empty-to-nonempty discovery, therefore
+// requires a drain/fence and restart instead of in-place adoption.
 func (m *ComputeDomainManager) refreshGPUCliqueID(ctx context.Context) error {
 	newCliqueID, err := m.getCliqueIDFunc()
 	if err != nil {
@@ -910,7 +918,13 @@ func (m *ComputeDomainManager) refreshGPUCliqueID(ctx context.Context) error {
 		return fmt.Errorf("error getting cliqueID: %w", err)
 	}
 
-	if oldCliqueID := m.CliqueID(); oldCliqueID != "" && newCliqueID != oldCliqueID {
+	oldCliqueID := m.CliqueID()
+	if oldCliqueID == "" && newCliqueID != "" && !m.controllerReadersOn {
+		// Preserve legacy late fabric registration. With no controller-v1
+		// snapshot/Pod readers, no informer or daemon identity was scoped to the
+		// empty startup value, so the historical dynamic adoption is safe.
+		m.setCliqueID(newCliqueID)
+	} else if newCliqueID != oldCliqueID {
 		m.cliqueIDMu.Lock()
 		m.topologyInvalid = true
 		m.cliqueIDMu.Unlock()

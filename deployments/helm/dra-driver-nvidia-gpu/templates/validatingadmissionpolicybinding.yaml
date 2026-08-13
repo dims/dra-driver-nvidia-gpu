@@ -1,48 +1,164 @@
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: resourceslices-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
 spec:
-  policyName: resourceslices-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "controllerownedcdc-rbac-binding-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "controllerownedcdc-rbac-binding-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "controllerownedcdc-namespaced-rbac-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "controllerownedcdc-namespaced-rbac-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "controllerownedcdc-workload-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "controllerownedcdc-workload-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "resourceslices-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "resourceslices-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
   validationActions: [Deny]
   # All ResourceSlices are matched.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: computedomain-reserved-metadata-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-reserved-metadata-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
 spec:
-  policyName: computedomain-reserved-metadata-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-reserved-metadata-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: computedomain-node-topology-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-node-topology-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
 spec:
-  policyName: computedomain-node-topology-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-node-topology-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: computedomain-protocol-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-node-attestation-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
 spec:
-  policyName: computedomain-protocol-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-node-attestation-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: computedomain-reservation-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-protocol-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
 spec:
-  policyName: computedomain-reservation-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-protocol-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
   validationActions: [Deny]
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: computedomain-snapshot-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-reservation-writer-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
 spec:
-  policyName: computedomain-snapshot-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-reservation-writer-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
   validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-snapshot-writer-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-snapshot-writer-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+{{- end }}

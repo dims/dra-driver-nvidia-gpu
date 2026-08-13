@@ -21,9 +21,11 @@ import (
 	"context"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
+	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/imex"
@@ -94,33 +96,50 @@ func NewController(config *Config) *Controller {
 // graceful shutdown when the context is cancelled.
 func (c *Controller) Run(ctx context.Context) error {
 	workQueue := workqueue.New(workqueue.DefaultControllerRateLimiter())
+	requiresControllerOwned, err := controllerOwnedStateRequired(ctx, c.config)
+	if err != nil {
+		return err
+	}
+	if requiresControllerOwned {
+		if err := validateControllerOwnedCDCInstallation(ctx, c.config); err != nil {
+			return err
+		}
+	}
 
 	// API support is independent of the feature gate. The gate chooses the
 	// default for newly admitted ComputeDomains; persisted controller-v1
 	// domains must keep reconciling after an operator disables that default.
-	controllerOwnedAvailable := true
-	if discovery := c.config.clientsets.Nvidia.Discovery(); discovery != nil {
-		resources, err := discovery.ServerResourcesForGroupVersion("resource.nvidia.com/v1beta1")
-		if err != nil {
-			if featuregates.Enabled(featuregates.ControllerOwnedCDCliques) {
-				klog.Errorf("controller-owned API discovery preflight failed: %v", err)
+	controllerOwnedAvailable := requiresControllerOwned
+	if requiresControllerOwned {
+		if discovery := c.config.clientsets.Nvidia.Discovery(); discovery != nil {
+			resources, err := discovery.ServerResourcesForGroupVersion("resource.nvidia.com/v1beta1")
+			if err != nil {
+				if featuregates.Enabled(featuregates.ControllerOwnedCDCliques) {
+					klog.Errorf("controller-owned API discovery preflight failed: %v", err)
+				}
+				controllerOwnedAvailable = false
+			} else if !apiResourcePresent(resources.APIResources, "computedomaincliquesnapshots/status") || !apiResourcePresent(resources.APIResources, "computedomaincliquereservations") {
+				klog.Errorf("controller-owned API discovery is missing the snapshot status subresource or physical clique reservations")
+				controllerOwnedAvailable = false
 			}
-			controllerOwnedAvailable = false
-		} else if !apiResourcePresent(resources.APIResources, "computedomaincliquesnapshots/status") || !apiResourcePresent(resources.APIResources, "computedomaincliquereservations") {
-			klog.Errorf("controller-owned API discovery is missing the snapshot status subresource or physical clique reservations")
-			controllerOwnedAvailable = false
 		}
 	}
-	if _, err := c.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().List(ctx, metav1.ListOptions{Limit: 1}); err != nil {
-		if featuregates.Enabled(featuregates.ControllerOwnedCDCliques) {
-			klog.Errorf("controller-owned physical clique reservation API preflight failed; new ComputeDomains cannot use controller-v1: %v", err)
+	if requiresControllerOwned {
+		if _, err := c.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().List(ctx, metav1.ListOptions{Limit: 1}); err != nil {
+			if featuregates.Enabled(featuregates.ControllerOwnedCDCliques) {
+				klog.Errorf("controller-owned physical clique reservation API preflight failed; new ComputeDomains cannot use controller-v1: %v", err)
+			}
+			controllerOwnedAvailable = false
 		}
-		controllerOwnedAvailable = false
 	}
 	namespaces := append([]string{c.config.flags.namespace}, c.config.flags.additionalNamespaces.Value()...)
 	namespaceAvailable := make(map[string]bool, len(namespaces))
 	for _, namespace := range namespaces {
 		if _, checked := namespaceAvailable[namespace]; checked {
+			continue
+		}
+		if !requiresControllerOwned {
+			namespaceAvailable[namespace] = false
 			continue
 		}
 		_, err := c.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).List(ctx, metav1.ListOptions{Limit: 1})
@@ -131,6 +150,9 @@ func (c *Controller) Run(ctx context.Context) error {
 				controllerOwnedAvailable = false
 			}
 		}
+	}
+	if requiresControllerOwned && !c.config.imexConfig.EffectiveHostManaged() && !controllerOwnedAvailable {
+		return fmt.Errorf("claim-attested ComputeDomain Node routing requires the reservation and snapshot APIs; install and establish both CRDs before rolling out controller and kubelet binaries")
 	}
 
 	managerConfig := &ManagerConfig{
@@ -184,6 +206,64 @@ func (c *Controller) Run(ctx context.Context) error {
 		cliqueManager.Stop()
 	}
 
+	return nil
+}
+
+// controllerOwnedStateRequired separates the alpha protocol's durable runtime
+// requirements from the legacy default. The feature gate admits new streams;
+// persisted protocol markers or reservations keep the controller active after
+// that default is disabled. A legacy-only installation does not require the
+// alpha CRDs, installation marker, topology publishing, or leader election.
+func controllerOwnedStateRequired(ctx context.Context, config *Config) (bool, error) {
+	if featuregates.Enabled(featuregates.ControllerOwnedCDCliques) {
+		return true, nil
+	}
+	computeDomains, err := config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("check persisted ComputeDomain protocols: %w", err)
+	}
+	for i := range computeDomains.Items {
+		if computeDomains.Items[i].Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation] == string(nvapi.ComputeDomainCliqueProtocolControllerV1) {
+			return true, nil
+		}
+	}
+	reservations, err := config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().List(ctx, metav1.ListOptions{Limit: 1})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check persisted controller-owned clique reservations: %w", err)
+	}
+	return len(reservations.Items) > 0, nil
+}
+
+func validateControllerOwnedCDCInstallation(ctx context.Context, config *Config) error {
+	installation, err := config.clientsets.Core.RbacV1().ClusterRoles().Get(ctx, controllerOwnedCDCInstallationPolicyName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("controller-owned CDC installation guard %q is missing; install the chart admission policies before starting the controller", controllerOwnedCDCInstallationPolicyName)
+		}
+		return fmt.Errorf("read controller-owned CDC installation guard %q: %w", controllerOwnedCDCInstallationPolicyName, err)
+	}
+	expectedSubject := fmt.Sprintf("system:serviceaccount:%s:%s", config.flags.namespace, config.flags.serviceAccountName)
+	return validateControllerOwnedCDCInstallationIdentity(installation.Annotations, config.flags.installationID, config.flags.namespace, expectedSubject)
+}
+
+func validateControllerOwnedCDCInstallationIdentity(annotations map[string]string, installationID, namespace, controllerSubject string) error {
+	checks := []struct {
+		annotation  string
+		expected    string
+		description string
+	}{
+		{controllerOwnedCDCInstallationAnnotation, installationID, "Helm installation"},
+		{controllerOwnedCDCControlNamespaceAnnotation, namespace, "control namespace"},
+		{controllerOwnedCDCControllerSubjectAnnotation, controllerSubject, "controller ServiceAccount"},
+	}
+	for _, check := range checks {
+		if actual := annotations[check.annotation]; actual != check.expected {
+			return fmt.Errorf("controller-owned CDC single-install preflight rejected this process: %s in installation guard %q is %q, expected %q", check.description, controllerOwnedCDCInstallationPolicyName, actual, check.expected)
+		}
+	}
 	return nil
 }
 

@@ -53,7 +53,11 @@ import (
 )
 
 const (
-	DriverName = "compute-domain.nvidia.com"
+	DriverName                                    = "compute-domain.nvidia.com"
+	controllerOwnedCDCInstallationPolicyName      = "controller-owned-cdc-installation.dra-driver-nvidia-gpu"
+	controllerOwnedCDCInstallationAnnotation      = "resource.nvidia.com/controller-owned-cdc-installation"
+	controllerOwnedCDCControlNamespaceAnnotation  = "resource.nvidia.com/controller-owned-cdc-control-namespace"
+	controllerOwnedCDCControllerSubjectAnnotation = "resource.nvidia.com/controller-owned-cdc-controller-subject"
 
 	// This constant provides a reasonable default for the maximum size of
 	// a given IMEX Domain. On GB200 and GB300 the limit is 18, so we pick
@@ -68,6 +72,8 @@ type Flags struct {
 
 	podName               string
 	namespace             string
+	serviceAccountName    string
+	installationID        string
 	imageName             string
 	maxNodesPerIMEXDomain int
 	logVerbosityCDDaemon  int
@@ -140,6 +146,18 @@ func newApp() *cli.App {
 			Required:    true,
 			Destination: &flags.podName,
 			EnvVars:     []string{"POD_NAME"},
+		},
+		&cli.StringFlag{
+			Name:        "service-account-name",
+			Usage:       "The ServiceAccount name used by this controller Pod.",
+			Destination: &flags.serviceAccountName,
+			EnvVars:     []string{"SERVICE_ACCOUNT_NAME"},
+		},
+		&cli.StringFlag{
+			Name:        "controller-owned-cdc-installation-id",
+			Usage:       "Immutable Helm release identity which owns cluster-scoped controller-owned CDC admission.",
+			Destination: &flags.installationID,
+			EnvVars:     []string{"CONTROLLER_OWNED_CDC_INSTALLATION_ID"},
 		},
 		&cli.StringFlag{
 			Name:        "namespace",

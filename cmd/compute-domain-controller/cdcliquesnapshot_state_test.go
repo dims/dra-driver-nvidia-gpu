@@ -1,0 +1,449 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
+
+	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
+	nvfake "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/clientset/versioned/fake"
+)
+
+type observedFakeAPIAction struct {
+	verb        string
+	resource    string
+	subresource string
+	result      string
+	mutated     bool
+}
+
+type controllerOwnedCliqueHarness struct {
+	manager    *ControllerOwnedCliqueManager
+	nvidia     *nvfake.Clientset
+	observed   []observedFakeAPIAction
+	cd         *nvapi.ComputeDomain
+	daemonSet  *appsv1.DaemonSet
+	key        string
+	cliqueID   string
+	nextObject int
+}
+
+func setTestNodeAttestation(t testing.TB, node *corev1.Node, cdUID, podUID string) {
+	t.Helper()
+	encoded, err := json.Marshal(computeDomainNodeAttestation{
+		ComputeDomainUID: types.UID(cdUID),
+		NodeUID:          node.UID,
+		PodUID:           types.UID(podUID),
+		ResourceClaimUID: types.UID("claim-" + podUID),
+		Protocol:         nvapi.ComputeDomainCliqueProtocolControllerV1,
+	})
+	require.NoError(t, err)
+	if node.Annotations == nil {
+		node.Annotations = make(map[string]string)
+	}
+	node.Annotations[computeDomainAttestationAnnotationKey] = string(encoded)
+}
+
+func newControllerOwnedCliqueHarness(t *testing.T, expectedNodes int) *controllerOwnedCliqueHarness {
+	t.Helper()
+	oldTemplatePath := DaemonSetTemplatePath
+	DaemonSetTemplatePath = "../../templates/compute-domain-daemon.tmpl.yaml"
+	t.Cleanup(func() { DaemonSetTemplatePath = oldTemplatePath })
+
+	cd := &nvapi.ComputeDomain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "domain",
+			Namespace: "workload",
+			UID:       types.UID("cd-uid"),
+			Annotations: map[string]string{
+				nvapi.ComputeDomainCliqueProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+			},
+		},
+		Spec: nvapi.ComputeDomainSpec{
+			NumNodes: expectedNodes,
+			Channel: &nvapi.ComputeDomainChannelSpec{
+				ResourceClaimTemplate: nvapi.ComputeDomainResourceClaimTemplate{Name: "workload-template"},
+			},
+		},
+	}
+	nvidia := nvfake.NewSimpleClientset(cd.DeepCopy())
+	config := &ManagerConfig{
+		driverNamespace:       "driver",
+		imageName:             "example.invalid/daemon:test",
+		maxNodesPerIMEXDomain: max(expectedNodes, 18),
+		clientsets: flags.ClientSets{
+			Nvidia: nvidia,
+		},
+	}
+	ds, err := expectedDaemonSet(cd, fmt.Sprintf("computedomain-daemon-%s", cd.UID), config)
+	require.NoError(t, err)
+	ds.UID = types.UID("ds-uid")
+
+	h := &controllerOwnedCliqueHarness{
+		nvidia:     nvidia,
+		cd:         cd,
+		daemonSet:  ds,
+		cliqueID:   "clique-a",
+		nextObject: 1,
+	}
+	h.manager = NewControllerOwnedCliqueManager(config)
+	// This harness isolates the snapshot state machine. The full live
+	// Pod->claim->template attestation chain is exercised separately in
+	// nodeattestation_test.go.
+	h.manager.liveAttestationCheck = func(*corev1.Node) bool { return true }
+	require.NoError(t, h.manager.addInformerIndexes())
+	require.NoError(t, h.manager.computeDomainInformer.GetStore().Add(cd.DeepCopy()))
+	require.NoError(t, h.manager.daemonSetInformer.GetStore().Add(ds.DeepCopy()))
+	h.key = config.driverNamespace + "/" + snapshotName(string(cd.UID), h.cliqueID)
+	h.manager.pendingScopes[h.key] = snapshotScope{computeDomainUID: string(cd.UID), cliqueID: h.cliqueID}
+	t.Cleanup(func() {
+		h.manager.queue.ShutDown()
+		h.manager.attestationQueue.ShutDown()
+	})
+
+	objectReaction := clienttesting.ObjectReaction(nvidia.Tracker())
+	nvidia.PrependReactor("*", "*", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if objectAction, ok := action.(interface{ GetObject() runtime.Object }); ok && (action.GetVerb() == "create" || action.GetVerb() == "update") {
+			accessor, accessorErr := apiMeta.Accessor(objectAction.GetObject())
+			require.NoError(t, accessorErr)
+			accessor.SetResourceVersion(strconv.Itoa(h.nextObject))
+			if accessor.GetUID() == "" {
+				accessor.SetUID(types.UID(fmt.Sprintf("fake-uid-%d", h.nextObject)))
+			}
+			h.nextObject++
+		}
+		_, result, reactionErr := objectReaction(action)
+		outcome := "success"
+		if apierrors.IsAlreadyExists(reactionErr) {
+			outcome = "already_exists"
+		} else if reactionErr != nil {
+			outcome = "error"
+		}
+		mutated := reactionErr == nil && (action.GetVerb() == "create" || action.GetVerb() == "update" || action.GetVerb() == "delete" || action.GetVerb() == "patch")
+		h.observed = append(h.observed, observedFakeAPIAction{
+			verb:        action.GetVerb(),
+			resource:    action.GetResource().Resource,
+			subresource: action.GetSubresource(),
+			result:      outcome,
+			mutated:     mutated,
+		})
+		return true, result, reactionErr
+	})
+	return h
+}
+
+func (h *controllerOwnedCliqueHarness) addNodeAndPod(t *testing.T, ordinal int) {
+	t.Helper()
+	controller := true
+	nodeName := fmt.Sprintf("node-%02d", ordinal)
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: nodeName,
+		UID:  types.UID(fmt.Sprintf("node-uid-%02d", ordinal)),
+		Labels: map[string]string{
+			computeDomainLabelKey:                  string(h.cd.UID),
+			gpuCliqueNodeLabelKey:                  h.cliqueID,
+			controllerOwnedCliqueIsolationLabelKey: string(h.cd.UID),
+		},
+		Annotations: map[string]string{
+			computeDomainCliqueStartupAnnotationKey:    h.cliqueID,
+			computeDomainCliqueCapabilityAnnotationKey: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+		},
+	}}
+	setTestNodeAttestation(t, node, string(h.cd.UID), fmt.Sprintf("pod-uid-%02d", ordinal))
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "daemon-" + nodeName,
+			Namespace: "driver",
+			UID:       types.UID(fmt.Sprintf("pod-uid-%02d", ordinal)),
+			Labels:    map[string]string{computeDomainLabelKey: string(h.cd.UID)},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: appsv1.SchemeGroupVersion.String(),
+				Kind:       "DaemonSet",
+				Name:       h.daemonSet.Name,
+				UID:        h.daemonSet.UID,
+				Controller: &controller,
+			}},
+		},
+		Spec: corev1.PodSpec{NodeName: nodeName},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: fmt.Sprintf("10.0.0.%d", ordinal+1),
+		},
+	}
+	require.NoError(t, h.manager.nodeInformer.GetStore().Add(node))
+	require.NoError(t, h.manager.podInformer.GetStore().Add(pod))
+	h.manager.rebuildSelectedNodeState()
+}
+
+func (h *controllerOwnedCliqueHarness) syncSnapshotInformer(t *testing.T) *nvapi.ComputeDomainCliqueSnapshot {
+	t.Helper()
+	obj, err := h.nvidia.Tracker().Get(
+		nvapi.SchemeGroupVersion.WithResource("computedomaincliquesnapshots"),
+		"driver",
+		snapshotName(string(h.cd.UID), h.cliqueID),
+	)
+	require.NoError(t, err)
+	snapshot, ok := obj.(*nvapi.ComputeDomainCliqueSnapshot)
+	require.True(t, ok)
+	key := snapshot.Namespace + "/" + snapshot.Name
+	_, exists, err := h.manager.snapshotInformer.GetStore().GetByKey(key)
+	require.NoError(t, err)
+	if exists {
+		require.NoError(t, h.manager.snapshotInformer.GetStore().Update(snapshot.DeepCopy()))
+	} else {
+		require.NoError(t, h.manager.snapshotInformer.GetStore().Add(snapshot.DeepCopy()))
+	}
+	return snapshot.DeepCopy()
+}
+
+func fakeActionNames(actions []observedFakeAPIAction) []string {
+	names := make([]string, len(actions))
+	for i := range actions {
+		names[i] = actions[i].verb + ":" + actions[i].resource
+		if actions[i].subresource != "" {
+			names[i] += "/" + actions[i].subresource
+		}
+		if actions[i].result != "success" {
+			names[i] += ":" + actions[i].result
+		}
+	}
+	return names
+}
+
+func countFakeMutations(actions []observedFakeAPIAction, resource string) int {
+	count := 0
+	for _, action := range actions {
+		if action.resource == resource && action.mutated {
+			count++
+		}
+	}
+	return count
+}
+
+func TestIndexedReconcileInputsAreCliqueScoped(t *testing.T) {
+	nodes := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		computeDomainCliqueIndex: nodeComputeDomainCliqueIndexKeys,
+	})
+	pods := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		podComputeDomainNodeIndex: podComputeDomainNodeIndexKeys,
+	})
+	for clique := range 2 {
+		cliqueID := fmt.Sprintf("clique-%d", clique)
+		for member := range 3 {
+			nodeName := fmt.Sprintf("node-%d-%d", clique, member)
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName,
+				UID:  types.UID("uid-" + nodeName),
+				Labels: map[string]string{
+					computeDomainLabelKey:                  "cd",
+					gpuCliqueNodeLabelKey:                  cliqueID,
+					controllerOwnedCliqueIsolationLabelKey: "cd",
+				},
+			}}
+			setTestNodeAttestation(t, node, "cd", "pod-"+nodeName)
+			require.NoError(t, nodes.Add(node))
+			require.NoError(t, pods.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name:      "pod-" + nodeName,
+				Namespace: "driver",
+				Labels:    map[string]string{computeDomainLabelKey: "cd"},
+			}, Spec: corev1.PodSpec{NodeName: nodeName}}))
+		}
+	}
+	require.NoError(t, nodes.Add(&corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "unattested-spoof",
+		Labels: map[string]string{
+			computeDomainLabelKey: "cd",
+			gpuCliqueNodeLabelKey: "clique-1",
+		},
+	}}))
+
+	selected, err := selectedNodesForClique(nodes, "cd", "clique-1")
+	require.NoError(t, err)
+	require.Len(t, selected, 3)
+	candidates, err := candidatePodsForNodes(pods, "cd", selected)
+	require.NoError(t, err)
+	require.Len(t, candidates, 3)
+	for _, candidate := range candidates {
+		require.Contains(t, candidate.Spec.NodeName, "node-1-")
+	}
+	require.True(t, expectedSetReadyForSummary(selectedNodeSummary{selected: 6, topologyReady: 6}, 6))
+	require.False(t, expectedSetReadyForSummary(selectedNodeSummary{selected: 6, topologyReady: 5}, 6))
+}
+
+func TestNodeEventsBroadcastOnlyOnExpectedSetTransition(t *testing.T) {
+	cd := &nvapi.ComputeDomain{
+		ObjectMeta: metav1.ObjectMeta{Name: "domain", Namespace: "workload", UID: types.UID("cd")},
+		Spec:       nvapi.ComputeDomainSpec{NumNodes: 4},
+	}
+	m := NewControllerOwnedCliqueManager(&ManagerConfig{
+		driverNamespace: "driver",
+		clientsets:      flags.ClientSets{Nvidia: nvfake.NewSimpleClientset(cd.DeepCopy())},
+	})
+	require.NoError(t, m.addInformerIndexes())
+	require.NoError(t, m.computeDomainInformer.GetStore().Add(cd.DeepCopy()))
+	t.Cleanup(func() {
+		m.queue.ShutDown()
+		m.attestationQueue.ShutDown()
+	})
+
+	for _, cliqueID := range []string{"clique-a", "clique-b"} {
+		require.NoError(t, m.snapshotInformer.GetStore().Add(&nvapi.ComputeDomainCliqueSnapshot{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "driver", Name: snapshotName(string(cd.UID), cliqueID)},
+			Spec: nvapi.ComputeDomainCliqueSnapshotSpec{
+				ComputeDomainUID: cd.UID,
+				CliqueID:         cliqueID,
+			},
+		}))
+	}
+	var changed *corev1.Node
+	for clique := range 2 {
+		cliqueID := fmt.Sprintf("clique-%c", 'a'+clique)
+		for member := range 2 {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("node-%d-%d", clique, member),
+				Labels: map[string]string{
+					computeDomainLabelKey:                  string(cd.UID),
+					gpuCliqueNodeLabelKey:                  cliqueID,
+					controllerOwnedCliqueIsolationLabelKey: string(cd.UID),
+				},
+				Annotations: map[string]string{
+					computeDomainCliqueStartupAnnotationKey:    cliqueID,
+					computeDomainCliqueCapabilityAnnotationKey: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+				},
+			}}
+			setTestNodeAttestation(t, node, string(cd.UID), "pod-"+node.Name)
+			require.NoError(t, m.nodeInformer.GetStore().Add(node))
+			if clique == 0 && member == 0 {
+				changed = node
+			}
+		}
+	}
+	m.rebuildSelectedNodeState()
+	require.True(t, m.expectedSetReady(string(cd.UID), cd.Spec.NumNodes))
+
+	drain := func() []string {
+		keys := make([]string, 0, m.queue.Len())
+		for m.queue.Len() > 0 {
+			key, shutdown := m.queue.Get()
+			require.False(t, shutdown)
+			keys = append(keys, key)
+			m.queue.Done(key)
+		}
+		slices.Sort(keys)
+		return keys
+	}
+
+	// An unrelated Node update touches only its clique, even though another
+	// clique snapshot exists for the same ComputeDomain.
+	unrelated := changed.DeepCopy()
+	unrelated.Annotations["example.com/unrelated"] = "changed"
+	m.handleNodeEvent(changed, unrelated)
+	require.Equal(t, []string{"driver/" + snapshotName(string(cd.UID), "clique-a")}, drain())
+
+	// Losing topology readiness crosses the domain-wide expected-set barrier,
+	// so all existing clique snapshots must be re-evaluated exactly once.
+	notReady := unrelated.DeepCopy()
+	delete(notReady.Annotations, computeDomainCliqueCapabilityAnnotationKey)
+	m.handleNodeEvent(unrelated, notReady)
+	wantBroadcast := []string{
+		"driver/" + snapshotName(string(cd.UID), "clique-a"),
+		"driver/" + snapshotName(string(cd.UID), "clique-b"),
+	}
+	slices.Sort(wantBroadcast)
+	require.Equal(t, wantBroadcast, drain())
+}
+
+func TestControllerOwnedCliqueExpectedSetFormationActionSequence(t *testing.T) {
+	h := newControllerOwnedCliqueHarness(t, 2)
+	h.addNodeAndPod(t, 0)
+
+	// Creation establishes physical ownership and the Pending snapshot, but an
+	// incomplete expected set must not publish assignments or status.
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	require.Equal(t, []string{
+		"create:computedomaincliquereservations",
+		"create:computedomaincliquesnapshots",
+	}, fakeActionNames(h.observed))
+	snapshot := h.syncSnapshotInformer(t)
+	require.Zero(t, snapshot.Status.Generation)
+	require.Empty(t, snapshot.Finalizers)
+
+	actionsBeforeIncompleteReconcile := len(h.observed)
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	require.Len(t, h.observed, actionsBeforeIncompleteReconcile, "an incomplete expected set must not issue an API call")
+
+	// The final Node makes the exact expected set ready. Expire the test's
+	// in-memory batch timer so the next reconcile reaches the API immediately.
+	h.addNodeAndPod(t, 1)
+	h.manager.batchStarted[h.key] = time.Now().Add(-snapshotHardDeadline)
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	require.Equal(t, []string{
+		"create:computedomaincliquereservations",
+		"create:computedomaincliquesnapshots",
+		"update:computedomaincliquesnapshots",
+	}, fakeActionNames(h.observed))
+	snapshot = h.syncSnapshotInformer(t)
+	require.Contains(t, snapshot.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer)
+	require.Zero(t, snapshot.Status.Generation, "the finalizer must commit before Active status")
+
+	// The finalizer is a separate mutation. Expire the restarted initial-status
+	// batch as well so this deterministic harness does not wait on wall time.
+	h.manager.batchStarted[h.key] = time.Now().Add(-snapshotHardDeadline)
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	require.Equal(t, []string{
+		"create:computedomaincliquereservations",
+		"create:computedomaincliquesnapshots",
+		"update:computedomaincliquesnapshots",
+		"update:computedomaincliquesnapshots/status",
+	}, fakeActionNames(h.observed))
+	snapshot = h.syncSnapshotInformer(t)
+	require.Equal(t, nvapi.ComputeDomainCliqueSnapshotPhaseActive, snapshot.Status.Phase)
+	require.EqualValues(t, 1, snapshot.Status.Generation)
+	require.Len(t, snapshot.Status.Assignments, 2)
+	require.Len(t, snapshot.Status.Members, 2)
+
+	// Formation has exactly three snapshot mutations plus the cluster-scoped
+	// reservation Create. AlreadyExists and its validating GET are API actions,
+	// not writes.
+	require.Equal(t, 3, countFakeMutations(h.observed, "computedomaincliquesnapshots"))
+	require.Equal(t, 1, countFakeMutations(h.observed, "computedomaincliquereservations"))
+	require.Len(t, h.observed, 4)
+
+	// A semantic no-op uses the immutable reservation cache and makes no API call.
+	writesBeforeNoop := countFakeMutations(h.observed, "computedomaincliquesnapshots") + countFakeMutations(h.observed, "computedomaincliquereservations")
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	require.Equal(t, writesBeforeNoop, countFakeMutations(h.observed, "computedomaincliquesnapshots")+countFakeMutations(h.observed, "computedomaincliquereservations"))
+	require.Empty(t, h.observed[4:])
+}

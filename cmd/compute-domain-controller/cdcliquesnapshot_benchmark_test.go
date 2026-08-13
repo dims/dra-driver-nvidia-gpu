@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 )
@@ -59,4 +60,99 @@ func BenchmarkAllocateSelectedNodes144(b *testing.B) {
 			b.Fatalf("allocation failed: blocked=%v err=%v", blocked, err)
 		}
 	}
+}
+
+type indexedReconcileBenchmarkState struct {
+	nodes       cache.Indexer
+	pods        cache.Indexer
+	cdUID       string
+	cliqueIDs   []string
+	nodeSummary selectedNodeSummary
+}
+
+func newIndexedReconcileBenchmarkState(b *testing.B, cliques, membersPerClique int) indexedReconcileBenchmarkState {
+	b.Helper()
+	state := indexedReconcileBenchmarkState{
+		nodes: cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+			computeDomainCliqueIndex: nodeComputeDomainCliqueIndexKeys,
+		}),
+		pods: cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+			podComputeDomainNodeIndex: podComputeDomainNodeIndexKeys,
+		}),
+		cdUID:       "benchmark-cd",
+		cliqueIDs:   make([]string, cliques),
+		nodeSummary: selectedNodeSummary{selected: cliques * membersPerClique, topologyReady: cliques * membersPerClique},
+	}
+	for clique := range cliques {
+		cliqueID := fmt.Sprintf("clique-%03d", clique)
+		state.cliqueIDs[clique] = cliqueID
+		for member := range membersPerClique {
+			nodeName := fmt.Sprintf("node-%03d-%03d", clique, member)
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName,
+				UID:  types.UID("uid-" + nodeName),
+				Labels: map[string]string{
+					computeDomainLabelKey:                  state.cdUID,
+					gpuCliqueNodeLabelKey:                  cliqueID,
+					controllerOwnedCliqueIsolationLabelKey: state.cdUID,
+				},
+			}}
+			setTestNodeAttestation(b, node, state.cdUID, "pod-"+nodeName)
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "driver",
+				Name:      "daemon-" + nodeName,
+				UID:       types.UID("pod-" + nodeName),
+				Labels:    map[string]string{computeDomainLabelKey: state.cdUID},
+			}, Spec: corev1.PodSpec{NodeName: nodeName}}
+			if err := state.nodes.Add(node); err != nil {
+				b.Fatal(err)
+			}
+			if err := state.pods.Add(pod); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	return state
+}
+
+func benchmarkIndexedReconcileInputs(b *testing.B, cliques, membersPerClique int) {
+	state := newIndexedReconcileBenchmarkState(b, cliques, membersPerClique)
+	expected := cliques * membersPerClique
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if !expectedSetReadyForSummary(state.nodeSummary, expected) {
+			b.Fatal("expected set was not ready")
+		}
+		observed := 0
+		for _, cliqueID := range state.cliqueIDs {
+			nodes, err := selectedNodesForClique(state.nodes, state.cdUID, cliqueID)
+			if err != nil {
+				b.Fatal(err)
+			}
+			pods, err := candidatePodsForNodes(state.pods, state.cdUID, nodes)
+			if err != nil {
+				b.Fatal(err)
+			}
+			observed += len(nodes) + len(pods)
+		}
+		if observed != 2*expected {
+			b.Fatalf("observed %d indexed objects, want %d", observed, 2*expected)
+		}
+	}
+}
+
+func BenchmarkIndexedReconcileInputs18(b *testing.B) {
+	benchmarkIndexedReconcileInputs(b, 1, 18)
+}
+
+func BenchmarkIndexedReconcileInputs144(b *testing.B) {
+	benchmarkIndexedReconcileInputs(b, 1, 144)
+}
+
+// BenchmarkIndexedReconcileInputs280x18 measures one complete reconciliation
+// wave across the 5,040-Node design shape. Each clique reads only its 18 Nodes
+// and per-Node Pod buckets; it does not scan 5,040 Nodes or Pods 280 times.
+func BenchmarkIndexedReconcileInputs280x18(b *testing.B) {
+	benchmarkIndexedReconcileInputs(b, 280, 18)
 }

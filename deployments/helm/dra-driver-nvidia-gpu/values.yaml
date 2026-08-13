@@ -124,8 +124,13 @@ featureGates: {}
 # Namespaces in which an operator may create the explicitly annotated
 # controller-v1 ComputeDomain canary. Keep empty to deny all canaries even when
 # the feature gate is enabled. Existing persisted controller-v1 domains remain
-# reconcilable when this list changes.
+# reconcilable when this list changes. Alpha supports exactly one Helm release
+# and one immutable primary control namespace. Cluster admission and controller
+# startup reject a second release, ServiceAccount rename, or namespace move.
 controllerOwnedCDCliques:
+  # Install and retain the singleton admission boundary. Enable this before
+  # ControllerOwnedCDCliques and keep it enabled while controller-v1 state exists.
+  admissionEnabled: false
   canaryNamespaces: []
 
 # Log verbosity for all components. Zero or greater, higher number means higher

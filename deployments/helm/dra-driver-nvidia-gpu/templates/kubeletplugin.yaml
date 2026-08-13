@@ -23,8 +23,15 @@ kind: DaemonSet
 metadata:
   name: {{ include "dra-driver-nvidia-gpu.name" . }}-kubelet-plugin
   namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+  annotations:
+    resource.nvidia.com/controller-owned-cdc-installation: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" . | quote }}
+  {{- end }}
   labels:
     {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
+    {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+    resource.nvidia.com/controller-owned-cdc-workload: kubelet
+    {{- end }}
 spec:
   selector:
     matchLabels:
