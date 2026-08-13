@@ -16,6 +16,8 @@ spec:
       - name: channel
         exactly:
           deviceClassName: {{ .DeviceClassName }}
+          allocationMode: ExactCount
+          count: 1
       config:
       - requests: ["channel"]
         opaque:
@@ -25,3 +27,6 @@ spec:
             kind: {{ .ChannelConfig.Kind }}
             domainID: {{ .ChannelConfig.DomainID }}
             allocationMode: {{ .ChannelConfig.AllocationMode }}
+            {{- if .ChannelConfig.Protocol }}
+            protocol: {{ .ChannelConfig.Protocol }}
+            {{- end }}

@@ -11,6 +11,9 @@ rules:
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomains/status"]
   verbs: ["update"]
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquereservations"]
+  verbs: ["get", "list", "create"]
 - apiGroups: ["resource.k8s.io"]
   resources: ["resourceclaimtemplates"]
   verbs: ["get", "list", "watch", "create", "update", "delete"]
@@ -63,6 +66,12 @@ rules:
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomaincliques"]
   verbs: ["get", "list", "watch", "update"]
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquesnapshots"]
+  verbs: ["get", "list", "watch", "create", "update", "delete"]
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquesnapshots/status"]
+  verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

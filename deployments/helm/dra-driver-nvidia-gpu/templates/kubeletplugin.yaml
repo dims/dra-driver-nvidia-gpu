@@ -15,6 +15,7 @@
 {{- if or .Values.resources.computeDomains.enabled .Values.resources.gpus.enabled }}
 {{- if .Values.resources.computeDomains.enabled }}
 {{- include "dra-driver-nvidia-gpu.validateIMEXConfig" . }}
+{{- include "dra-driver-nvidia-gpu.validateControllerOwnedCDCliques" . }}
 {{- end }}
 ---
 apiVersion: apps/v1

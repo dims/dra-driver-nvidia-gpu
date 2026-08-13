@@ -464,6 +464,26 @@ func TestValidateFeatureGates(t *testing.T) {
 			description: "should be valid when IMEXDaemonsWithDNSNames is enabled but ComputeDomainCliques is not",
 		},
 		{
+			name:        "Controller-owned cliques with dependencies",
+			fgMap:       map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true},
+			expectError: false,
+			description: "should be valid when controller-owned cliques and both dependencies are enabled",
+		},
+		{
+			name:         "Controller-owned cliques without CDCliques",
+			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: false, IMEXDaemonsWithDNSNames: true},
+			expectError:  true,
+			errorMessage: "feature gate ControllerOwnedCDCliques requires ComputeDomainCliques to also be enabled",
+			description:  "should fail without ComputeDomainCliques",
+		},
+		{
+			name:         "Controller-owned cliques without DNSNames",
+			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: false},
+			expectError:  true,
+			errorMessage: "feature gate ComputeDomainCliques requires IMEXDaemonsWithDNSNames to also be enabled",
+			description:  "should fail without IMEXDaemonsWithDNSNames",
+		},
+		{
 			name:         "DynamicMIG enabled with PassthroughSupport",
 			fgMap:        map[featuregate.Feature]bool{DynamicMIG: true, PassthroughSupport: true},
 			expectError:  true,

@@ -14,6 +14,7 @@
 
 {{- if .Values.resources.computeDomains.enabled }}
 {{- include "dra-driver-nvidia-gpu.validateIMEXConfig" . }}
+{{- include "dra-driver-nvidia-gpu.validateControllerOwnedCDCliques" . }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -24,6 +25,8 @@ metadata:
     {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.controller.replicas }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "dra-driver-nvidia-gpu.selectorLabels" (dict "context" . "componentName" "controller") | nindent 6 }}

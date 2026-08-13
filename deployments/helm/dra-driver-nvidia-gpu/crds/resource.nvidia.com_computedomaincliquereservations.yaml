@@ -1,0 +1,101 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.1
+  name: computedomaincliquereservations.resource.nvidia.com
+spec:
+  group: resource.nvidia.com
+  names:
+    kind: ComputeDomainCliqueReservation
+    listKind: ComputeDomainCliqueReservationList
+    plural: computedomaincliquereservations
+    shortNames:
+    - cdcreservation
+    singular: computedomaincliquereservation
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.cliqueID
+      name: Clique
+      type: string
+    - jsonPath: .spec.computeDomainName
+      name: ComputeDomain
+      type: string
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ComputeDomainCliqueReservation is the API-server-atomic ownership record for
+          one physical hardware clique. Its name is derived only from cliqueID, so two
+          ComputeDomains, controller workers, namespaces, or controller instances must
+          race on the same Kubernetes Create. Strict v1 never deletes a reservation:
+          Kubernetes object absence cannot prove that an old IMEX runtime is fenced.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ComputeDomainCliqueReservationSpec is immutable. A future verified fence
+              protocol may introduce an explicit handoff object; it must not mutate or
+              silently recycle this record.
+            properties:
+              cliqueID:
+                minLength: 1
+                type: string
+              computeDomainName:
+                minLength: 1
+                type: string
+              computeDomainNamespace:
+                minLength: 1
+                type: string
+              computeDomainUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+                x-kubernetes-validations:
+                - message: computeDomainUID must not be empty
+                  rule: self != ''
+              protocol:
+                description: |-
+                  ComputeDomainCliqueProtocol identifies the component which owns clique
+                  allocation and membership for one ComputeDomain. The value is persisted in
+                  generated claim configuration, so it must not be inferred from feature-gate
+                  state or from whether a particular API object happens to exist.
+                enum:
+                - controller-v1
+                type: string
+            required:
+            - cliqueID
+            - computeDomainName
+            - computeDomainNamespace
+            - computeDomainUID
+            - protocol
+            type: object
+            x-kubernetes-validations:
+            - message: physical clique reservation is immutable
+              rule: self == oldSelf
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources: {}

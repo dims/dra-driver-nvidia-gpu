@@ -79,12 +79,33 @@ func (m *MultiNamespaceDaemonSetManager) Stop() error {
 
 // Create creates a DaemonSet in the provided namespace.
 func (m *MultiNamespaceDaemonSetManager) Create(ctx context.Context, cd *nvapi.ComputeDomain) (*appsv1.DaemonSet, error) {
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err != nil {
+		return nil, err
+	}
+	// Controller-v1 snapshots and node-local receipts are deliberately scoped
+	// to the configured driver namespace. Keep the alpha protocol there; the
+	// additional-namespace adoption path remains legacy-only until migration
+	// can prove the kubelet and tombstone scopes move together.
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		manager, exists := m.managers[m.config.driverNamespace]
+		if !exists {
+			return nil, fmt.Errorf("no DaemonSet manager found for namespace %s", m.config.driverNamespace)
+		}
+		return manager.Create(ctx, cd)
+	}
 	for ns, manager := range m.managers {
 		ds, err := manager.Get(ctx, string(cd.UID))
 		if err != nil {
 			return nil, fmt.Errorf("failed to get DaemonSet in namespace %s: %w", ns, err)
 		}
 		if ds != nil {
+			if _, err := manager.resourceClaimTemplateManager.Create(ctx, cd); err != nil {
+				return nil, fmt.Errorf("validate existing daemon ResourceClaimTemplate in namespace %s: %w", ns, err)
+			}
+			if err := validateExistingDaemonSet(ds, cd, manager.config); err != nil {
+				return nil, err
+			}
 			return ds, nil
 		}
 	}

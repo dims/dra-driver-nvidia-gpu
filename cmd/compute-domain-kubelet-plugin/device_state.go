@@ -715,7 +715,7 @@ func (s *DeviceState) applyComputeDomainChannelConfigDriverManaged(ctx context.C
 		return nil, fmt.Errorf("error adding Node label for ComputeDomain: %w", err)
 	}
 
-	if err := s.computeDomainManager.AssertComputeDomainReady(ctx, config.DomainID); err != nil {
+	if err := s.computeDomainManager.AssertComputeDomainReady(ctx, config.DomainID, config.Protocol); err != nil {
 		return nil, fmt.Errorf("error asserting ComputeDomain Ready: %w", err)
 	}
 
@@ -739,6 +739,23 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 	// permanently.
 	if s.config.imexConfig.EffectiveHostManaged() {
 		return nil, permanentError{fmt.Errorf("ComputeDomain daemon claims are not supported when imex.mode=hostManaged")}
+	}
+	cd, err := s.computeDomainManager.GetComputeDomain(ctx, config.DomainID)
+	if err != nil {
+		return nil, fmt.Errorf("get ComputeDomain for daemon claim: %w", err)
+	}
+	if cd == nil {
+		return nil, permanentError{fmt.Errorf("ComputeDomain %q for daemon claim does not exist", config.DomainID)}
+	}
+	persistedProtocol := configapi.EffectiveComputeDomainCliqueProtocol(configapi.ComputeDomainCliqueProtocol(cd.Annotations[configapi.ComputeDomainCliqueProtocolAnnotation]))
+	if config.Protocol != persistedProtocol {
+		return nil, permanentError{fmt.Errorf("daemon claim clique protocol %q does not match ComputeDomain protocol %q", config.Protocol, persistedProtocol)}
+	}
+	// The daemon claim is the last node-local gate before a per-CD IMEX Pod is
+	// configured. Honor a reservation owned by another ComputeDomain for both
+	// protocols so legacy rollback cannot bypass a controller-v1 tombstone.
+	if err := s.computeDomainManager.AssertPhysicalCliqueAvailable(ctx, config.DomainID); err != nil {
+		return nil, permanentError{err}
 	}
 
 	// Get the list of claim requests this config is being applied over.

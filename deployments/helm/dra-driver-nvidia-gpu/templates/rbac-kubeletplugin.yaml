@@ -8,6 +8,9 @@ rules:
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomains"]
   verbs: ["get", "list", "watch"]
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquereservations"]
+  verbs: ["get"]
 - apiGroups: ["resource.k8s.io"]
   resources: ["resourceclaims"]
   verbs: ["get", "list", "watch"]
@@ -17,9 +20,6 @@ rules:
 - apiGroups: [""]
   resources: ["nodes"]
   verbs: ["get", "list", "watch", "update", "patch"]
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -46,6 +46,7 @@ roleRef:
   name: {{ include "dra-driver-nvidia-gpu.name" $ }}-clusterrole-kubeletplugin
   apiGroup: rbac.authorization.k8s.io
 
+{{- $driverNamespace := include "dra-driver-nvidia-gpu.namespace" . }}
 {{- range $namespace := splitList "," (include "dra-driver-nvidia-gpu.namespaces" .) }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -57,6 +58,14 @@ rules:
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomaincliques"]
   verbs: ["get"]
+{{- if eq $namespace $driverNamespace }}
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquesnapshots"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+{{- end }}
 {{- if (and $.Values.resources.gpus.enabled (and $.Values.featureGates (and (hasKey $.Values.featureGates "MPSSupport") $.Values.featureGates.MPSSupport))) }}
 - apiGroups: ["apps"]
   resources: ["deployments"]

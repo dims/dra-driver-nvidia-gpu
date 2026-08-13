@@ -118,7 +118,15 @@ resources:
 #   HostManagedIMEXDaemon: false       # Gate allowing resources.computeDomains.imex.mode=hostManaged
 #   DRAListTypeAttributes: false       # Publish list-valued DRA device attributes
 #   ConsumableShares: false            # Publish consumable capacity and multi-allocation support for devices
+#   ControllerOwnedCDCliques: false    # Opt in new ComputeDomains to controller-owned clique snapshots
 featureGates: {}
+
+# Namespaces in which an operator may create the explicitly annotated
+# controller-v1 ComputeDomain canary. Keep empty to deny all canaries even when
+# the feature gate is enabled. Existing persisted controller-v1 domains remain
+# reconcilable when this list changes.
+controllerOwnedCDCliques:
+  canaryNamespaces: []
 
 # Log verbosity for all components. Zero or greater, higher number means higher
 # verbosity. Regardless of this setting, messages of type Error, Warning, and

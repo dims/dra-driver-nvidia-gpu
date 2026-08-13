@@ -34,3 +34,194 @@ spec:
   - expression: variables.userNodeName == variables.objectNodeName || variables.allNodesValue == true || variables.nodeSelectorValue != null
     messageExpression: >-
       "this user running on node '"+variables.userNodeName+"' may not modify cluster or node resourceslices"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: computedomain-reserved-metadata-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["computedomains"]
+  validations:
+  - expression: >-
+      request.operation != 'CREATE' ||
+      !has(object.metadata.finalizers) ||
+      !object.metadata.finalizers.exists(f, f == 'resource.nvidia.com/computeDomain')
+    message: the resource.nvidia.com/computeDomain finalizer is controller-owned and may not be supplied at creation
+  - expression: >-
+      request.operation != 'UPDATE' ||
+      ((has(oldObject.metadata.finalizers) && oldObject.metadata.finalizers.exists(f, f == 'resource.nvidia.com/computeDomain')) ==
+       (has(object.metadata.finalizers) && object.metadata.finalizers.exists(f, f == 'resource.nvidia.com/computeDomain'))) ||
+      request.userInfo.username ==
+      "system:serviceaccount:{{ include "dra-driver-nvidia-gpu.namespace" . }}:{{ include "dra-driver-nvidia-gpu.serviceAccountName" . }}-controller"
+    message: only the compute-domain controller may add or remove its reserved finalizer
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: computedomain-node-topology-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["nodes"]
+  matchConditions:
+  - name: isComputeDomainKubeletPlugin
+    expression: >-
+      request.userInfo.username ==
+      "system:serviceaccount:{{ include "dra-driver-nvidia-gpu.namespace" . }}:{{ include "dra-driver-nvidia-gpu.serviceAccountName" . }}-kubeletplugin"
+  variables:
+  - name: userNodeName
+    expression: >-
+      request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+  validations:
+  - expression: variables.userNodeName != '' && object.metadata.name == variables.userNodeName
+    message: the kubelet plugin may update only the Node bound into its service-account token
+  - expression: object.spec == oldObject.spec
+    message: the kubelet plugin may not change Node spec
+  - expression: object.metadata.finalizers == oldObject.metadata.finalizers && object.metadata.ownerReferences == oldObject.metadata.ownerReferences
+    message: the kubelet plugin may not change Node finalizers or owner references
+  - expression: >-
+      (!has(object.metadata.labels) ||
+       object.metadata.labels.all(k, v,
+         k in ['resource.nvidia.com/computeDomain', 'nvidia.com/gpu.clique'] ||
+         (has(oldObject.metadata.labels) && k in oldObject.metadata.labels && oldObject.metadata.labels[k] == v))) &&
+      (!has(oldObject.metadata.labels) ||
+       oldObject.metadata.labels.all(k, v,
+         k in ['resource.nvidia.com/computeDomain', 'nvidia.com/gpu.clique'] ||
+         (has(object.metadata.labels) && k in object.metadata.labels && object.metadata.labels[k] == v)))
+    message: the kubelet plugin may change only its ComputeDomain and GPU clique Node labels
+  - expression: >-
+      (!has(object.metadata.annotations) ||
+       object.metadata.annotations.all(k, v,
+         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability'] ||
+         (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == v))) &&
+      (!has(oldObject.metadata.annotations) ||
+       oldObject.metadata.annotations.all(k, v,
+         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability'] ||
+         (has(object.metadata.annotations) && k in object.metadata.annotations && object.metadata.annotations[k] == v)))
+    message: the kubelet plugin may change only its startup-topology and controller-v1 capability Node annotations
+  - expression: >-
+      !has(oldObject.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueStartupID' in oldObject.metadata.annotations) ||
+      (has(object.metadata.annotations) &&
+       'resource.nvidia.com/computeDomainCliqueStartupID' in object.metadata.annotations &&
+       object.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID'] ==
+       oldObject.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID'])
+    message: the startup GPU clique identity is immutable; drain and fence the node before an operator clears it
+  - expression: >-
+      !has(object.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueProtocolCapability' in object.metadata.annotations) ||
+      object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocolCapability'] == 'controller-v1'
+    message: the kubelet plugin capability marker has an unsupported value
+  - expression: >-
+      !has(object.metadata.labels) ||
+      !('nvidia.com/gpu.clique' in object.metadata.labels) ||
+      (has(object.metadata.annotations) &&
+       'resource.nvidia.com/computeDomainCliqueStartupID' in object.metadata.annotations &&
+       object.metadata.labels['nvidia.com/gpu.clique'] ==
+       object.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID'])
+    message: the published GPU clique label must match the immutable startup identity
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: computedomain-protocol-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["computedomains"]
+  validations:
+  - expression: >-
+      request.operation != 'CREATE' ||
+      !has(object.metadata.annotations) ||
+      !('resource.nvidia.com/requestedComputeDomainCliqueProtocol' in object.metadata.annotations) ||
+      object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] != 'controller-v1' ||
+      object.metadata.namespace in {{ toJson .Values.controllerOwnedCDCliques.canaryNamespaces }}
+    message: controller-v1 is an operator-controlled canary protocol and this namespace is not allowlisted by controllerOwnedCDCliques.canaryNamespaces
+  - expression: >-
+      request.operation == 'CREATE' ?
+        (!has(object.metadata.annotations) ||
+         !('resource.nvidia.com/requestedComputeDomainCliqueProtocol' in object.metadata.annotations) ||
+         object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] in ['legacy-v1', 'controller-v1']) :
+        ((!has(oldObject.metadata.annotations) ||
+          !('resource.nvidia.com/requestedComputeDomainCliqueProtocol' in oldObject.metadata.annotations)) ?
+           (!has(object.metadata.annotations) ||
+            !('resource.nvidia.com/requestedComputeDomainCliqueProtocol' in object.metadata.annotations)) :
+           (has(object.metadata.annotations) &&
+            'resource.nvidia.com/requestedComputeDomainCliqueProtocol' in object.metadata.annotations &&
+            object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] ==
+            oldObject.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol']))
+    message: requestedComputeDomainCliqueProtocol must be legacy-v1 or controller-v1 and is immutable after creation
+  - expression: >-
+      request.operation != 'CREATE' ||
+      !has(object.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueProtocol' in object.metadata.annotations)
+    message: computeDomainCliqueProtocol is controller-owned and may not be supplied when a ComputeDomain is created
+  - expression: >-
+      !has(object.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueProtocol' in object.metadata.annotations) ||
+      object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol'] in ['legacy-v1', 'controller-v1']
+    message: the ComputeDomain clique protocol must be legacy-v1 or controller-v1
+  - expression: >-
+      request.operation == 'CREATE' ||
+      (has(oldObject.metadata.annotations) &&
+       'resource.nvidia.com/computeDomainCliqueProtocol' in oldObject.metadata.annotations &&
+       has(object.metadata.annotations) &&
+       object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol'] ==
+       oldObject.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol']) ||
+      (request.userInfo.username ==
+       "system:serviceaccount:{{ include "dra-driver-nvidia-gpu.namespace" . }}:{{ include "dra-driver-nvidia-gpu.serviceAccountName" . }}-controller" &&
+       (!has(oldObject.metadata.annotations) ||
+        !('resource.nvidia.com/computeDomainCliqueProtocol' in oldObject.metadata.annotations)) &&
+       has(object.metadata.annotations) &&
+       'resource.nvidia.com/computeDomainCliqueProtocol' in object.metadata.annotations)
+    message: the persisted ComputeDomain clique protocol is immutable; migrate by drain and recreate
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: computedomain-reservation-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["computedomaincliquereservations"]
+  validations:
+  - expression: >-
+      request.operation != 'DELETE' && request.userInfo.username ==
+      "system:serviceaccount:{{ include "dra-driver-nvidia-gpu.namespace" . }}:{{ include "dra-driver-nvidia-gpu.serviceAccountName" . }}-controller"
+    message: only the compute-domain controller may create reservations; strict v1 never deletes them without verified fence evidence
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: computedomain-snapshot-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["computedomaincliquesnapshots", "computedomaincliquesnapshots/status"]
+  validations:
+  - expression: >-
+      request.userInfo.username ==
+      "system:serviceaccount:{{ include "dra-driver-nvidia-gpu.namespace" . }}:{{ include "dra-driver-nvidia-gpu.serviceAccountName" . }}-controller"
+    message: only the compute-domain controller may write controller-owned clique snapshots

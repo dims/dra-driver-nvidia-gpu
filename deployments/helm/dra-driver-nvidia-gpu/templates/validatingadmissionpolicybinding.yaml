@@ -6,3 +6,43 @@ spec:
   policyName: resourceslices-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
   validationActions: [Deny]
   # All ResourceSlices are matched.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: computedomain-reserved-metadata-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  policyName: computedomain-reserved-metadata-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: computedomain-node-topology-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  policyName: computedomain-node-topology-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: computedomain-protocol-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  policyName: computedomain-protocol-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: computedomain-reservation-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  policyName: computedomain-reservation-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: computedomain-snapshot-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  policyName: computedomain-snapshot-writer-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  validationActions: [Deny]

@@ -17,16 +17,26 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -37,10 +47,14 @@ import (
 	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/common"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	nvinformers "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/informers/externalversions"
+	nvlisters "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/listers/resource/v1beta1"
 )
 
 const (
-	computeDomainLabelKey = "resource.nvidia.com/computeDomain"
+	computeDomainLabelKey                      = "resource.nvidia.com/computeDomain"
+	computeDomainCliqueLabelKey                = "resource.nvidia.com/computeDomain.cliqueID"
+	computeDomainCliqueStartupAnnotationKey    = "resource.nvidia.com/computeDomainCliqueStartupID"
+	computeDomainCliqueCapabilityAnnotationKey = "resource.nvidia.com/computeDomainCliqueProtocolCapability"
 
 	// gpuCliqueLabelKey sets the node label historically set by
 	// gpu-feature-discovery (see
@@ -63,13 +77,24 @@ type ComputeDomainManager struct {
 	waitGroup     sync.WaitGroup
 	cancelContext context.CancelFunc
 
-	factory  nvinformers.SharedInformerFactory
-	informer cache.SharedIndexInformer
+	computeDomainFactory nvinformers.SharedInformerFactory
+	informer             cache.SharedIndexInformer
+	snapshotFactory      nvinformers.SharedInformerFactory
+	snapshotInformer     cache.SharedIndexInformer
+	snapshotLister       nvlisters.ComputeDomainCliqueSnapshotLister
+	snapshotAPIAvailable bool
+	podFactory           informers.SharedInformerFactory
+	podInformer          cache.SharedIndexInformer
+	podLister            corev1listers.PodLister
+	nodeFactory          informers.SharedInformerFactory
+	nodeInformer         cache.SharedIndexInformer
+	nodeLister           corev1listers.NodeLister
 
 	configFilesRoot string
 
-	cliqueIDMu sync.RWMutex
-	cliqueID   string
+	cliqueIDMu      sync.RWMutex
+	cliqueID        string
+	topologyInvalid bool
 
 	getCliqueIDFunc func() (string, error)
 }
@@ -83,22 +108,58 @@ type ComputeDomainDaemonSettings struct {
 }
 
 func NewComputeDomainManager(config *Config, getCliqueIDFunc func() (string, error)) (*ComputeDomainManager, error) {
-	factory := nvinformers.NewSharedInformerFactory(config.clientsets.Nvidia, informerResyncPeriod)
-	informer := factory.Resource().V1beta1().ComputeDomains().Informer()
-	configFilesRoot := filepath.Join(config.DriverPluginPath(), ComputeDomainDaemonConfigFilesDirName)
-
 	cliqueID, err := getCliqueIDFunc()
 	if err != nil {
 		return nil, fmt.Errorf("error getting cliqueID: %w", err)
 	}
+	computeDomainFactory := nvinformers.NewSharedInformerFactory(config.clientsets.Nvidia, informerResyncPeriod)
+	informer := computeDomainFactory.Resource().V1beta1().ComputeDomains().Informer()
+	snapshotFactory := nvinformers.NewSharedInformerFactoryWithOptions(
+		config.clientsets.Nvidia,
+		informerResyncPeriod,
+		nvinformers.WithNamespace(config.flags.namespace),
+		nvinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			// A node needs only snapshots for its immutable startup hardware
+			// clique. Avoid broadcasting every full snapshot in the driver
+			// namespace to every kubelet plugin in the cluster.
+			options.LabelSelector = labels.SelectorFromSet(labels.Set{computeDomainCliqueLabelKey: cliqueID}).String()
+		}),
+	)
+	snapshotInformer := snapshotFactory.Resource().V1beta1().ComputeDomainCliqueSnapshots().Informer()
+	podFactory := informers.NewSharedInformerFactoryWithOptions(
+		config.clientsets.Core,
+		informerResyncPeriod,
+		informers.WithNamespace(config.flags.namespace),
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = computeDomainLabelKey
+			options.FieldSelector = "spec.nodeName=" + config.flags.nodeName
+		}),
+	)
+	nodeFactory := informers.NewSharedInformerFactoryWithOptions(
+		config.clientsets.Core,
+		informerResyncPeriod,
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = "metadata.name=" + config.flags.nodeName
+		}),
+	)
+	configFilesRoot := filepath.Join(config.DriverPluginPath(), ComputeDomainDaemonConfigFilesDirName)
 
 	m := &ComputeDomainManager{
-		config:          config,
-		factory:         factory,
-		informer:        informer,
-		configFilesRoot: configFilesRoot,
-		cliqueID:        cliqueID,
-		getCliqueIDFunc: getCliqueIDFunc,
+		config:               config,
+		computeDomainFactory: computeDomainFactory,
+		informer:             informer,
+		snapshotFactory:      snapshotFactory,
+		snapshotInformer:     snapshotInformer,
+		snapshotLister:       snapshotFactory.Resource().V1beta1().ComputeDomainCliqueSnapshots().Lister(),
+		podFactory:           podFactory,
+		podInformer:          podFactory.Core().V1().Pods().Informer(),
+		podLister:            podFactory.Core().V1().Pods().Lister(),
+		nodeFactory:          nodeFactory,
+		nodeInformer:         nodeFactory.Core().V1().Nodes().Informer(),
+		nodeLister:           nodeFactory.Core().V1().Nodes().Lister(),
+		configFilesRoot:      configFilesRoot,
+		cliqueID:             cliqueID,
+		getCliqueIDFunc:      getCliqueIDFunc,
 	}
 
 	return m, nil
@@ -117,6 +178,15 @@ func (m *ComputeDomainManager) setCliqueID(cliqueID string) {
 	m.cliqueIDMu.Lock()
 	defer m.cliqueIDMu.Unlock()
 	m.cliqueID = cliqueID
+}
+
+func (m *ComputeDomainManager) assertTopologyValid() error {
+	m.cliqueIDMu.RLock()
+	defer m.cliqueIDMu.RUnlock()
+	if m.topologyInvalid {
+		return fmt.Errorf("GPU clique topology changed after plugin startup; drain and fence this node before preparing more ComputeDomain resources")
+	}
+	return nil
 }
 
 func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
@@ -138,11 +208,26 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 		return fmt.Errorf("error adding indexer for UIDs: %w", err)
 	}
 
-	m.waitGroup.Add(1)
-	go func() {
-		defer m.waitGroup.Done()
-		m.factory.Start(ctx.Done())
-	}()
+	m.snapshotAPIAvailable, err = m.probeSnapshotAPI(ctx)
+	if err != nil {
+		return err
+	}
+
+	factories := []interface{ Start(<-chan struct{}) }{
+		m.computeDomainFactory,
+		m.podFactory,
+		m.nodeFactory,
+	}
+	if m.snapshotAPIAvailable {
+		factories = append(factories, m.snapshotFactory)
+	}
+	for _, factory := range factories {
+		m.waitGroup.Add(1)
+		go func() {
+			defer m.waitGroup.Done()
+			factory.Start(ctx.Done())
+		}()
+	}
 
 	m.waitGroup.Add(1)
 	go func() {
@@ -150,7 +235,11 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 		m.periodicCleanup(ctx)
 	}()
 
-	if !cache.WaitForCacheSync(ctx.Done(), m.informer.HasSynced) {
+	syncs := []cache.InformerSynced{m.informer.HasSynced, m.podInformer.HasSynced, m.nodeInformer.HasSynced}
+	if m.snapshotAPIAvailable {
+		syncs = append(syncs, m.snapshotInformer.HasSynced)
+	}
+	if !cache.WaitForCacheSync(ctx.Done(), syncs...) {
 		return fmt.Errorf("informer cache sync for ComputeDomains failed")
 	}
 
@@ -169,6 +258,21 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 	}
 
 	return nil
+}
+
+// probeSnapshotAPI lets legacy-only installations start before the snapshot
+// CRD is installed. It intentionally does not consult the feature gate: a
+// persisted controller-v1 ComputeDomain remains controller-v1 across later
+// changes to the process-wide default.
+func (m *ComputeDomainManager) probeSnapshotAPI(ctx context.Context) (bool, error) {
+	_, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(m.config.flags.namespace).List(ctx, metav1.ListOptions{Limit: 1})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("probe ComputeDomainCliqueSnapshot API: %w", err)
+	}
+	return true, nil
 }
 
 //nolint:contextcheck
@@ -295,7 +399,10 @@ func (s *ComputeDomainDaemonSettings) WriteConfigFile(ctx context.Context) error
 	return nil
 }
 
-func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdUID string) error {
+func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdUID string, protocol nvapi.ComputeDomainCliqueProtocol) error {
+	if err := m.assertTopologyValid(); err != nil {
+		return err
+	}
 	cd, err := m.GetComputeDomain(ctx, cdUID)
 	if err != nil {
 		return fmt.Errorf("error getting ComputeDomain: %w", err)
@@ -304,12 +411,228 @@ func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdU
 		return fmt.Errorf("ComputeDomain not found: %s", cdUID)
 	}
 
-	// Check if the current node is ready in the ComputeDomain
+	if err := nvapi.ValidateComputeDomainCliqueProtocol(protocol); err != nil {
+		return err
+	}
+	protocol = nvapi.EffectiveComputeDomainCliqueProtocol(protocol)
+	persistedProtocol := nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation])
+	if err := nvapi.ValidateComputeDomainCliqueProtocol(persistedProtocol); err != nil {
+		return fmt.Errorf("invalid persisted ComputeDomain clique protocol: %w", err)
+	}
+	persistedProtocol = nvapi.EffectiveComputeDomainCliqueProtocol(persistedProtocol)
+	if protocol != persistedProtocol {
+		return fmt.Errorf("claim clique protocol %q does not match ComputeDomain protocol %q", protocol, persistedProtocol)
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		return m.assertCurrentNodeReadyInSnapshot(cd)
+	}
+
+	// Marker-less and explicit legacy-v1 claims retain the compatibility path.
 	if !m.isCurrentNodeReady(ctx, cd) {
 		return fmt.Errorf("current node not ready in ComputeDomain")
 	}
 
 	return nil
+}
+
+func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(cd *nvapi.ComputeDomain) error {
+	if cd.DeletionTimestamp != nil {
+		return fmt.Errorf("controller-owned ComputeDomain is deleting")
+	}
+	cliqueID := m.CliqueID()
+	if cliqueID == "" {
+		return fmt.Errorf("controller-owned readiness requires a non-empty GPU clique ID")
+	}
+	if !m.snapshotAPIAvailable {
+		return fmt.Errorf("ComputeDomainCliqueSnapshot API is unavailable")
+	}
+	digest := sha256.Sum256([]byte(cliqueID))
+	name := fmt.Sprintf("%s.%s", cd.UID, hex.EncodeToString(digest[:8]))
+	snapshot, err := m.snapshotLister.ComputeDomainCliqueSnapshots(m.config.flags.namespace).Get(name)
+	if err != nil {
+		return fmt.Errorf("get controller-owned snapshot: %w", err)
+	}
+	if snapshot.DeletionTimestamp != nil {
+		return fmt.Errorf("controller-owned snapshot is deleting")
+	}
+	if snapshot.Spec.Protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 ||
+		snapshot.Spec.ComputeDomainUID != cd.UID ||
+		snapshot.Spec.ComputeDomainName != cd.Name ||
+		snapshot.Spec.ComputeDomainNamespace != cd.Namespace ||
+		snapshot.Spec.CliqueID != cliqueID ||
+		snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseActive ||
+		snapshot.Status.Generation < 1 ||
+		snapshot.Status.Hash == "" {
+		return fmt.Errorf("controller-owned snapshot is not active for this ComputeDomain")
+	}
+	if err := validateSnapshotStructure(snapshot); err != nil {
+		return fmt.Errorf("validate controller-owned snapshot: %w", err)
+	}
+
+	var local *nvapi.ComputeDomainCliqueMember
+	for i := range snapshot.Status.Members {
+		member := &snapshot.Status.Members[i]
+		if member.NodeName == m.config.flags.nodeName {
+			if local != nil {
+				return fmt.Errorf("active snapshot has multiple members for current node")
+			}
+			local = member
+		}
+	}
+	if local == nil {
+		return fmt.Errorf("active snapshot has no member for current node")
+	}
+	node, err := m.nodeLister.Get(m.config.flags.nodeName)
+	if err != nil {
+		return fmt.Errorf("get current Node identity from local cache: %w", err)
+	}
+	if local.NodeUID != node.UID {
+		return fmt.Errorf("snapshot Node UID does not match current Node")
+	}
+	pod, err := m.podLister.Pods(snapshot.Namespace).Get(local.PodName)
+	if err != nil {
+		return fmt.Errorf("get current daemon Pod: %w", err)
+	}
+	if pod.DeletionTimestamp != nil || podTerminal(pod.Status.Phase) {
+		return fmt.Errorf("current daemon Pod is deleting or terminal")
+	}
+	if pod.Spec.NodeName != local.NodeName || pod.UID != local.PodUID || pod.Status.PodIP != local.PodIP || !podControlledByUID(pod.OwnerReferences, local.DaemonSetUID) || !podReady(pod.Status.Conditions) {
+		return fmt.Errorf("current daemon Pod identity, ownership, address, or readiness does not match snapshot")
+	}
+
+	receiptPath := filepath.Join(m.configFilesRoot, string(cd.UID), "snapshot-receipt.json")
+	receiptBytes, err := os.ReadFile(receiptPath)
+	if err != nil {
+		return fmt.Errorf("read installed snapshot receipt: %w", err)
+	}
+	var receipt nvapi.ComputeDomainCliqueSnapshotReceipt
+	if err := json.Unmarshal(receiptBytes, &receipt); err != nil {
+		return fmt.Errorf("decode installed snapshot receipt: %w", err)
+	}
+	if receipt.ComputeDomainUID != cd.UID || receipt.SnapshotUID != snapshot.UID || receipt.SnapshotGeneration != snapshot.Status.Generation || receipt.SnapshotHash != snapshot.Status.Hash || receipt.NodeUID != local.NodeUID || receipt.PodUID != local.PodUID || receipt.Index != local.Index {
+		return fmt.Errorf("installed snapshot receipt is stale or belongs to another identity")
+	}
+	return nil
+}
+
+func validateSnapshotStructure(snapshot *nvapi.ComputeDomainCliqueSnapshot) error {
+	if snapshot.Status.MemberCount != len(snapshot.Status.Members) {
+		return fmt.Errorf("memberCount %d does not match %d members", snapshot.Status.MemberCount, len(snapshot.Status.Members))
+	}
+	controller := metav1.GetControllerOf(snapshot)
+	if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" ||
+		controller.Name != snapshot.Spec.DaemonSetName || controller.UID != snapshot.Spec.DaemonSetUID {
+		return fmt.Errorf("snapshot controller owner does not match its DaemonSet scope")
+	}
+	assignments := make(map[types.UID]nvapi.ComputeDomainCliqueAssignment, len(snapshot.Status.Assignments))
+	indices := make(map[int]struct{}, len(snapshot.Status.Assignments))
+	assignmentNames := make(map[string]struct{}, len(snapshot.Status.Assignments))
+	assignmentPods := make(map[types.UID]struct{}, len(snapshot.Status.Assignments))
+	for _, assignment := range snapshot.Status.Assignments {
+		if assignment.NodeUID == "" || assignment.NodeName == "" || assignment.Index < 0 || assignment.Index >= snapshot.Spec.Capacity {
+			return fmt.Errorf("assignment identity or index is invalid")
+		}
+		if _, duplicate := assignments[assignment.NodeUID]; duplicate {
+			return fmt.Errorf("duplicate assignment Node UID %q", assignment.NodeUID)
+		}
+		if _, duplicate := indices[assignment.Index]; duplicate {
+			return fmt.Errorf("duplicate assignment index %d", assignment.Index)
+		}
+		if assignment.State != nvapi.ComputeDomainCliqueAssignmentStateBound && assignment.State != nvapi.ComputeDomainCliqueAssignmentStateQuarantined {
+			return fmt.Errorf("assignment state %q is invalid", assignment.State)
+		}
+		if _, duplicate := assignmentNames[assignment.NodeName]; duplicate {
+			return fmt.Errorf("duplicate assignment Node name %q", assignment.NodeName)
+		}
+		if assignment.CurrentPodUID != "" {
+			if _, duplicate := assignmentPods[assignment.CurrentPodUID]; duplicate {
+				return fmt.Errorf("duplicate assignment current Pod UID %q", assignment.CurrentPodUID)
+			}
+			assignmentPods[assignment.CurrentPodUID] = struct{}{}
+		}
+		assignments[assignment.NodeUID] = assignment
+		indices[assignment.Index] = struct{}{}
+		assignmentNames[assignment.NodeName] = struct{}{}
+	}
+	members := slices.Clone(snapshot.Status.Members)
+	slices.SortFunc(members, func(a, b nvapi.ComputeDomainCliqueMember) int { return cmp.Compare(a.Index, b.Index) })
+	canonical, err := json.Marshal(members)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(canonical)
+	if hex.EncodeToString(digest[:]) != snapshot.Status.Hash {
+		return fmt.Errorf("snapshot hash does not match canonical membership")
+	}
+	seenNodes := make(map[types.UID]struct{}, len(members))
+	seenNodeNames := make(map[string]struct{}, len(members))
+	seenPods := make(map[types.UID]struct{}, len(members))
+	seenPodNames := make(map[string]struct{}, len(members))
+	seenIPs := make(map[netip.Addr]struct{}, len(members))
+	seenMemberIndices := make(map[int]struct{}, len(members))
+	for _, member := range members {
+		if member.NodeUID == "" || member.PodUID == "" || member.NodeName == "" || member.PodName == "" ||
+			member.DaemonSetUID != snapshot.Spec.DaemonSetUID || member.Index < 0 || member.Index >= snapshot.Spec.Capacity {
+			return fmt.Errorf("member identity, owner, or index is invalid")
+		}
+		ip, err := netip.ParseAddr(member.PodIP)
+		if err != nil || ip.IsUnspecified() {
+			return fmt.Errorf("member Pod IP %q is invalid", member.PodIP)
+		}
+		ip = ip.Unmap()
+		if _, duplicate := seenNodes[member.NodeUID]; duplicate {
+			return fmt.Errorf("duplicate member Node UID %q", member.NodeUID)
+		}
+		if _, duplicate := seenPods[member.PodUID]; duplicate {
+			return fmt.Errorf("duplicate member Pod UID %q", member.PodUID)
+		}
+		if _, duplicate := seenNodeNames[member.NodeName]; duplicate {
+			return fmt.Errorf("duplicate member Node name %q", member.NodeName)
+		}
+		if _, duplicate := seenPodNames[member.PodName]; duplicate {
+			return fmt.Errorf("duplicate member Pod name %q", member.PodName)
+		}
+		if _, duplicate := seenIPs[ip]; duplicate {
+			return fmt.Errorf("duplicate member Pod IP %q", member.PodIP)
+		}
+		if _, duplicate := seenMemberIndices[member.Index]; duplicate {
+			return fmt.Errorf("duplicate member index %d", member.Index)
+		}
+		assignment, found := assignments[member.NodeUID]
+		if !found || assignment.State != nvapi.ComputeDomainCliqueAssignmentStateBound ||
+			assignment.Index != member.Index || assignment.NodeName != member.NodeName || assignment.CurrentPodUID != member.PodUID {
+			return fmt.Errorf("member at index %d does not match its bound assignment", member.Index)
+		}
+		seenNodes[member.NodeUID] = struct{}{}
+		seenNodeNames[member.NodeName] = struct{}{}
+		seenPods[member.PodUID] = struct{}{}
+		seenPodNames[member.PodName] = struct{}{}
+		seenIPs[ip] = struct{}{}
+		seenMemberIndices[member.Index] = struct{}{}
+	}
+	return nil
+}
+
+func podControlledByUID(ownerReferences []metav1.OwnerReference, uid types.UID) bool {
+	for _, owner := range ownerReferences {
+		if owner.Controller != nil && *owner.Controller && owner.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func podTerminal(phase corev1.PodPhase) bool {
+	return phase == corev1.PodSucceeded || phase == corev1.PodFailed
+}
+
+func podReady(conditions []corev1.PodCondition) bool {
+	for _, condition := range conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // isCurrentNodeReady checks if the current node is marked as ready in the ComputeDomain.
@@ -370,6 +693,17 @@ func (m *ComputeDomainManager) AssertComputeDomainNamespace(ctx context.Context,
 }
 
 func (m *ComputeDomainManager) AddNodeLabel(ctx context.Context, cdUID string) error {
+	if err := m.assertTopologyValid(); err != nil {
+		return err
+	}
+	// A retained controller-v1 reservation is a durable warning that an old
+	// runtime on this physical clique may still own its indices. Check before
+	// publishing the Node selection label, then repeat at daemon-claim Prepare
+	// to close the interval between these two lifecycle steps.
+	if err := m.AssertPhysicalCliqueAvailable(ctx, cdUID); err != nil {
+		return err
+	}
+
 	node, err := m.config.clientsets.Core.CoreV1().Nodes().Get(ctx, m.config.flags.nodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("error retrieving Node: %w", err)
@@ -394,6 +728,36 @@ func (m *ComputeDomainManager) AddNodeLabel(ctx context.Context, cdUID string) e
 		return fmt.Errorf("error updating Node with label: %w", err)
 	}
 
+	return nil
+}
+
+// AssertPhysicalCliqueAvailable prevents a new daemon from starting on a
+// clique reserved by a different, potentially still-running ComputeDomain.
+// It is deliberately protocol-neutral: a retained controller-v1 tombstone
+// must also stop legacy-v1 from reusing the same hardware indices.
+func (m *ComputeDomainManager) AssertPhysicalCliqueAvailable(ctx context.Context, cdUID string) error {
+	if err := m.assertTopologyValid(); err != nil {
+		return err
+	}
+	cliqueID := m.CliqueID()
+	if cliqueID == "" {
+		return nil
+	}
+	digest := sha256.Sum256([]byte(cliqueID))
+	reservationName := "clique-" + hex.EncodeToString(digest[:])
+	reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, reservationName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("check physical clique reservation: %w", err)
+	}
+	if reservation.Spec.CliqueID != cliqueID {
+		return fmt.Errorf("physical clique reservation %q does not match local clique %q", reservation.Spec.CliqueID, cliqueID)
+	}
+	if reservation.Spec.ComputeDomainUID != types.UID(cdUID) {
+		return fmt.Errorf("physical clique %q remains reserved by unfenced ComputeDomain %s/%s UID %q", cliqueID, reservation.Spec.ComputeDomainNamespace, reservation.Spec.ComputeDomainName, reservation.Spec.ComputeDomainUID)
+	}
 	return nil
 }
 
@@ -429,13 +793,39 @@ func (m *ComputeDomainManager) RemoveNodeLabel(ctx context.Context, cdUID string
 func (m *ComputeDomainManager) SetGPUCliqueLabel(ctx context.Context) error {
 	cliqueID := m.CliqueID()
 	if cliqueID == "" {
+		node, err := m.config.clientsets.Core.CoreV1().Nodes().Get(ctx, m.config.flags.nodeName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("read Node while startup GPU clique is absent: %w", err)
+		}
+		if persisted := node.Annotations[computeDomainCliqueStartupAnnotationKey]; persisted != "" || node.Labels[gpuCliqueLabelKey] != "" {
+			m.cliqueIDMu.Lock()
+			m.topologyInvalid = true
+			m.cliqueIDMu.Unlock()
+			if node.Labels[gpuCliqueLabelKey] != "" {
+				if err := m.RemoveGPUCliqueLabel(ctx); err != nil {
+					return fmt.Errorf("startup GPU clique disappeared and removing stale label failed: %w", err)
+				}
+			}
+			return fmt.Errorf("startup GPU clique is absent but Node retains startup identity %q; drain and fence the node before clearing it", persisted)
+		}
 		return nil
+	}
+	node, err := m.config.clientsets.Core.CoreV1().Nodes().Get(ctx, m.config.flags.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read Node startup topology: %w", err)
+	}
+	if startupCliqueID := node.Annotations[computeDomainCliqueStartupAnnotationKey]; startupCliqueID != "" && startupCliqueID != cliqueID {
+		return fmt.Errorf("GPU clique ID %q does not match immutable Node startup clique %q; drain and fence the node before clearing the startup topology annotation", cliqueID, startupCliqueID)
 	}
 
 	patch := map[string]any{
 		"metadata": map[string]any{
 			"labels": map[string]string{
 				gpuCliqueLabelKey: cliqueID,
+			},
+			"annotations": map[string]string{
+				computeDomainCliqueStartupAnnotationKey:    cliqueID,
+				computeDomainCliqueCapabilityAnnotationKey: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
 			},
 		},
 	}
@@ -460,6 +850,9 @@ func (m *ComputeDomainManager) RemoveGPUCliqueLabel(ctx context.Context) error {
 			"labels": map[string]any{
 				gpuCliqueLabelKey: nil,
 			},
+			// Keep the startup topology annotation as an immutable fence for
+			// already-created daemon Pods. A different topology epoch requires
+			// explicit node drain/reset, not an in-place label rewrite.
 		},
 	}
 
@@ -498,12 +891,35 @@ func (m *ComputeDomainManager) periodicGPUCliqueIDRefresh(ctx context.Context) {
 func (m *ComputeDomainManager) refreshGPUCliqueID(ctx context.Context) error {
 	newCliqueID, err := m.getCliqueIDFunc()
 	if err != nil {
+		// Once a non-empty topology has been published, losing the ability to
+		// verify it is a safety event rather than merely an observability
+		// failure. Continuing to admit new ComputeDomain work would authorize
+		// it from stale topology. Keep the immutable startup annotation as the
+		// fence, remove the routable label, and require an explicit drain/reset.
+		if oldCliqueID := m.CliqueID(); oldCliqueID != "" {
+			m.cliqueIDMu.Lock()
+			m.topologyInvalid = true
+			m.cliqueIDMu.Unlock()
+			if m.config.flags.gpuCliqueLabelEnabled {
+				if removeErr := m.RemoveGPUCliqueLabel(ctx); removeErr != nil {
+					return fmt.Errorf("verifying GPU clique ID %q failed (%v) and removing the stale Node label failed: %w", oldCliqueID, err, removeErr)
+				}
+			}
+			return fmt.Errorf("verifying GPU clique ID %q failed: %w; refusing new ComputeDomain work until the node and IMEX fabric are drained and fenced", oldCliqueID, err)
+		}
 		return fmt.Errorf("error getting cliqueID: %w", err)
 	}
 
-	if oldCliqueID := m.CliqueID(); newCliqueID != "" && newCliqueID != oldCliqueID {
-		klog.Infof("GPU clique ID changed from %q to %q, updating %s node label", oldCliqueID, newCliqueID, gpuCliqueLabelKey)
-		m.setCliqueID(newCliqueID)
+	if oldCliqueID := m.CliqueID(); oldCliqueID != "" && newCliqueID != oldCliqueID {
+		m.cliqueIDMu.Lock()
+		m.topologyInvalid = true
+		m.cliqueIDMu.Unlock()
+		if m.config.flags.gpuCliqueLabelEnabled {
+			if removeErr := m.RemoveGPUCliqueLabel(ctx); removeErr != nil {
+				return fmt.Errorf("GPU clique ID changed from %q to %q and removing the stale Node label failed: %w", oldCliqueID, newCliqueID, removeErr)
+			}
+		}
+		return fmt.Errorf("GPU clique ID changed from %q to %q; refusing in-place topology migration until the node and IMEX fabric are drained and fenced", oldCliqueID, newCliqueID)
 	}
 
 	if m.config.flags.gpuCliqueLabelEnabled {

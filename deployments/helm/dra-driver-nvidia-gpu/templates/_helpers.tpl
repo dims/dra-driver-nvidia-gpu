@@ -234,3 +234,18 @@ on an invalid combination. Produces no output on success.
   {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Controller-owned snapshots need an expected Node set before they may become
+Active. The kubelet plugin's topology label is that set in the initial
+implementation.
+*/}}
+{{- define "dra-driver-nvidia-gpu.validateControllerOwnedCDCliques" -}}
+{{- $enabled := and .Values.featureGates (and (hasKey .Values.featureGates "ControllerOwnedCDCliques") .Values.featureGates.ControllerOwnedCDCliques) -}}
+{{- if and $enabled (not .Values.kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled=true" -}}
+{{- end -}}
+{{- if and $enabled (not .Values.controller.leaderElection.enabled) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires controller.leaderElection.enabled=true; clique allocation requires one active writer" -}}
+{{- end -}}
+{{- end -}}

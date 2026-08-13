@@ -28,6 +28,10 @@ type Interface interface {
 	ComputeDomains() ComputeDomainInformer
 	// ComputeDomainCliques returns a ComputeDomainCliqueInformer.
 	ComputeDomainCliques() ComputeDomainCliqueInformer
+	// ComputeDomainCliqueReservations returns a ComputeDomainCliqueReservationInformer.
+	ComputeDomainCliqueReservations() ComputeDomainCliqueReservationInformer
+	// ComputeDomainCliqueSnapshots returns a ComputeDomainCliqueSnapshotInformer.
+	ComputeDomainCliqueSnapshots() ComputeDomainCliqueSnapshotInformer
 }
 
 type version struct {
@@ -49,4 +53,14 @@ func (v *version) ComputeDomains() ComputeDomainInformer {
 // ComputeDomainCliques returns a ComputeDomainCliqueInformer.
 func (v *version) ComputeDomainCliques() ComputeDomainCliqueInformer {
 	return &computeDomainCliqueInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// ComputeDomainCliqueReservations returns a ComputeDomainCliqueReservationInformer.
+func (v *version) ComputeDomainCliqueReservations() ComputeDomainCliqueReservationInformer {
+	return &computeDomainCliqueReservationInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// ComputeDomainCliqueSnapshots returns a ComputeDomainCliqueSnapshotInformer.
+func (v *version) ComputeDomainCliqueSnapshots() ComputeDomainCliqueSnapshotInformer {
+	return &computeDomainCliqueSnapshotInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

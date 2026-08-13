@@ -19,15 +19,19 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/metrics"
 	nvinformers "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/informers/externalversions"
 	nvlisters "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/listers/resource/v1beta1"
@@ -47,9 +51,10 @@ const (
 	// not so long that stale entries cause issues.
 	mutationCacheTTL = time.Hour
 
-	computeDomainLabelKey       = "resource.nvidia.com/computeDomain"
-	computeDomainCliqueLabelKey = "resource.nvidia.com/computeDomain.cliqueID"
-	computeDomainFinalizer      = computeDomainLabelKey
+	computeDomainLabelKey           = "resource.nvidia.com/computeDomain"
+	computeDomainCliqueLabelKey     = "resource.nvidia.com/computeDomain.cliqueID"
+	computeDomainFinalizer          = computeDomainLabelKey
+	computeDomainProtocolAnnotation = nvapi.ComputeDomainCliqueProtocolAnnotation
 
 	computeDomainDefaultChannelDeviceClass = "compute-domain-default-channel.nvidia.com"
 	computeDomainChannelDeviceClass        = "compute-domain-channel.nvidia.com"
@@ -267,6 +272,65 @@ func (m *ComputeDomainManager) RemoveFinalizer(ctx context.Context, uid string) 
 	return nil
 }
 
+func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string) error {
+	namespaces := append([]string{m.config.driverNamespace}, m.config.additionalNamespaces...)
+	seenNamespaces := make(map[string]struct{}, len(namespaces))
+	var snapshots []nvapi.ComputeDomainCliqueSnapshot
+	for _, namespace := range namespaces {
+		if _, seen := seenNamespaces[namespace]; seen {
+			continue
+		}
+		seenNamespaces[namespace] = struct{}{}
+		listed, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labels.Set{computeDomainLabelKey: cdUID}).String(),
+		})
+		if err != nil {
+			return err
+		}
+		snapshots = append(snapshots, listed.Items...)
+	}
+	// Validate every namespace before deleting any object or global reservation.
+	for i := range snapshots {
+		snapshot := &snapshots[i]
+		if slices.Contains(snapshot.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer) &&
+			(snapshot.Status.Generation > 0 || snapshotEverPublished(snapshot)) {
+			return fmt.Errorf("snapshot %s/%s retains published index tombstones; verified IMEX fence is required before deletion", snapshot.Namespace, snapshot.Name)
+		}
+	}
+	for i := range snapshots {
+		snapshot := &snapshots[i]
+		if slices.Contains(snapshot.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer) {
+			withoutFence := snapshot.DeepCopy()
+			withoutFence.Finalizers = slices.DeleteFunc(withoutFence.Finalizers, func(finalizer string) bool {
+				return finalizer == nvapi.ComputeDomainCliqueSnapshotFinalizer
+			})
+			if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, withoutFence, metav1.UpdateOptions{}); err != nil {
+				return err
+			}
+		}
+		if err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Delete(ctx, snapshot.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &snapshot.UID}}); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	reservations, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{computeDomainLabelKey: cdUID}).String(),
+	})
+	if err != nil {
+		return err
+	}
+	for i := range reservations.Items {
+		reservation := &reservations.Items[i]
+		if reservation.Spec.ComputeDomainUID != types.UID(cdUID) {
+			return fmt.Errorf("physical clique reservation %s has mismatched ComputeDomain UID", reservation.Name)
+		}
+		// Strict v1 has no fence verifier. Retain the cluster-scoped physical
+		// reservation even when generation zero never activated: availability is
+		// preferable to unsafe cross-stream reuse, and an operator-controlled
+		// recovery protocol can add an explicit evidence-bearing transition later.
+	}
+	return nil
+}
+
 // hostManaged reports whether the driver is configured for host-managed IMEX
 // (see pkg/imex), in which case the driver never creates per-ComputeDomain
 // DaemonSets, daemon ResourceClaimTemplates, or ComputeDomain node labels.
@@ -314,19 +378,75 @@ func (m *ComputeDomainManager) updateGlobalStatus(ctx context.Context, cd *nvapi
 }
 
 func (m *ComputeDomainManager) addFinalizer(ctx context.Context, cd *nvapi.ComputeDomain) error {
-	for _, f := range cd.Finalizers {
-		if f == computeDomainFinalizer {
-			return nil
+	newCD := cd.DeepCopy()
+	changed := false
+	if !slices.Contains(cd.Finalizers, computeDomainFinalizer) && cd.Annotations[computeDomainProtocolAnnotation] != "" {
+		return fmt.Errorf("persisted ComputeDomain clique protocol is controller-owned and cannot predate the controller finalizer")
+	}
+	if newCD.Annotations == nil {
+		newCD.Annotations = make(map[string]string)
+	}
+	if _, exists := newCD.Annotations[computeDomainProtocolAnnotation]; !exists {
+		protocol, err := selectComputeDomainCliqueProtocol(
+			cd,
+			featuregates.Enabled(featuregates.ControllerOwnedCDCliques),
+			m.config.controllerOwnedCDCliquesAvailable,
+			m.config.maxNodesPerIMEXDomain,
+		)
+		if err != nil {
+			return err
+		}
+		newCD.Annotations[computeDomainProtocolAnnotation] = string(protocol)
+		changed = true
+	}
+	if !slices.Contains(newCD.Finalizers, computeDomainFinalizer) {
+		newCD.Finalizers = append(newCD.Finalizers, computeDomainFinalizer)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	updated, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(cd.Namespace).Update(ctx, newCD, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("error updating ComputeDomain: %w", err)
+	}
+	m.mutationCache.Mutation(updated)
+
+	return nil
+}
+
+func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnabled, snapshotAPIAvailable bool, capacity int) (nvapi.ComputeDomainCliqueProtocol, error) {
+	requested := nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueRequestedProtocolAnnotation])
+	if requested != "" {
+		if err := nvapi.ValidateComputeDomainCliqueProtocol(requested); err != nil {
+			return "", fmt.Errorf("invalid requested ComputeDomain clique protocol: %w", err)
 		}
 	}
 
-	newCD := cd.DeepCopy()
-	newCD.Finalizers = append(newCD.Finalizers, computeDomainFinalizer)
-	if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(cd.Namespace).Update(ctx, newCD, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("error updating ComputeDomain: %w", err)
+	// A marker-less object which already has our finalizer predates protocol
+	// selection and must remain legacy. Only a newly admitted object can opt
+	// into controller-v1.
+	if slices.Contains(cd.Finalizers, computeDomainFinalizer) || requested != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		return nvapi.ComputeDomainCliqueProtocolLegacyV1, nil
 	}
+	if cd.Spec.NumNodes <= 0 {
+		return "", fmt.Errorf("controller-v1 requires spec.numNodes to declare the complete expected Node set")
+	}
+	if cd.Spec.NumNodes > capacity {
+		return "", fmt.Errorf("controller-v1 spec.numNodes %d exceeds the configured IMEX clique capacity %d", cd.Spec.NumNodes, capacity)
+	}
+	if !controllerEnabled || !snapshotAPIAvailable {
+		return "", fmt.Errorf("controller-v1 was requested but the ControllerOwnedCDCliques feature gate and snapshot API are not both available")
+	}
+	return nvapi.ComputeDomainCliqueProtocolControllerV1, nil
+}
 
-	return nil
+func computeDomainCliqueProtocol(cd *nvapi.ComputeDomain) (nvapi.ComputeDomainCliqueProtocol, error) {
+	protocol := nvapi.ComputeDomainCliqueProtocol(cd.Annotations[computeDomainProtocolAnnotation])
+	if err := nvapi.ValidateComputeDomainCliqueProtocol(protocol); err != nil {
+		return "", err
+	}
+	return nvapi.EffectiveComputeDomainCliqueProtocol(protocol), nil
 }
 
 func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error {
@@ -360,6 +480,10 @@ func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error
 // addition to the workload ResourceClaimTemplate.
 func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, cd *nvapi.ComputeDomain) error {
 	if cd.GetDeletionTimestamp() != nil {
+		protocol, protocolErr := computeDomainCliqueProtocol(cd)
+		if protocolErr != nil {
+			return fmt.Errorf("invalid ComputeDomain clique protocol during deletion: %w", protocolErr)
+		}
 		if err := m.resourceClaimTemplateManager.Delete(ctx, string(cd.UID)); err != nil {
 			return fmt.Errorf("error deleting ResourceClaimTemplate: %w", err)
 		}
@@ -388,6 +512,15 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 			return fmt.Errorf("error asserting removal of DaemonSet: %w", err)
 		}
 
+		if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+			if err := m.DeleteSnapshots(ctx, string(cd.UID)); err != nil {
+				// Strict v1 policy: Kubernetes object disappearance is not a
+				// runtime fence. Preserve tombstones and the ComputeDomain finalizer
+				// until a future verified-fence or audited recovery path clears them.
+				return fmt.Errorf("controller-owned clique retirement blocked: %w", err)
+			}
+		}
+
 		if err := m.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
 			return fmt.Errorf("error removing finalizer: %w", err)
 		}
@@ -399,6 +532,19 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 	// Add the finalizer.
 	if err := m.addFinalizer(ctx, cd); err != nil {
 		return fmt.Errorf("error adding finalizer: %w", err)
+	}
+	// Protocol and finalizer are persisted together. Wait for the informer
+	// round-trip before creating objects so every artifact receives exactly the
+	// same immutable marker.
+	if _, exists := cd.Annotations[computeDomainProtocolAnnotation]; !exists {
+		return nil
+	}
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err != nil {
+		return fmt.Errorf("invalid ComputeDomain clique protocol: %w", err)
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 && !m.config.controllerOwnedCDCliquesAvailable {
+		return fmt.Errorf("controller-v1 requested but ComputeDomainCliqueSnapshot API is unavailable")
 	}
 
 	// Do not wait for the next periodic label cleanup to happen.

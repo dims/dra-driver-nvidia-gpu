@@ -23,6 +23,12 @@ kind: ServiceAccount
 metadata:
   name: compute-domain-daemon-service-account
   namespace: {{ $namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: compute-domain-daemon-reader-service-account
+  namespace: {{ $namespace }}
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -39,6 +45,32 @@ roleRef:
   kind: ClusterRole
   name: compute-domain-daemon-role
   apiGroup: rbac.authorization.k8s.io
+{{- range $namespace := $namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: compute-domain-daemon-reader-role
+  namespace: {{ $namespace }}
+rules:
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquesnapshots"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: compute-domain-daemon-reader-role-binding
+  namespace: {{ $namespace }}
+subjects:
+- kind: ServiceAccount
+  name: compute-domain-daemon-reader-service-account
+  namespace: {{ $namespace }}
+roleRef:
+  kind: Role
+  name: compute-domain-daemon-reader-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
 {{- if .Capabilities.APIVersions.Has "security.openshift.io/v1/SecurityContextConstraints" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -49,6 +81,9 @@ subjects:
 {{- range $namespace := $namespaces }}
 - kind: ServiceAccount
   name: compute-domain-daemon-service-account
+  namespace: {{ $namespace }}
+- kind: ServiceAccount
+  name: compute-domain-daemon-reader-service-account
   namespace: {{ $namespace }}
 {{- end }}
 roleRef:

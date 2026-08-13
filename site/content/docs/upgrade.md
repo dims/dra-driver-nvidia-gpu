@@ -17,6 +17,7 @@ For the full release summary, see the [v0.4.1 release notes](https://github.com/
 helm upgrade -i nvidia-dra-driver-gpu oci://registry.k8s.io/dra-driver-nvidia/charts/dra-driver-nvidia-gpu \
     --version {{< param "driver_version" >}} \
     --namespace nvidia-dra-driver-gpu \
+    --set resources.gpus.enabled=false \
     --set gpuResourcesEnabledOverride=true
 ```
 
@@ -76,6 +77,125 @@ Update the ComputeDomainsCliques CRD:
 kubectl apply \
     -f https://raw.githubusercontent.com/kubernetes-sigs/dra-driver-nvidia-gpu/refs/tags/v0.4.0/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliques.yaml
 ```
+
+For a release which contains `ControllerOwnedCDCliques`, download that exact
+release's chart or source archive. Render and apply its admission policies and
+bindings **before** applying the controller-owned ComputeDomainCliqueSnapshots
+and cluster-scoped ComputeDomainCliqueReservations CRDs, and before upgrading
+the controller or kubelet plugin binaries. Admission resource rules may safely
+name a GVR which is not served yet; this order prevents a namespace writer from
+pre-seeding controller-owned protocol or snapshot state in the CRD-to-binary
+bootstrap interval. A CRD by itself does not reserve controller-owned metadata.
+Helm does not install a newly added file from the chart's
+`crds/` directory during `helm upgrade`:
+
+```bash
+RELEASE_VERSION=vX.Y.Z
+curl -fsSLO "https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/archive/refs/tags/${RELEASE_VERSION}.tar.gz"
+tar -xzf "${RELEASE_VERSION}.tar.gz"
+
+# Render the exact release with the Phase-2 safety settings, then apply the
+# policies and their bindings before either new CRD exists. Preserve/reapply
+# the other values used by the installed release as appropriate.
+helm template nvidia-dra-driver-gpu \
+    "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu" \
+    --namespace nvidia-dra-driver-gpu \
+    --set featureGates.ControllerOwnedCDCliques=true \
+    --set kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled=true \
+    --set controller.leaderElection.enabled=true \
+    --set-json 'controllerOwnedCDCliques.canaryNamespaces=["my-canary-namespace"]' \
+    --show-only templates/validatingadmissionpolicy.yaml \
+    --show-only templates/validatingadmissionpolicybinding.yaml \
+    > controller-owned-admission.yaml
+kubectl apply -f controller-owned-admission.yaml
+
+kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquesnapshots.yaml"
+kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquereservations.yaml"
+
+kubectl wait --for=condition=Established \
+    crd/computedomaincliquesnapshots.resource.nvidia.com
+kubectl wait --for=condition=Established \
+    crd/computedomaincliquereservations.resource.nvidia.com
+
+# Verify the served version and the snapshot status subresource. The dry-run
+# must pass authorization and schema routing without creating an object.
+kubectl get --raw /apis/resource.nvidia.com/v1beta1 | \
+    grep -q 'computedomaincliquesnapshots/status'
+kubectl auth can-i update computedomaincliquesnapshots/status \
+    --api-group=resource.nvidia.com \
+    --as=system:serviceaccount:nvidia-dra-driver-gpu:nvidia-dra-driver-gpu-controller \
+    -n nvidia-dra-driver-gpu
+```
+
+Verify that the rendered `computedomain-protocol-policy`, reserved-metadata,
+Node-topology, reservation-writer, and snapshot-writer policies all have active
+`ValidatingAdmissionPolicyBinding` objects before continuing. The controller
+also rejects a persisted protocol marker which predates its finalizer, but the
+admission layer is required to prevent that invalid state rather than merely
+fail closed after it is stored.
+
+Leave `ControllerOwnedCDCliques=false` until the CRD is Established and the
+dual-capable kubelet plugin has rolled out to every eligible node. Then opt in
+only a canary ComputeDomain by creating it with
+`resource.nvidia.com/requestedComputeDomainCliqueProtocol: controller-v1` and
+a positive `spec.numNodes` equal to the complete expected Node count. Before
+that creation, reserve the **entire physical clique** for the canary and use
+hardware that is either new or has been externally quiesced and reset. Prevent
+every legacy workload from beginning Prepare on that clique throughout
+controller-mode formation. The legacy path can check whether a reservation
+already exists, but only the later controller reconciliation atomically creates
+the reservation; those operations do not form one cross-protocol transaction.
+Deleting a legacy Kubernetes object is not proof that its old IMEX runtime
+stopped, so strict v1 does not treat ordinary legacy deletion as migration
+fence evidence. Enable leader election and topology publication and explicitly
+allowlist an operator-controlled canary namespace:
+
+```yaml
+featureGates:
+  ControllerOwnedCDCliques: true
+kubeletPlugin:
+  containers:
+    computeDomains:
+      gpuCliqueLabelEnabled: true
+controller:
+  leaderElection:
+    enabled: true
+controllerOwnedCDCliques:
+  canaryNamespaces:
+  - my-canary-namespace
+```
+
+Alpha supports one chart installation in one fixed primary driver namespace.
+Do not install another release, rename or move the controller ServiceAccount,
+or migrate the control namespace while controller-owned admission policies or
+state exist. The policies are cluster-scoped and authorize the exact release
+ServiceAccount identities; multiple releases would overwrite or conjunctively
+conflict with one another. Additional driver namespaces remain legacy-only.
+
+Only trusted operators should be able to create ComputeDomains in an allowed
+canary namespace. The node-bound admission policy limits the kubelet plugin to
+driver-owned metadata on its own Node, but the ComputeDomain membership label
+is not proof that a DRA claim authorized that membership. Use exclusive,
+controlled canary Nodes until membership is derived from an allocation or a
+controller-issued attestation.
+
+Keep leader election and topology publication enabled while any persisted
+controller-v1 ComputeDomain exists, including after disabling the feature gate
+for new admission. Strict v1 deliberately blocks deletion/index reuse after an
+Active snapshot until the whole physical clique has been externally quiesced
+and reset; do not recreate it as legacy-v1 as a shortcut.
+Helm rollback does not roll CRD schemas back. Existing ComputeDomains retain
+their persisted protocol; disabling the feature gate stops new controller-v1
+admission but does not stop reconciliation of active controller-v1 domains.
+Do not uninstall the chart or roll back to a chart/binary which predates
+controller-v1 while any reservation or controller-v1 ComputeDomain exists.
+The admission policies are normal chart resources while CRDs and strict
+tombstones outlive an uninstall; removing those policies would remove the
+writer/delete guard from retained state, and old binaries do not understand
+the protocol, receipt, or reservation fence. Likewise, do not switch
+`imex.mode` from `driverManaged` to `hostManaged` until every controller-v1
+domain has gone through the verified whole-fabric recovery procedure; current
+binaries refuse that transition while controller-owned state remains.
 
 2. Upgrade the Helm chart by using the `helm upgrade -i` command to upgrade the chart in place. 
 

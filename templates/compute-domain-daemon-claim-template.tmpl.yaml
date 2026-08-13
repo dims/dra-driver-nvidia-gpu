@@ -16,6 +16,8 @@ spec:
       - name: daemon
         exactly:
           deviceClassName: {{ .DeviceClassName }}
+          allocationMode: ExactCount
+          count: 1
       config:
       - requests: ["daemon"]
         opaque:
@@ -24,3 +26,6 @@ spec:
             apiVersion: {{ .DaemonConfig.APIVersion }}
             kind: {{ .DaemonConfig.Kind }}
             domainID: {{ .DaemonConfig.DomainID }}
+            {{- if .DaemonConfig.Protocol }}
+            protocol: {{ .DaemonConfig.Protocol }}
+            {{- end }}

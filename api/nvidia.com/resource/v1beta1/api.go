@@ -27,13 +27,15 @@ const (
 	GroupName = "resource.nvidia.com"
 	Version   = "v1beta1"
 
-	GpuConfigKind                  = "GpuConfig"
-	MigDeviceConfigKind            = "MigDeviceConfig"
-	VfioDeviceConfigKind           = "VfioDeviceConfig"
-	ComputeDomainChannelConfigKind = "ComputeDomainChannelConfig"
-	ComputeDomainDaemonConfigKind  = "ComputeDomainDaemonConfig"
-	ComputeDomainKind              = "ComputeDomain"
-	ComputeDomainCliqueKind        = "ComputeDomainClique"
+	GpuConfigKind                      = "GpuConfig"
+	MigDeviceConfigKind                = "MigDeviceConfig"
+	VfioDeviceConfigKind               = "VfioDeviceConfig"
+	ComputeDomainChannelConfigKind     = "ComputeDomainChannelConfig"
+	ComputeDomainDaemonConfigKind      = "ComputeDomainDaemonConfig"
+	ComputeDomainKind                  = "ComputeDomain"
+	ComputeDomainCliqueKind            = "ComputeDomainClique"
+	ComputeDomainCliqueSnapshotKind    = "ComputeDomainCliqueSnapshot"
+	ComputeDomainCliqueReservationKind = "ComputeDomainCliqueReservation"
 )
 
 // Interface defines the set of common APIs for all configs
@@ -73,6 +75,10 @@ func init() {
 		&ComputeDomainDaemonConfig{},
 		&ComputeDomain{},
 		&ComputeDomainClique{},
+		&ComputeDomainCliqueSnapshot{},
+		&ComputeDomainCliqueSnapshotList{},
+		&ComputeDomainCliqueReservation{},
+		&ComputeDomainCliqueReservationList{},
 	)
 	metav1.AddToGroupVersion(scheme, schemeGroupVersion)
 

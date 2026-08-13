@@ -20,10 +20,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"text/template"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -38,9 +42,7 @@ import (
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 )
 
-const (
-	DaemonSetTemplatePath = "/templates/compute-domain-daemon.tmpl.yaml"
-)
+var DaemonSetTemplatePath = "/templates/compute-domain-daemon.tmpl.yaml"
 
 type DaemonSetTemplateData struct {
 	Namespace                 string
@@ -54,6 +56,8 @@ type DaemonSetTemplateData struct {
 	FeatureGates              map[string]bool
 	LogVerbosity              int
 	ImagePullSecretNames      []string
+	ServiceAccountName        string
+	Protocol                  nvapi.ComputeDomainCliqueProtocol
 }
 
 type DaemonSetManager struct {
@@ -196,6 +200,12 @@ func (m *DaemonSetManager) Create(ctx context.Context, cd *nvapi.ComputeDomain) 
 		return nil, fmt.Errorf("more than one DaemonSet found with same ComputeDomain UID")
 	}
 	if len(ds) == 1 {
+		if _, err := m.resourceClaimTemplateManager.Create(ctx, cd); err != nil {
+			return nil, fmt.Errorf("validate existing daemon ResourceClaimTemplate: %w", err)
+		}
+		if err := validateExistingDaemonSet(ds[0], cd, m.config); err != nil {
+			return nil, err
+		}
 		return ds[0], nil
 	}
 
@@ -204,43 +214,12 @@ func (m *DaemonSetManager) Create(ctx context.Context, cd *nvapi.ComputeDomain) 
 		return nil, fmt.Errorf("error creating ResourceClaimTemplate: %w", err)
 	}
 
-	templateData := DaemonSetTemplateData{
-		Namespace:                 m.config.driverNamespace,
-		Name:                      fmt.Sprintf("computedomain-daemon-%s", cd.UID),
-		Finalizer:                 computeDomainFinalizer,
-		ComputeDomainLabelKey:     computeDomainLabelKey,
-		ComputeDomainLabelValue:   cd.UID,
-		ResourceClaimTemplateName: rct.Name,
-		ImageName:                 m.config.imageName,
-		MaxNodesPerIMEXDomain:     m.config.maxNodesPerIMEXDomain,
-		FeatureGates:              featuregates.ToMap(),
-		LogVerbosity:              m.config.logVerbosityCDDaemon,
-		ImagePullSecretNames:      m.config.imagePullSecretNames,
-	}
-
-	tmpl, err := template.ParseFiles(DaemonSetTemplatePath)
+	daemonSet, err := expectedDaemonSet(cd, rct.Name, m.config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse template file: %w", err)
+		return nil, err
 	}
 
-	var daemonSetYaml bytes.Buffer
-	if err := tmpl.Execute(&daemonSetYaml, templateData); err != nil {
-		return nil, fmt.Errorf("failed to execute template: %w", err)
-	}
-
-	var unstructuredObj unstructured.Unstructured
-	err = yaml.Unmarshal(daemonSetYaml.Bytes(), &unstructuredObj)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal yaml: %w", err)
-	}
-
-	var daemonSet appsv1.DaemonSet
-	err = runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.UnstructuredContent(), &daemonSet)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert unstructured data to typed object: %w", err)
-	}
-
-	d, err := m.config.clientsets.Core.AppsV1().DaemonSets(daemonSet.Namespace).Create(ctx, &daemonSet, metav1.CreateOptions{})
+	d, err := m.config.clientsets.Core.AppsV1().DaemonSets(daemonSet.Namespace).Create(ctx, daemonSet, metav1.CreateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error creating DaemonSet: %w", err)
 	}
@@ -250,6 +229,143 @@ func (m *DaemonSetManager) Create(ctx context.Context, cd *nvapi.ComputeDomain) 
 	m.mutationCache.Mutation(d)
 
 	return d, nil
+}
+
+func validateExistingDaemonSet(ds *appsv1.DaemonSet, cd *nvapi.ComputeDomain, config *ManagerConfig) error {
+	expected, err := expectedDaemonSet(cd, fmt.Sprintf("computedomain-daemon-%s", cd.UID), config)
+	if err != nil {
+		return err
+	}
+	// Existing per-CD DaemonSets are intentionally not rewritten on a controller
+	// upgrade. Preserve that brownfield behavior for rollout-only fields while
+	// comparing every identity/protocol field, probe, command, claim, and
+	// downward-API binding exactly. In particular, ControllerOwnedCDCliques is
+	// an admission-default gate and may be disabled while a persisted
+	// controller-v1 domain continues running.
+	normalizeMutableDaemonRolloutFields(expected, ds)
+	if ds.Namespace != expected.Namespace || ds.Name != expected.Name ||
+		!slices.Equal(ds.Finalizers, expected.Finalizers) ||
+		!reflect.DeepEqual(ds.Labels, expected.Labels) ||
+		!reflect.DeepEqual(ds.Spec.Selector, expected.Spec.Selector) ||
+		!reflect.DeepEqual(ds.Spec.Template, expected.Spec.Template) {
+		return fmt.Errorf("refusing to adopt DaemonSet %s/%s because its canonical Pod template or identity does not match ComputeDomain UID %q", ds.Namespace, ds.Name, cd.UID)
+	}
+	return nil
+}
+
+func normalizeMutableDaemonRolloutFields(expected, existing *appsv1.DaemonSet) {
+	expected.Spec.Template.Spec.ImagePullSecrets = slices.Clone(existing.Spec.Template.Spec.ImagePullSecrets)
+	if len(expected.Spec.Template.Spec.Containers) != 1 || len(existing.Spec.Template.Spec.Containers) != 1 {
+		return
+	}
+	expectedContainer := &expected.Spec.Template.Spec.Containers[0]
+	existingContainer := &existing.Spec.Template.Spec.Containers[0]
+	expectedContainer.Image = existingContainer.Image
+	expectedContainer.ImagePullPolicy = existingContainer.ImagePullPolicy
+	if len(expectedContainer.Env) != len(existingContainer.Env) {
+		return
+	}
+	for i := range expectedContainer.Env {
+		if expectedContainer.Env[i].Name != existingContainer.Env[i].Name {
+			continue
+		}
+		switch expectedContainer.Env[i].Name {
+		case "FEATURE_GATES", "LOG_VERBOSITY":
+			expectedContainer.Env[i] = existingContainer.Env[i]
+		}
+	}
+}
+
+func expectedDaemonSet(cd *nvapi.ComputeDomain, resourceClaimTemplateName string, config *ManagerConfig) (*appsv1.DaemonSet, error) {
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ComputeDomain clique protocol: %w", err)
+	}
+	templateData := DaemonSetTemplateData{
+		Namespace:                 config.driverNamespace,
+		Name:                      fmt.Sprintf("computedomain-daemon-%s", cd.UID),
+		Finalizer:                 computeDomainFinalizer,
+		ComputeDomainLabelKey:     computeDomainLabelKey,
+		ComputeDomainLabelValue:   cd.UID,
+		ResourceClaimTemplateName: resourceClaimTemplateName,
+		ImageName:                 config.imageName,
+		MaxNodesPerIMEXDomain:     config.maxNodesPerIMEXDomain,
+		FeatureGates:              featuregates.ToMap(),
+		LogVerbosity:              config.logVerbosityCDDaemon,
+		ImagePullSecretNames:      config.imagePullSecretNames,
+		Protocol:                  protocol,
+		ServiceAccountName:        "compute-domain-daemon-service-account",
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		templateData.ServiceAccountName = "compute-domain-daemon-reader-service-account"
+	}
+	tmpl, err := template.ParseFiles(DaemonSetTemplatePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse DaemonSet template: %w", err)
+	}
+	var daemonSetYAML bytes.Buffer
+	if err := tmpl.Execute(&daemonSetYAML, templateData); err != nil {
+		return nil, fmt.Errorf("failed to execute DaemonSet template: %w", err)
+	}
+	var unstructuredObj unstructured.Unstructured
+	if err := yaml.Unmarshal(daemonSetYAML.Bytes(), &unstructuredObj); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal DaemonSet YAML: %w", err)
+	}
+	var daemonSet appsv1.DaemonSet
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.UnstructuredContent(), &daemonSet); err != nil {
+		return nil, fmt.Errorf("failed to convert DaemonSet to typed object: %w", err)
+	}
+	// Informer objects contain defaults applied by the API server. Normalize the
+	// locally rendered expected PodTemplate before doing an exact comparison;
+	// client-go's external scheme intentionally does not register API-server
+	// defaulting functions.
+	applyDaemonPodTemplateDefaults(&daemonSet.Spec.Template)
+	return &daemonSet, nil
+}
+
+func applyDaemonPodTemplateDefaults(template *corev1.PodTemplateSpec) {
+	spec := &template.Spec
+	if spec.DeprecatedServiceAccount == "" {
+		spec.DeprecatedServiceAccount = spec.ServiceAccountName
+	}
+	if spec.DNSPolicy == "" {
+		spec.DNSPolicy = corev1.DNSClusterFirst
+	}
+	if spec.RestartPolicy == "" {
+		spec.RestartPolicy = corev1.RestartPolicyAlways
+	}
+	if spec.SecurityContext == nil {
+		spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	if spec.TerminationGracePeriodSeconds == nil {
+		seconds := int64(corev1.DefaultTerminationGracePeriodSeconds)
+		spec.TerminationGracePeriodSeconds = &seconds
+	}
+	if spec.SchedulerName == "" {
+		spec.SchedulerName = corev1.DefaultSchedulerName
+	}
+	for i := range spec.Containers {
+		container := &spec.Containers[i]
+		if container.ImagePullPolicy == "" {
+			container.ImagePullPolicy = corev1.PullIfNotPresent
+			lastSlash := strings.LastIndex(container.Image, "/")
+			lastColon := strings.LastIndex(container.Image, ":")
+			if lastColon > lastSlash && container.Image[lastColon+1:] == "latest" {
+				container.ImagePullPolicy = corev1.PullAlways
+			}
+		}
+		if container.TerminationMessagePath == "" {
+			container.TerminationMessagePath = corev1.TerminationMessagePathDefault
+		}
+		if container.TerminationMessagePolicy == "" {
+			container.TerminationMessagePolicy = corev1.TerminationMessageReadFile
+		}
+		for j := range container.Env {
+			if container.Env[j].ValueFrom != nil && container.Env[j].ValueFrom.FieldRef != nil && container.Env[j].ValueFrom.FieldRef.APIVersion == "" {
+				container.Env[j].ValueFrom.FieldRef.APIVersion = "v1"
+			}
+		}
+	}
 }
 
 func (m *DaemonSetManager) Get(ctx context.Context, cdUID string) (*appsv1.DaemonSet, error) {

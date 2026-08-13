@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"text/template"
 
@@ -310,11 +311,28 @@ func (m *DaemonSetResourceClaimTemplateManager) Create(ctx context.Context, cd *
 		return nil, fmt.Errorf("more than one ResourceClaimTemplate found with same ComputeDomain UID")
 	}
 	if len(rcts) == 1 {
+		protocol, protocolErr := computeDomainCliqueProtocol(cd)
+		if protocolErr != nil {
+			return nil, protocolErr
+		}
+		if err := validateExistingResourceClaimTemplate(rcts[0], m.config.driverNamespace, fmt.Sprintf("computedomain-daemon-%s", cd.UID), cd.UID, computeDomainResourceClaimTemplateTargetDaemon, "daemon", computeDomainDaemonDeviceClass, protocol, ""); err != nil {
+			return nil, err
+		}
 		return rcts[0], nil
 	}
 
 	daemonConfig := nvapi.DefaultComputeDomainDaemonConfig()
 	daemonConfig.DomainID = string(cd.UID)
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ComputeDomain clique protocol: %w", err)
+	}
+	daemonConfig.Protocol = protocol
+	if protocol == nvapi.ComputeDomainCliqueProtocolLegacyV1 {
+		// Do not add an unknown field to legacy claims while older strict
+		// decoders may still run during the phase-1 rollout.
+		daemonConfig.Protocol = ""
+	}
 
 	templateData := ResourceClaimTemplateTemplateData{
 		Namespace:               m.config.driverNamespace,
@@ -387,12 +405,27 @@ func (m *WorkloadResourceClaimTemplateManager) Create(ctx context.Context, names
 		return nil, fmt.Errorf("more than one ResourceClaimTemplate found with same ComputeDomain UID")
 	}
 	if len(rcts) == 1 {
+		protocol, protocolErr := computeDomainCliqueProtocol(cd)
+		if protocolErr != nil {
+			return nil, protocolErr
+		}
+		if err := validateExistingResourceClaimTemplate(rcts[0], namespace, name, cd.UID, computeDomainResourceClaimTemplateTargetWorkload, "channel", computeDomainDefaultChannelDeviceClass, protocol, channelAllocationModeFor(cd, m.config.imexConfig.EffectiveHostManaged())); err != nil {
+			return nil, err
+		}
 		return rcts[0], nil
 	}
 
 	channelConfig := nvapi.DefaultComputeDomainChannelConfig()
 	channelConfig.DomainID = string(cd.UID)
 	channelConfig.AllocationMode = channelAllocationModeFor(cd, m.config.imexConfig.EffectiveHostManaged())
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ComputeDomain clique protocol: %w", err)
+	}
+	channelConfig.Protocol = protocol
+	if protocol == nvapi.ComputeDomainCliqueProtocolLegacyV1 {
+		channelConfig.Protocol = ""
+	}
 
 	templateData := ResourceClaimTemplateTemplateData{
 		Namespace:               namespace,
@@ -413,4 +446,38 @@ func (m *WorkloadResourceClaimTemplateManager) Create(ctx context.Context, names
 	}
 
 	return rct, nil
+}
+
+func validateExistingResourceClaimTemplate(rct *resourceapi.ResourceClaimTemplate, namespace, name string, cdUID types.UID, target, requestName, deviceClass string, protocol nvapi.ComputeDomainCliqueProtocol, expectedAllocationMode string) error {
+	if rct.Namespace != namespace || rct.Name != name ||
+		rct.Labels[computeDomainLabelKey] != string(cdUID) ||
+		rct.Labels[computeDomainResourceClaimTemplateTargetLabelKey] != target {
+		return fmt.Errorf("refusing to adopt non-canonical ResourceClaimTemplate %s/%s for ComputeDomain UID %q", rct.Namespace, rct.Name, cdUID)
+	}
+	claim := rct.Spec.Spec.Devices
+	expectedRequest := resourceapi.DeviceRequest{Name: requestName, Exactly: &resourceapi.ExactDeviceRequest{
+		DeviceClassName: deviceClass,
+		AllocationMode:  resourceapi.DeviceAllocationModeExactCount,
+		Count:           1,
+	}}
+	if len(claim.Requests) != 1 || !reflect.DeepEqual(claim.Requests[0], expectedRequest) || len(claim.Constraints) != 0 || len(claim.Config) != 1 || claim.Config[0].Opaque == nil || claim.Config[0].Opaque.Driver != DriverName || len(claim.Config[0].Requests) != 1 || claim.Config[0].Requests[0] != requestName {
+		return fmt.Errorf("refusing to adopt ResourceClaimTemplate %s/%s with unexpected request, DeviceClass, or driver", rct.Namespace, rct.Name)
+	}
+	decoded, err := runtime.Decode(nvapi.StrictDecoder, claim.Config[0].Opaque.Parameters.Raw)
+	if err != nil {
+		return fmt.Errorf("decode existing ResourceClaimTemplate %s/%s parameters: %w", rct.Namespace, rct.Name, err)
+	}
+	switch marker := decoded.(type) {
+	case *nvapi.ComputeDomainDaemonConfig:
+		if requestName != "daemon" || marker.DomainID != string(cdUID) || nvapi.EffectiveComputeDomainCliqueProtocol(marker.Protocol) != protocol {
+			return fmt.Errorf("refusing to adopt ResourceClaimTemplate %s/%s with ComputeDomain or protocol mismatch", rct.Namespace, rct.Name)
+		}
+	case *nvapi.ComputeDomainChannelConfig:
+		if requestName != "channel" || marker.DomainID != string(cdUID) || nvapi.EffectiveComputeDomainCliqueProtocol(marker.Protocol) != protocol || marker.AllocationMode != expectedAllocationMode {
+			return fmt.Errorf("refusing to adopt ResourceClaimTemplate %s/%s with ComputeDomain, protocol, or allocationMode mismatch", rct.Namespace, rct.Name)
+		}
+	default:
+		return fmt.Errorf("refusing to adopt ResourceClaimTemplate %s/%s with unexpected opaque config %T", rct.Namespace, rct.Name, decoded)
+	}
+	return nil
 }
