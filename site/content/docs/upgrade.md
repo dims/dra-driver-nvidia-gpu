@@ -193,11 +193,15 @@ conflict with one another. Additional driver namespaces remain legacy-only.
 The chart enforces this boundary with a fixed, zero-permission ClusterRole
 named `controller-owned-cdc-installation.dra-driver-nvidia-gpu`. It records the
 Helm release, primary control namespace, controller ServiceAccount, and kubelet
-plugin ServiceAccount as immutable annotations and carries the canary namespace
-allowlist as parameters for every safety policy. `helm install`/`helm upgrade`
-uses a live lookup and rejects a different release or namespace before
-rendering namespaced resources. The installation policy denies identity changes
-or deletion of the ClusterRole marker, and the controller checks the recorded
+plugin ServiceAccount as immutable annotations. It also records the exact
+pre-controller-v1 controller and kubelet Role and binding names for that same
+release and namespace. Those legacy aliases permit a verified zero-state
+rollback without permitting a different release or ServiceAccount to acquire
+the protected roles. The marker carries the canary namespace allowlist as
+parameters for every safety policy. `helm install`/`helm upgrade` uses a live
+lookup and rejects a different release or namespace before rendering
+namespaced resources. The installation policy denies identity changes or
+deletion of the ClusterRole marker, and the controller checks the recorded
 identity at startup. Client-only `helm template` cannot perform a live lookup.
 Do not use `helm template | kubectl apply` to install or upgrade the chart:
 multi-document apply is not transactional. The retained RBAC-binding policy
@@ -232,19 +236,27 @@ ServiceAccount, workload, Role, and binding name identical is not a distinct
 installation identity.
 
 There is intentionally no ordinary Helm uninstall, old-chart rollback, or
-namespace-migration path while alpha controller-v1 state exists. A future
-explicit decommission procedure must
+namespace-migration path while alpha controller-v1 state exists. When the
+cluster has no controller-v1 ComputeDomains, snapshots, retirement evidence,
+or unreleased reservations, an in-place rollback of the same release in the
+same namespace to the recorded legacy workload and RBAC names is supported.
+The retained policies continue to reject any other release, namespace, or
+ServiceAccount during and after that rollback. Test that exact chart transition
+on the target Kubernetes version before relying on it as a recovery path.
+
+A full decommission or any rollback with controller-owned state still requires
+an explicit reviewed procedure which must
 first inventory and remove every controller-v1 ComputeDomain and snapshot,
 verify the whole-clique reset/fence, and account for retained reservations. Only
 then may a cluster administrator mark the protected admission objects with
 `resource.nvidia.com/unsafe-controller-owned-cdc-decommission=approved` and
 remove the binding, policies, and retained CRDs/state in a reviewed order. The
-workload policy permits the exact marker-recorded legacy controller and kubelet
-workload names so the admission-first brownfield rollout can overlap old
-binaries. That compatibility is not evidence that an old-chart rollback is
-safe. A rollback to a chart predating controller-v1 requires verified zero
-controller state and a tested RBAC/workload rollback or the reviewed
-decommission first. That
+workload and RBAC policies permit the exact marker-recorded legacy controller
+and kubelet identities so the admission-first brownfield rollout can overlap
+old binaries and a verified zero-state rollback can complete. This is not
+permission to roll back while a controller-owned clique exists. A rollback to
+a chart predating controller-v1 requires verified zero controller state and the
+recorded same-installation transition, or the reviewed decommission first. That
 annotation is an unsafe administrative authorization, not fence evidence.
 
 Only trusted operators should be able to create ComputeDomains in an allowed

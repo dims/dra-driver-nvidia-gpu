@@ -34,7 +34,15 @@ spec:
        'resource.nvidia.com/controller-owned-cdc-controller-namespace-role',
        'resource.nvidia.com/controller-owned-cdc-controller-namespace-binding',
        'resource.nvidia.com/controller-owned-cdc-kubelet-namespace-role',
-       'resource.nvidia.com/controller-owned-cdc-kubelet-namespace-binding']
+       'resource.nvidia.com/controller-owned-cdc-kubelet-namespace-binding',
+       'resource.nvidia.com/controller-owned-cdc-legacy-controller-role',
+       'resource.nvidia.com/controller-owned-cdc-legacy-kubelet-role',
+       'resource.nvidia.com/controller-owned-cdc-legacy-controller-binding',
+       'resource.nvidia.com/controller-owned-cdc-legacy-kubelet-binding',
+       'resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-role',
+       'resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-binding',
+       'resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-role',
+       'resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-binding']
   validations:
   - expression: >-
       request.operation != 'UPDATE' ||
@@ -77,6 +85,14 @@ spec:
     expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-binding']
   - name: kubeletBinding
     expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-kubelet-binding']
+  - name: legacyControllerRole
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-controller-role']
+  - name: legacyKubeletRole
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-kubelet-role']
+  - name: legacyControllerBinding
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-controller-binding']
+  - name: legacyKubeletBinding
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-kubelet-binding']
   - name: daemonRole
     expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-daemon-role']
   - name: daemonBinding
@@ -93,12 +109,16 @@ spec:
     expression: object.subjects.filter(s, s.kind == 'ServiceAccount').map(s, 'system:serviceaccount:'+s.namespace+':'+s.name)
   validations:
   - expression: >-
-      object.roleRef.name != variables.controllerRole ||
-      (object.metadata.name == variables.controllerBinding && size(object.subjects) == 1 && variables.subjectUsernames == [variables.controllerSubject])
+      (object.roleRef.name != variables.controllerRole && object.roleRef.name != variables.legacyControllerRole) ||
+      (((object.metadata.name == variables.controllerBinding && object.roleRef.name == variables.controllerRole) ||
+        (object.metadata.name == variables.legacyControllerBinding && object.roleRef.name == variables.legacyControllerRole)) &&
+       size(object.subjects) == 1 && variables.subjectUsernames == [variables.controllerSubject])
     message: the controller ClusterRole may be bound only to the immutable installation controller ServiceAccount
   - expression: >-
-      object.roleRef.name != variables.kubeletRole ||
-      (object.metadata.name == variables.kubeletBinding && size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject])
+      (object.roleRef.name != variables.kubeletRole && object.roleRef.name != variables.legacyKubeletRole) ||
+      (((object.metadata.name == variables.kubeletBinding && object.roleRef.name == variables.kubeletRole) ||
+        (object.metadata.name == variables.legacyKubeletBinding && object.roleRef.name == variables.legacyKubeletRole)) &&
+       size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject])
     message: the kubelet-plugin ClusterRole may be bound only to the immutable installation kubelet ServiceAccount
   - expression: >-
       object.roleRef.name != variables.daemonRole ||
@@ -132,6 +152,18 @@ spec:
       - {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceBindingName" . | quote }}
       - {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceRoleName" . | quote }}
       - {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceBindingName" . | quote }}
+      {{- if ne (include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceRoleName" .) (include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceRoleName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceRoleName" . | quote }}
+      {{- end }}
+      {{- if ne (include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceBindingName" .) (include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceBindingName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceBindingName" . | quote }}
+      {{- end }}
+      {{- if ne (include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceRoleName" .) (include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceRoleName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceRoleName" . | quote }}
+      {{- end }}
+      {{- if ne (include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceBindingName" .) (include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceBindingName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceBindingName" . | quote }}
+      {{- end }}
   variables:
   - name: installation
     expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-installation']
@@ -143,6 +175,16 @@ spec:
     expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-kubelet-namespace-role']
   - name: kubeletBinding
     expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-kubelet-namespace-binding']
+  - name: legacyControllerRole
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-role']
+  - name: legacyControllerBinding
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-binding']
+  - name: legacyKubeletRole
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-role']
+  - name: legacyKubeletBinding
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-binding']
+  - name: controlNamespace
+    expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace']
   - name: controllerSubject
     expression: params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-subject']
   - name: kubeletSubject
@@ -153,12 +195,18 @@ spec:
     expression: >-
       object.kind == 'RoleBinding' ? object.subjects.filter(s, s.kind == 'ServiceAccount').map(s, 'system:serviceaccount:'+s.namespace+':'+s.name) : []
   validations:
-  - expression: variables.actualInstallation == variables.installation
+  - expression: >-
+      variables.actualInstallation == variables.installation ||
+      (object.metadata.namespace == variables.controlNamespace &&
+       object.metadata.name in [variables.legacyControllerRole, variables.legacyControllerBinding,
+        variables.legacyKubeletRole, variables.legacyKubeletBinding])
     message: protected controller-owned CDC namespaced RBAC belongs to the immutable installation
   - expression: >-
       object.kind != 'RoleBinding' ||
       (object.metadata.name == variables.controllerBinding && object.roleRef.name == variables.controllerRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.controllerSubject]) ||
-      (object.metadata.name == variables.kubeletBinding && object.roleRef.name == variables.kubeletRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject])
+      (object.metadata.name == variables.kubeletBinding && object.roleRef.name == variables.kubeletRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject]) ||
+      (object.metadata.namespace == variables.controlNamespace && object.metadata.name == variables.legacyControllerBinding && object.roleRef.name == variables.legacyControllerRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.controllerSubject]) ||
+      (object.metadata.namespace == variables.controlNamespace && object.metadata.name == variables.legacyKubeletBinding && object.roleRef.name == variables.legacyKubeletRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject])
     message: protected controller-owned CDC namespaced RoleBindings may bind only the immutable installation subjects
 ---
 apiVersion: admissionregistration.k8s.io/v1

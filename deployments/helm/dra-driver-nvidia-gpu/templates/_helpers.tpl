@@ -177,6 +177,44 @@ dra-driver-nvidia-gpu-clusterrole-binding-kubeletplugin
 {{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}dra-driver-nvidia-gpu-role-binding-kubeletplugin{{- else -}}{{- printf "%s-role-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
 {{- end -}}
 
+{{/*
+Names emitted by charts which predate controller-owned CDC admission. The
+immutable installation marker records these aliases so a verified zero-state
+rollback can restore the old workloads and RBAC without opening the binding
+policies to a second release or control namespace.
+*/}}
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerRoleName" -}}
+{{- printf "%s-clusterrole-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletRoleName" -}}
+{{- printf "%s-clusterrole-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerBindingName" -}}
+{{- printf "%s-clusterrole-binding-controller-%s" (include "dra-driver-nvidia-gpu.name" .) (include "dra-driver-nvidia-gpu.namespace" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletBindingName" -}}
+{{- printf "%s-clusterrole-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceRoleName" -}}
+{{- printf "%s-role-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceBindingName" -}}
+{{- printf "%s-role-binding-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceRoleName" -}}
+{{- printf "%s-role-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceBindingName" -}}
+{{- printf "%s-role-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
 {{- define "dra-driver-nvidia-gpu.controllerServiceAccountUsername" -}}
 {{- printf "system:serviceaccount:%s:%s-controller" (include "dra-driver-nvidia-gpu.namespace" . | trim) (include "dra-driver-nvidia-gpu.serviceAccountName" . | trim) -}}
 {{- end -}}
@@ -205,6 +243,14 @@ resource.nvidia.com/controller-owned-cdc-controller-namespace-role: {{ include "
 resource.nvidia.com/controller-owned-cdc-controller-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceBindingName" . | quote }}
 resource.nvidia.com/controller-owned-cdc-kubelet-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceRoleName" . | quote }}
 resource.nvidia.com/controller-owned-cdc-kubelet-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceBindingName" . | quote }}
 {{- end -}}
 
 {{- define "dra-driver-nvidia-gpu.controllerOwnedCDCObjectIdentity" -}}
