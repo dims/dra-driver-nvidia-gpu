@@ -38,6 +38,7 @@ import (
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/common"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/bootid"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	pkgflags "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
 )
@@ -279,6 +280,13 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	if flags.cliqueID == "" {
 		klog.Infof("no cliqueID: starting controller-v1 retirement-capable snapshot reader with IMEX disabled")
 	}
+	bootID, err := bootid.GetCurrentBootID()
+	if err != nil {
+		return fmt.Errorf("read kernel boot ID: %w", err)
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 && bootID == "" {
+		return fmt.Errorf("controller-v1 requires a nonempty kernel boot ID")
+	}
 
 	config := &ControllerConfig{
 		httpEndpoint:           flags.httpEndpoint,
@@ -293,6 +301,7 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		podUID:                 flags.podUID,
 		podName:                flags.podName,
 		podNamespace:           flags.podNamespace,
+		bootID:                 bootID,
 		maxNodesPerIMEXDomain:  flags.maxNodesPerIMEXDomain,
 		protocol:               protocol,
 	}
@@ -488,13 +497,13 @@ type controllerSnapshotApplyState struct {
 }
 
 type controllerSnapshotApplyOperations struct {
-	updateHosts            func([]*nvapi.ComputeDomainDaemonInfo) (bool, error)
-	ensureIMEX             func() (bool, error)
-	restartIMEX            func() error
-	checkIMEX              func() error
-	writeReceipt           func(*nvapi.ComputeDomainCliqueSnapshotReceipt) error
-	retireIMEX             func() error
-	writeRetirementReceipt func(*ControllerSnapshotDesiredState) error
+	updateHosts             func([]*nvapi.ComputeDomainDaemonInfo) (bool, error)
+	ensureIMEX              func() (bool, error)
+	restartIMEX             func() error
+	checkIMEX               func() error
+	writeReceipt            func(*nvapi.ComputeDomainCliqueSnapshotReceipt) error
+	retireIMEX              func() error
+	writeRetirementEvidence func(*ControllerSnapshotDesiredState) error
 }
 
 // IMEXDaemonUpdateLoopWithControllerSnapshot retries local installation
@@ -521,8 +530,8 @@ func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller 
 		},
 		writeReceipt: writeSnapshotReceipt,
 		retireIMEX:   retireIMEX,
-		writeRetirementReceipt: func(state *ControllerSnapshotDesiredState) error {
-			return controller.PublishSnapshotRetirementReceipt(ctx, state)
+		writeRetirementEvidence: func(state *ControllerSnapshotDesiredState) error {
+			return controller.PublishSnapshotRetirementEvidence(ctx, state)
 		},
 	}
 
@@ -548,7 +557,7 @@ func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller 
 		}
 
 		if err := applyControllerSnapshot(&pending, ops); err == nil {
-			if pending.desired.RetirementReceipt != nil {
+			if pending.desired.RetirementEvidence != nil {
 				controller.MarkSnapshotRetired(pending.desired)
 			} else {
 				controller.MarkSnapshotApplied(pending.desired)
@@ -573,15 +582,15 @@ func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller 
 }
 
 func applyControllerSnapshot(state *controllerSnapshotApplyState, ops controllerSnapshotApplyOperations) error {
-	if state.desired.RetirementReceipt != nil {
-		if ops.retireIMEX == nil || ops.writeRetirementReceipt == nil {
+	if state.desired.RetirementEvidence != nil {
+		if ops.retireIMEX == nil || ops.writeRetirementEvidence == nil {
 			return fmt.Errorf("retirement operations are unavailable")
 		}
 		if err := ops.retireIMEX(); err != nil {
 			return fmt.Errorf("failed to stop and reap IMEX daemon: %w", err)
 		}
-		if err := ops.writeRetirementReceipt(state.desired); err != nil {
-			return fmt.Errorf("failed to publish process-exit retirement receipt: %w", err)
+		if err := ops.writeRetirementEvidence(state.desired); err != nil {
+			return fmt.Errorf("failed to publish durable retirement evidence: %w", err)
 		}
 		state.restartRequired = false
 		return nil

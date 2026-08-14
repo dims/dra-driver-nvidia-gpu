@@ -118,8 +118,11 @@ func (c *Controller) Run(ctx context.Context) error {
 					klog.Errorf("controller-owned API discovery preflight failed: %v", err)
 				}
 				controllerOwnedAvailable = false
-			} else if !apiResourcePresent(resources.APIResources, "computedomaincliquesnapshots/status") || !apiResourcePresent(resources.APIResources, "computedomaincliquereservations") || !apiResourcePresent(resources.APIResources, "computedomaincliquereservations/status") {
-				klog.Errorf("controller-owned API discovery is missing the snapshot or reservation status subresource")
+			} else if !apiResourcePresent(resources.APIResources, "computedomaincliquesnapshots/status") ||
+				!apiResourcePresent(resources.APIResources, "computedomaincliquereservations") ||
+				!apiResourcePresent(resources.APIResources, "computedomaincliquereservations/status") ||
+				!apiResourcePresent(resources.APIResources, "computedomaincliqueretirementevidences") {
+				klog.Errorf("controller-owned API discovery is missing the snapshot, reservation, or retirement-evidence API")
 				controllerOwnedAvailable = false
 			}
 		}
@@ -149,10 +152,18 @@ func (c *Controller) Run(ctx context.Context) error {
 			if namespace == c.config.flags.namespace {
 				controllerOwnedAvailable = false
 			}
+			continue
+		}
+		if _, evidenceErr := c.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(namespace).List(ctx, metav1.ListOptions{Limit: 1}); evidenceErr != nil {
+			namespaceAvailable[namespace] = false
+			klog.Errorf("controller-owned retirement-evidence API preflight failed in namespace %s: %v", namespace, evidenceErr)
+			if namespace == c.config.flags.namespace {
+				controllerOwnedAvailable = false
+			}
 		}
 	}
 	if requiresControllerOwned && !c.config.imexConfig.EffectiveHostManaged() && !controllerOwnedAvailable {
-		return fmt.Errorf("claim-attested ComputeDomain Node routing requires the reservation and snapshot APIs; install and establish both CRDs before rolling out controller and kubelet binaries")
+		return fmt.Errorf("claim-attested ComputeDomain routing and retirement require the reservation, snapshot, and retirement-evidence APIs; install and establish all three CRDs before rolling out controller and kubelet binaries")
 	}
 
 	managerConfig := &ManagerConfig{

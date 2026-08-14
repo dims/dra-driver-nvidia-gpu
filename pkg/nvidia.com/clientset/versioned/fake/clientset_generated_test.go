@@ -66,3 +66,35 @@ func TestComputeDomainCliqueSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("got %d snapshots, want 2", len(list.Items))
 	}
 }
+
+func TestComputeDomainCliqueRetirementEvidenceRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	evidence := &resourcev1beta1.ComputeDomainCliqueRetirementEvidence{
+		ObjectMeta: metav1.ObjectMeta{Name: "retirement-snapshot-0", Namespace: "driver"},
+		Spec: resourcev1beta1.ComputeDomainCliqueRetirementEvidenceSpec{
+			Protocol:    resourcev1beta1.ComputeDomainCliqueProtocolControllerV1,
+			Reason:      resourcev1beta1.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot,
+			SnapshotUID: "snapshot",
+			Index:       0,
+			NodeName:    "node-a",
+			NodeUID:     "node-a-uid",
+		},
+	}
+	client := NewSimpleClientset(evidence)
+	evidences := client.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences("driver")
+
+	got, err := evidences.Get(ctx, evidence.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get seeded retirement evidence: %v", err)
+	}
+	if got.Spec.Reason != evidence.Spec.Reason {
+		t.Fatalf("got reason %q, want %q", got.Spec.Reason, evidence.Spec.Reason)
+	}
+	list, err := evidences.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list retirement evidence: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("got %d retirement evidence objects, want 1", len(list.Items))
+	}
+}

@@ -40,6 +40,10 @@ func (c *FakeResourceV1beta1) ComputeDomainCliqueReservations() v1beta1.ComputeD
 	return &FakeComputeDomainCliqueReservations{c}
 }
 
+func (c *FakeResourceV1beta1) ComputeDomainCliqueRetirementEvidences(namespace string) v1beta1.ComputeDomainCliqueRetirementEvidenceInterface {
+	return &FakeComputeDomainCliqueRetirementEvidences{c, namespace}
+}
+
 func (c *FakeResourceV1beta1) ComputeDomainCliqueSnapshots(namespace string) v1beta1.ComputeDomainCliqueSnapshotInterface {
 	return &FakeComputeDomainCliqueSnapshots{c, namespace}
 }

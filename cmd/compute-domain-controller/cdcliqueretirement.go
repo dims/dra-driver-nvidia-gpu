@@ -110,8 +110,8 @@ func (m *ControllerOwnedCliqueManager) PrepareComputeDomainRetirement(ctx contex
 			updated.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
 			apiMeta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
 				Type: "RetirementReady", Status: metav1.ConditionFalse,
-				Reason:             "WaitingForProcessExitReceipts",
-				Message:            "every exact published daemon must stop and reap its IMEX child before retirement can complete",
+				Reason:             "WaitingForRetirementEvidence",
+				Message:            "every published member must provide durable process-exit or node-reboot evidence before retirement can complete",
 				ObservedGeneration: snapshot.Generation,
 			})
 			if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{}); err != nil {
@@ -138,8 +138,8 @@ func (m *ControllerOwnedCliqueManager) PrepareComputeDomainRetirement(ctx contex
 			}
 			apiMeta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
 				Type: "RetirementReady", Status: metav1.ConditionTrue,
-				Reason:             "VerifiedProcessExit",
-				Message:            "every exact published daemon stopped and reaped its IMEX child",
+				Reason:             "VerifiedRetirementEvidence",
+				Message:            "every published member has durable evidence that its old IMEX process cannot still run",
 				ObservedGeneration: snapshot.Generation,
 			})
 			if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{}); err != nil {
@@ -232,6 +232,22 @@ func (m *ControllerOwnedCliqueManager) snapshotRetirementReceiptsComplete(ctx co
 	}
 	for i := range snapshot.Status.Members {
 		member := &snapshot.Status.Members[i]
+		evidenceName := nvapi.ComputeDomainCliqueRetirementEvidenceName(snapshot.UID, member.Index)
+		evidence, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(snapshot.Namespace).Get(ctx, evidenceName, metav1.GetOptions{})
+		if err == nil {
+			if err := m.validateRetirementEvidence(ctx, snapshot, member, evidence); err != nil {
+				return false, err
+			}
+			continue
+		}
+		if !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("read retirement evidence %s/%s: %w", snapshot.Namespace, evidenceName, err)
+		}
+
+		// Rolling-upgrade compatibility: an old exact daemon may still publish
+		// the Pod annotation introduced with the first retirement implementation.
+		// New daemons use the durable evidence object above so deleting or replacing
+		// the witness Pod cannot erase an already-verified fence.
 		pod, err := m.config.clientsets.Core.CoreV1().Pods(snapshot.Namespace).Get(ctx, member.PodName, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return false, fmt.Errorf("published daemon Pod %s/%s disappeared before its process-exit receipt; absence is not fence evidence", snapshot.Namespace, member.PodName)
@@ -265,6 +281,51 @@ func (m *ControllerOwnedCliqueManager) snapshotRetirementReceiptsComplete(ctx co
 		}
 	}
 	return true, nil
+}
+
+func (m *ControllerOwnedCliqueManager) validateRetirementEvidence(ctx context.Context, snapshot *nvapi.ComputeDomainCliqueSnapshot, member *nvapi.ComputeDomainCliqueMember, evidence *nvapi.ComputeDomainCliqueRetirementEvidence) error {
+	if evidence == nil || evidence.UID == "" || evidence.Name != nvapi.ComputeDomainCliqueRetirementEvidenceName(snapshot.UID, member.Index) || evidence.Namespace != snapshot.Namespace {
+		return fmt.Errorf("retirement evidence has an invalid object identity")
+	}
+	if len(evidence.Labels) != 2 ||
+		evidence.Labels[nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel] != string(snapshot.Spec.ComputeDomainUID) ||
+		evidence.Labels[nvapi.ComputeDomainCliqueRetirementEvidenceSnapshotUIDLabel] != string(snapshot.UID) {
+		return fmt.Errorf("retirement evidence %s/%s has invalid scope labels", evidence.Namespace, evidence.Name)
+	}
+	spec := &evidence.Spec
+	if spec.Protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 ||
+		spec.ComputeDomainUID != snapshot.Spec.ComputeDomainUID ||
+		spec.SnapshotName != snapshot.Name || spec.SnapshotUID != snapshot.UID ||
+		spec.SnapshotGeneration != snapshot.Status.Generation || spec.SnapshotHash != snapshot.Status.Hash ||
+		spec.Index != member.Index || spec.NodeName != member.NodeName || spec.NodeUID != member.NodeUID ||
+		spec.ActivationBootID != member.NodeBootID ||
+		spec.OriginalPodName != member.PodName || spec.OriginalPodUID != member.PodUID ||
+		spec.DaemonSetName != snapshot.Spec.DaemonSetName || spec.DaemonSetUID != snapshot.Spec.DaemonSetUID {
+		return fmt.Errorf("retirement evidence %s/%s does not match its published runtime identity", evidence.Namespace, evidence.Name)
+	}
+	switch spec.Reason {
+	case nvapi.ComputeDomainCliqueRetirementEvidenceReasonProcessExit:
+		if spec.WitnessPodName != member.PodName || spec.WitnessPodUID != member.PodUID {
+			return fmt.Errorf("process-exit evidence %s/%s was not published by the original daemon", evidence.Namespace, evidence.Name)
+		}
+		if member.NodeBootID != "" && spec.WitnessBootID != member.NodeBootID {
+			return fmt.Errorf("process-exit evidence %s/%s crossed a Node boot epoch", evidence.Namespace, evidence.Name)
+		}
+	case nvapi.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot:
+		if member.NodeBootID == "" || spec.WitnessBootID == "" || spec.WitnessBootID == member.NodeBootID {
+			return fmt.Errorf("node-reboot evidence %s/%s lacks distinct activation and witness boot epochs", evidence.Namespace, evidence.Name)
+		}
+		node, err := m.config.clientsets.Core.CoreV1().Nodes().Get(ctx, member.NodeName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("verify node-reboot evidence for Node %q: %w", member.NodeName, err)
+		}
+		if node.UID != member.NodeUID || node.Status.NodeInfo.BootID != spec.WitnessBootID {
+			return fmt.Errorf("node-reboot evidence %s/%s does not match the live Node UID and boot ID", evidence.Namespace, evidence.Name)
+		}
+	default:
+		return fmt.Errorf("retirement evidence %s/%s has unsupported reason %q", evidence.Namespace, evidence.Name, spec.Reason)
+	}
+	return nil
 }
 
 func decodeStrictJSON(data []byte, into any) error {

@@ -350,21 +350,33 @@ spec:
   - expression: >-
       (!has(object.metadata.annotations) ||
        object.metadata.annotations.all(k, v,
-         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability'] ||
+         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
          (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == v))) &&
       (!has(oldObject.metadata.annotations) ||
        oldObject.metadata.annotations.all(k, v,
-         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability'] ||
+         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
          (has(object.metadata.annotations) && k in object.metadata.annotations && object.metadata.annotations[k] == v)))
-    message: the kubelet plugin may change only its startup-topology and controller-v1 capability Node annotations
+    message: the kubelet plugin may change only its startup-topology, controller-v1 capability, and consumed retirement-fence annotations
   - expression: >-
       !has(oldObject.metadata.annotations) ||
       !('resource.nvidia.com/computeDomainCliqueStartupID' in oldObject.metadata.annotations) ||
       (has(object.metadata.annotations) &&
        'resource.nvidia.com/computeDomainCliqueStartupID' in object.metadata.annotations &&
        object.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID'] ==
-       oldObject.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID'])
-    message: the startup GPU clique identity is immutable; drain and fence the node before an operator clears it
+       oldObject.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID']) ||
+      (oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') != '' &&
+       object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueStartupID'].orValue('') == '' &&
+       object.metadata.?labels.orValue({})[?'nvidia.com/gpu.clique'].orValue('') == '' &&
+       object.metadata.?labels.orValue({})[?'resource.nvidia.com/computeDomain'].orValue('') == '' &&
+       object.metadata.?labels.orValue({})[?'resource.nvidia.com/controllerOwnedComputeDomain'].orValue('') == '' &&
+       object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainAttestation'].orValue('') == '')
+    message: the startup GPU clique identity is immutable until the controller records a completed runtime fence
+  - expression: >-
+      oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') ==
+        object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') ||
+      (oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') != '' &&
+       object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') == '')
+    message: the kubelet plugin may remove but never add or change the controller's retirement fence authorization
   - expression: >-
       !has(object.metadata.annotations) ||
       !('resource.nvidia.com/computeDomainCliqueProtocolCapability' in object.metadata.annotations) ||
@@ -424,7 +436,9 @@ spec:
       variables.controller ||
       (variables.legacyKubelet && variables.oldAttestation == variables.newAttestation && variables.newAttestation == '')
     message: only the compute-domain controller may change claim attestation; the bound kubelet may change an unattested legacy route
-  - expression: variables.oldAttestation == '' || variables.oldIsolation == variables.newIsolation
+  - expression: >-
+      variables.oldAttestation == '' || variables.oldIsolation == variables.newIsolation ||
+      (variables.controller && variables.newDomain == '' && variables.newAttestation == '' && variables.newIsolation == '')
     message: whole-clique isolation is immutable while a controller-owned Node attestation is active; clear the attestation through the controller before draining isolation
   - expression: >-
       !variables.controller ||
@@ -432,18 +446,18 @@ spec:
        object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
        object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
        (!has(object.metadata.labels) || object.metadata.labels.all(k, v,
-         k == 'resource.nvidia.com/computeDomain' ||
+         k in ['resource.nvidia.com/computeDomain', 'resource.nvidia.com/controllerOwnedComputeDomain'] ||
          (has(oldObject.metadata.labels) && k in oldObject.metadata.labels && oldObject.metadata.labels[k] == v))) &&
        (!has(oldObject.metadata.labels) || oldObject.metadata.labels.all(k, v,
-         k == 'resource.nvidia.com/computeDomain' ||
+         k in ['resource.nvidia.com/computeDomain', 'resource.nvidia.com/controllerOwnedComputeDomain'] ||
          (has(object.metadata.labels) && k in object.metadata.labels && object.metadata.labels[k] == v))) &&
        (!has(object.metadata.annotations) || object.metadata.annotations.all(k, v,
-         k == 'resource.nvidia.com/computeDomainAttestation' ||
+         k in ['resource.nvidia.com/computeDomainAttestation', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
          (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == v))) &&
        (!has(oldObject.metadata.annotations) || oldObject.metadata.annotations.all(k, v,
-         k == 'resource.nvidia.com/computeDomainAttestation' ||
+         k in ['resource.nvidia.com/computeDomainAttestation', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
          (has(object.metadata.annotations) && k in object.metadata.annotations && object.metadata.annotations[k] == v))))
-    message: the compute-domain controller may change only ComputeDomain routing and attestation Node metadata
+    message: the compute-domain controller may change only ComputeDomain routing, attestation, and retirement-fence Node metadata
   - expression: >-
       variables.oldIsolation == variables.newIsolation ||
       (variables.oldDomain == '' && variables.newDomain == '' &&
@@ -570,6 +584,64 @@ spec:
       params != null && request.userInfo.username ==
       params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-subject']
     message: only the compute-domain controller may write controller-owned clique snapshots
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-retirement-evidence-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["computedomaincliqueretirementevidences"]
+  variables:
+  - name: controller
+    expression: >-
+      params != null && request.userInfo.username ==
+      params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-subject']
+  - name: reader
+    expression: >-
+      params != null && request.userInfo.username ==
+      'system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace']+':compute-domain-daemon-reader-service-account'
+  - name: podName
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/pod-name'][0].orValue('')
+  - name: podUID
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/pod-uid'][0].orValue('')
+  - name: nodeName
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+  - name: nodeUID
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/node-uid'][0].orValue('')
+  validations:
+  - expression: request.operation != 'UPDATE'
+    message: retirement evidence is immutable and may not be updated
+  - expression: request.operation != 'DELETE' || variables.controller
+    message: only the compute-domain controller may delete durable retirement evidence
+  - expression: request.operation != 'CREATE' || variables.reader
+    message: only the compute-domain daemon reader may create retirement evidence
+  - expression: >-
+      request.operation != 'CREATE' ||
+      (object.metadata.namespace == params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace'] &&
+       variables.podName != '' && variables.podUID != '' && variables.nodeName != '' && variables.nodeUID != '' &&
+       object.spec.witnessPodName == variables.podName && string(object.spec.witnessPodUID) == variables.podUID &&
+       object.spec.nodeName == variables.nodeName && string(object.spec.nodeUID) == variables.nodeUID)
+    message: retirement evidence must match the Pod, Node, and UIDs bound into the daemon service-account token
+  - expression: >-
+      request.operation != 'CREATE' ||
+      (object.metadata.name == 'retirement-'+string(object.spec.snapshotUID)+'-'+string(object.spec.index) &&
+       object.metadata.?labels.orValue({}).size() == 2 &&
+       object.metadata.labels['resource.nvidia.com/computeDomain'] == string(object.spec.computeDomainUID) &&
+       object.metadata.labels['resource.nvidia.com/computeDomainCliqueSnapshotUID'] == string(object.spec.snapshotUID))
+    message: retirement evidence name and labels must match its immutable snapshot and ComputeDomain identity
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy

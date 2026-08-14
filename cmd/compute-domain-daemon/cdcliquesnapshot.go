@@ -24,13 +24,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"slices"
 	"sync"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
@@ -42,9 +43,9 @@ import (
 // has been started or restarted. Keeping these in one event prevents a consumer
 // from acknowledging a different snapshot than the one it just applied.
 type ControllerSnapshotDesiredState struct {
-	Members           []*nvapi.ComputeDomainDaemonInfo
-	Receipt           *nvapi.ComputeDomainCliqueSnapshotReceipt
-	RetirementReceipt *nvapi.ComputeDomainCliqueRetirementReceipt
+	Members            []*nvapi.ComputeDomainDaemonInfo
+	Receipt            *nvapi.ComputeDomainCliqueSnapshotReceipt
+	RetirementEvidence *nvapi.ComputeDomainCliqueRetirementEvidenceSpec
 }
 
 type controllerSnapshotIdentity struct {
@@ -55,10 +56,10 @@ type controllerSnapshotIdentity struct {
 }
 
 func (s *ControllerSnapshotDesiredState) identity() controllerSnapshotIdentity {
-	if s.RetirementReceipt != nil {
+	if s.RetirementEvidence != nil {
 		return controllerSnapshotIdentity{
-			uid: s.RetirementReceipt.SnapshotUID, generation: s.RetirementReceipt.SnapshotGeneration,
-			hash: s.RetirementReceipt.SnapshotHash, retiring: true,
+			uid: s.RetirementEvidence.SnapshotUID, generation: s.RetirementEvidence.SnapshotGeneration,
+			hash: s.RetirementEvidence.SnapshotHash, retiring: true,
 		}
 	}
 	return controllerSnapshotIdentity{
@@ -164,7 +165,7 @@ func (m *ComputeDomainCliqueSnapshotManager) MarkApplied(state *ControllerSnapsh
 }
 
 func (m *ComputeDomainCliqueSnapshotManager) MarkRetired(state *ControllerSnapshotDesiredState) {
-	if state == nil || state.RetirementReceipt == nil {
+	if state == nil || state.RetirementEvidence == nil {
 		return
 	}
 	identity := state.identity()
@@ -175,37 +176,50 @@ func (m *ComputeDomainCliqueSnapshotManager) MarkRetired(state *ControllerSnapsh
 	}
 }
 
-func (m *ComputeDomainCliqueSnapshotManager) PublishRetirementReceipt(ctx context.Context, state *ControllerSnapshotDesiredState) error {
-	if state == nil || state.RetirementReceipt == nil {
-		return fmt.Errorf("retirement receipt is missing")
+func (m *ComputeDomainCliqueSnapshotManager) PublishRetirementEvidence(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+	if state == nil || state.RetirementEvidence == nil {
+		return fmt.Errorf("retirement evidence is missing")
 	}
-	encoded, err := json.Marshal(state.RetirementReceipt)
+	spec := *state.RetirementEvidence
+	pod, err := m.config.clientsets.Core.CoreV1().Pods(m.config.podNamespace).Get(ctx, m.config.podName, metav1.GetOptions{})
 	if err != nil {
+		return fmt.Errorf("read retirement witness Pod: %w", err)
+	}
+	if string(pod.UID) != m.config.podUID || pod.Name != spec.WitnessPodName || pod.UID != spec.WitnessPodUID || pod.Spec.NodeName != spec.NodeName {
+		return fmt.Errorf("live Pod identity does not match retirement witness")
+	}
+	controller := metav1.GetControllerOf(pod)
+	if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" ||
+		controller.Name != spec.DaemonSetName || controller.UID != spec.DaemonSetUID {
+		return fmt.Errorf("retirement witness Pod owner does not match snapshot DaemonSet")
+	}
+	evidence := &nvapi.ComputeDomainCliqueRetirementEvidence{
+		TypeMeta: metav1.TypeMeta{APIVersion: nvapi.SchemeGroupVersion.String(), Kind: nvapi.ComputeDomainCliqueRetirementEvidenceKind},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      nvapi.ComputeDomainCliqueRetirementEvidenceName(spec.SnapshotUID, spec.Index),
+			Namespace: m.config.podNamespace,
+			Labels: map[string]string{
+				nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel: string(spec.ComputeDomainUID),
+				nvapi.ComputeDomainCliqueRetirementEvidenceSnapshotUIDLabel:   string(spec.SnapshotUID),
+			},
+		},
+		Spec: spec,
+	}
+	_, err = m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(m.config.podNamespace).Create(ctx, evidence, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
 		return err
 	}
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		pod, err := m.config.clientsets.Core.CoreV1().Pods(m.config.podNamespace).Get(ctx, m.config.podName, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		if string(pod.UID) != m.config.podUID || pod.UID != state.RetirementReceipt.PodUID {
-			return fmt.Errorf("live Pod UID %q does not match retirement identity %q", pod.UID, state.RetirementReceipt.PodUID)
-		}
-		existing := pod.Annotations[nvapi.ComputeDomainCliqueRetirementReceiptAnnotation]
-		if existing == string(encoded) {
-			return nil
-		}
-		if existing != "" {
-			return fmt.Errorf("Pod already has a different immutable retirement receipt")
-		}
-		updated := pod.DeepCopy()
-		if updated.Annotations == nil {
-			updated.Annotations = map[string]string{}
-		}
-		updated.Annotations[nvapi.ComputeDomainCliqueRetirementReceiptAnnotation] = string(encoded)
-		_, err = m.config.clientsets.Core.CoreV1().Pods(m.config.podNamespace).Update(ctx, updated, metav1.UpdateOptions{})
-		return err
-	})
+	existing, getErr := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(m.config.podNamespace).Get(ctx, evidence.Name, metav1.GetOptions{})
+	if getErr != nil {
+		return getErr
+	}
+	if !reflect.DeepEqual(existing.Spec, evidence.Spec) || !reflect.DeepEqual(existing.Labels, evidence.Labels) {
+		return fmt.Errorf("retirement evidence %s/%s already exists with a different immutable identity", evidence.Namespace, evidence.Name)
+	}
+	return nil
 }
 
 func (m *ComputeDomainCliqueSnapshotManager) enqueue(obj any) {
@@ -383,6 +397,7 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 	seenPodNames := make(map[string]struct{}, len(members))
 	seenPodIPs := make(map[netip.Addr]struct{}, len(members))
 	daemons := make([]*nvapi.ComputeDomainDaemonInfo, 0, len(members))
+	retiring := snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
 	for i := range members {
 		member := &members[i]
 		if member.Index < 0 || member.Index >= snapshot.Spec.Capacity {
@@ -425,9 +440,18 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 		seenPodIPs[podIP] = struct{}{}
 
 		assignment, found := assignmentsByNodeUID[member.NodeUID]
-		if !found || assignment.State != nvapi.ComputeDomainCliqueAssignmentStateBound ||
-			assignment.Index != member.Index || assignment.NodeName != member.NodeName || assignment.CurrentPodUID != member.PodUID {
-			return nil, fmt.Errorf("member at index %d does not match its bound assignment", member.Index)
+		assignmentStateValid := found && assignment.State == nvapi.ComputeDomainCliqueAssignmentStateBound
+		if retiring {
+			assignmentStateValid = found && assignment.EverPublished &&
+				(assignment.State == nvapi.ComputeDomainCliqueAssignmentStateBound || assignment.State == nvapi.ComputeDomainCliqueAssignmentStateQuarantined)
+		}
+		podBindingValid := assignment.CurrentPodUID == member.PodUID
+		if retiring {
+			podBindingValid = assignment.CurrentPodUID == "" || assignment.CurrentPodUID == member.PodUID
+		}
+		if !assignmentStateValid || assignment.Index != member.Index || assignment.NodeName != member.NodeName ||
+			!podBindingValid {
+			return nil, fmt.Errorf("member at index %d does not match its published assignment", member.Index)
 		}
 		if member.NodeName == m.config.nodeName {
 			self = member
@@ -440,13 +464,18 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 			Status:    nvapi.ComputeDomainStatusNotReady,
 		})
 	}
-	if self == nil || string(self.PodUID) != m.config.podUID || self.PodName != m.config.podName {
-		return nil, fmt.Errorf("active snapshot does not authorize this exact Pod UID")
+	if self == nil {
+		return nil, fmt.Errorf("published snapshot has no member for this Node")
 	}
-	configuredPodIP, err := netip.ParseAddr(m.config.podIP)
-	selfPodIP, selfIPError := netip.ParseAddr(self.PodIP)
-	if err != nil || selfIPError != nil || configuredPodIP.Unmap() != selfPodIP.Unmap() {
-		return nil, fmt.Errorf("active snapshot does not authorize this exact Pod IP")
+	if !retiring {
+		if string(self.PodUID) != m.config.podUID || self.PodName != m.config.podName {
+			return nil, fmt.Errorf("active snapshot does not authorize this exact Pod UID")
+		}
+		configuredPodIP, err := netip.ParseAddr(m.config.podIP)
+		selfPodIP, selfIPError := netip.ParseAddr(self.PodIP)
+		if err != nil || selfIPError != nil || configuredPodIP.Unmap() != selfPodIP.Unmap() {
+			return nil, fmt.Errorf("active snapshot does not authorize this exact Pod IP")
+		}
 	}
 
 	state := &ControllerSnapshotDesiredState{
@@ -461,13 +490,34 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 			Index:              self.Index,
 		},
 	}
-	if snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhaseRetiring {
+	if retiring {
+		reason := nvapi.ComputeDomainCliqueRetirementEvidenceReasonProcessExit
+		if self.NodeBootID != "" && m.config.bootID != "" && self.NodeBootID != m.config.bootID {
+			reason = nvapi.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot
+		} else if string(self.PodUID) != m.config.podUID || self.PodName != m.config.podName {
+			return nil, fmt.Errorf("same-boot replacement Pod cannot attest retirement for published Pod UID %q", self.PodUID)
+		}
 		state.Members = nil
 		state.Receipt = nil
-		state.RetirementReceipt = &nvapi.ComputeDomainCliqueRetirementReceipt{
-			ComputeDomainUID: snapshot.Spec.ComputeDomainUID, SnapshotUID: snapshot.UID,
-			SnapshotGeneration: snapshot.Status.Generation, SnapshotHash: snapshot.Status.Hash,
-			NodeUID: self.NodeUID, PodUID: self.PodUID, Index: self.Index,
+		state.RetirementEvidence = &nvapi.ComputeDomainCliqueRetirementEvidenceSpec{
+			Protocol:           nvapi.ComputeDomainCliqueProtocolControllerV1,
+			Reason:             reason,
+			ComputeDomainUID:   snapshot.Spec.ComputeDomainUID,
+			SnapshotName:       snapshot.Name,
+			SnapshotUID:        snapshot.UID,
+			SnapshotGeneration: snapshot.Status.Generation,
+			SnapshotHash:       snapshot.Status.Hash,
+			Index:              self.Index,
+			NodeName:           self.NodeName,
+			NodeUID:            self.NodeUID,
+			ActivationBootID:   self.NodeBootID,
+			WitnessBootID:      m.config.bootID,
+			OriginalPodName:    self.PodName,
+			OriginalPodUID:     self.PodUID,
+			WitnessPodName:     m.config.podName,
+			WitnessPodUID:      types.UID(m.config.podUID),
+			DaemonSetName:      snapshot.Spec.DaemonSetName,
+			DaemonSetUID:       snapshot.Spec.DaemonSetUID,
 		}
 	}
 	return state, nil

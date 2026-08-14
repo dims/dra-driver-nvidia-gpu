@@ -52,6 +52,7 @@ type ManagerConfig struct {
 	podUID                 string
 	podName                string
 	podNamespace           string
+	bootID                 string
 	maxNodesPerIMEXDomain  int
 }
 
@@ -69,6 +70,7 @@ type ControllerConfig struct {
 	podUID                 string
 	podName                string
 	podNamespace           string
+	bootID                 string
 	maxNodesPerIMEXDomain  int
 	protocol               nvapi.ComputeDomainCliqueProtocol
 }
@@ -98,6 +100,7 @@ func NewController(config *ControllerConfig) (*Controller, error) {
 		podUID:                 config.podUID,
 		podName:                config.podName,
 		podNamespace:           config.podNamespace,
+		bootID:                 config.bootID,
 		maxNodesPerIMEXDomain:  config.maxNodesPerIMEXDomain,
 	}
 
@@ -142,11 +145,11 @@ func (c *Controller) MarkSnapshotRetired(state *ControllerSnapshotDesiredState) 
 	}
 }
 
-func (c *Controller) PublishSnapshotRetirementReceipt(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+func (c *Controller) PublishSnapshotRetirementEvidence(ctx context.Context, state *ControllerSnapshotDesiredState) error {
 	if c.snapshotManager == nil {
 		return fmt.Errorf("controller-v1 snapshot manager is unavailable")
 	}
-	return c.snapshotManager.PublishRetirementReceipt(ctx, state)
+	return c.snapshotManager.PublishRetirementEvidence(ctx, state)
 }
 
 // Run starts the controller's main loop and manages the lifecycle of its components.

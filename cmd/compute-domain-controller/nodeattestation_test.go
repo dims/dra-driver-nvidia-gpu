@@ -27,6 +27,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -482,6 +483,22 @@ func (n *attestationNodes) Get(_ context.Context, name string, _ metav1.GetOptio
 	return node.DeepCopy(), nil
 }
 
+func (n *attestationNodes) List(_ context.Context, options metav1.ListOptions) (*corev1.NodeList, error) {
+	n.client.mu.Lock()
+	defer n.client.mu.Unlock()
+	selector, err := labels.Parse(options.LabelSelector)
+	if err != nil {
+		return nil, err
+	}
+	list := &corev1.NodeList{}
+	for _, node := range n.client.nodes {
+		if selector.Matches(labels.Set(node.Labels)) {
+			list.Items = append(list.Items, *node.DeepCopy())
+		}
+	}
+	return list, nil
+}
+
 func (n *attestationNodes) Update(_ context.Context, node *corev1.Node, _ metav1.UpdateOptions) (*corev1.Node, error) {
 	n.client.mu.Lock()
 	defer n.client.mu.Unlock()
@@ -490,6 +507,31 @@ func (n *attestationNodes) Update(_ context.Context, node *corev1.Node, _ metav1
 	}
 	n.client.nodes[node.Name] = node.DeepCopy()
 	return node.DeepCopy(), nil
+}
+
+func TestRetirementFencesControllerIsolatedNodeAfterRouteLoss(t *testing.T) {
+	const cdUID = "cd-uid"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "node-a",
+		Labels: map[string]string{
+			controllerOwnedCliqueIsolationLabelKey: cdUID,
+		},
+		Annotations: map[string]string{
+			computeDomainAttestationAnnotationKey:   `{"computeDomainUID":"cd-uid"}`,
+			computeDomainCliqueStartupAnnotationKey: "clique-a",
+		},
+	}}
+	coreClient := &attestationCoreClient{nodes: map[string]*corev1.Node{node.Name: node.DeepCopy()}}
+	manager := &NodeManager{config: &ManagerConfig{clientsets: flags.ClientSets{Core: coreClient}}}
+
+	require.NoError(t, manager.RemoveComputeDomainLabelsAndAttestations(context.Background(), cdUID, true))
+	updated, err := coreClient.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, updated.Labels[computeDomainLabelKey])
+	require.Empty(t, updated.Labels[controllerOwnedCliqueIsolationLabelKey])
+	require.Empty(t, updated.Annotations[computeDomainAttestationAnnotationKey])
+	require.Equal(t, cdUID, updated.Annotations[nvapi.ComputeDomainCliqueRetirementFencedAnnotation])
+	require.Equal(t, "clique-a", updated.Annotations[computeDomainCliqueStartupAnnotationKey], "the kubelet consumes the fence before clearing startup topology")
 }
 
 func TestNodeAttestationRejectsInexactAuthorization(t *testing.T) {

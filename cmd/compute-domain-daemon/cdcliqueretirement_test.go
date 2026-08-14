@@ -30,6 +30,7 @@ import (
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
+	nvfake "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/clientset/versioned/fake"
 )
 
 type retirementPodClient struct {
@@ -71,29 +72,46 @@ func (p *retirementPods) Update(_ context.Context, pod *corev1.Pod, _ metav1.Upd
 	return pod.DeepCopy(), nil
 }
 
-func TestPublishRetirementReceiptIsExactAndIdempotent(t *testing.T) {
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "daemon", Namespace: "driver", UID: types.UID("pod-uid")}}
+func TestPublishRetirementEvidenceIsExactDurableAndIdempotent(t *testing.T) {
+	controller := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "daemon", Namespace: "driver", UID: types.UID("pod-uid"),
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "daemonset", UID: types.UID("daemonset-uid"), Controller: &controller}},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+	}
 	core := &retirementPodClient{pod: pod}
+	nvidia := nvfake.NewSimpleClientset()
 	manager := &ComputeDomainCliqueSnapshotManager{config: &ManagerConfig{
-		clientsets: flags.ClientSets{Core: core}, podNamespace: pod.Namespace, podName: pod.Name, podUID: string(pod.UID),
+		clientsets: flags.ClientSets{Core: core, Nvidia: nvidia}, podNamespace: pod.Namespace, podName: pod.Name, podUID: string(pod.UID),
 	}}
-	state := &ControllerSnapshotDesiredState{RetirementReceipt: &nvapi.ComputeDomainCliqueRetirementReceipt{
-		ComputeDomainUID: types.UID("cd-uid"), SnapshotUID: types.UID("snapshot-uid"), SnapshotGeneration: 4,
-		SnapshotHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		NodeUID:      types.UID("node-uid"), PodUID: pod.UID, Index: 0,
+	state := &ControllerSnapshotDesiredState{RetirementEvidence: &nvapi.ComputeDomainCliqueRetirementEvidenceSpec{
+		Protocol: nvapi.ComputeDomainCliqueProtocolControllerV1, Reason: nvapi.ComputeDomainCliqueRetirementEvidenceReasonProcessExit,
+		ComputeDomainUID: types.UID("cd-uid"), SnapshotName: "snapshot", SnapshotUID: types.UID("snapshot-uid"), SnapshotGeneration: 4,
+		SnapshotHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Index: 0,
+		NodeName: "node-a", NodeUID: types.UID("node-uid"), ActivationBootID: "boot-a", WitnessBootID: "boot-a",
+		OriginalPodName: pod.Name, OriginalPodUID: pod.UID, WitnessPodName: pod.Name, WitnessPodUID: pod.UID,
+		DaemonSetName: "daemonset", DaemonSetUID: types.UID("daemonset-uid"),
 	}}
-	require.NoError(t, manager.PublishRetirementReceipt(context.Background(), state))
-	require.NotEmpty(t, core.pod.Annotations[nvapi.ComputeDomainCliqueRetirementReceiptAnnotation])
-	require.NoError(t, manager.PublishRetirementReceipt(context.Background(), state))
+	require.NoError(t, manager.PublishRetirementEvidence(context.Background(), state))
+	require.NoError(t, manager.PublishRetirementEvidence(context.Background(), state))
+	evidence, err := nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences("driver").Get(
+		context.Background(), nvapi.ComputeDomainCliqueRetirementEvidenceName(types.UID("snapshot-uid"), 0), metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, *state.RetirementEvidence, evidence.Spec)
+	require.Empty(t, core.pod.Annotations, "durable evidence must not be stored on the witness Pod")
 }
 
-func TestPublishRetirementReceiptRejectsDifferentPodUID(t *testing.T) {
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "daemon", Namespace: "driver", UID: types.UID("pod-uid")}}
+func TestPublishRetirementEvidenceRejectsDifferentWitnessPodUID(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "daemon", Namespace: "driver", UID: types.UID("pod-uid")}, Spec: corev1.PodSpec{NodeName: "node-a"}}
 	core := &retirementPodClient{pod: pod}
 	manager := &ComputeDomainCliqueSnapshotManager{config: &ManagerConfig{
-		clientsets: flags.ClientSets{Core: core}, podNamespace: pod.Namespace, podName: pod.Name, podUID: string(pod.UID),
+		clientsets: flags.ClientSets{Core: core, Nvidia: nvfake.NewSimpleClientset()}, podNamespace: pod.Namespace, podName: pod.Name, podUID: string(pod.UID),
 	}}
-	err := manager.PublishRetirementReceipt(context.Background(), &ControllerSnapshotDesiredState{RetirementReceipt: &nvapi.ComputeDomainCliqueRetirementReceipt{PodUID: types.UID("other")}})
-	require.ErrorContains(t, err, "does not match retirement identity")
+	err := manager.PublishRetirementEvidence(context.Background(), &ControllerSnapshotDesiredState{RetirementEvidence: &nvapi.ComputeDomainCliqueRetirementEvidenceSpec{
+		WitnessPodName: pod.Name, WitnessPodUID: types.UID("other"), NodeName: "node-a",
+	}})
+	require.ErrorContains(t, err, "does not match retirement witness")
 	require.Empty(t, core.pod.Annotations)
 }

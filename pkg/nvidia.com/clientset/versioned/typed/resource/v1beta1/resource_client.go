@@ -31,6 +31,7 @@ type ResourceV1beta1Interface interface {
 	ComputeDomainsGetter
 	ComputeDomainCliquesGetter
 	ComputeDomainCliqueReservationsGetter
+	ComputeDomainCliqueRetirementEvidencesGetter
 	ComputeDomainCliqueSnapshotsGetter
 }
 
@@ -49,6 +50,10 @@ func (c *ResourceV1beta1Client) ComputeDomainCliques(namespace string) ComputeDo
 
 func (c *ResourceV1beta1Client) ComputeDomainCliqueReservations() ComputeDomainCliqueReservationInterface {
 	return newComputeDomainCliqueReservations(c)
+}
+
+func (c *ResourceV1beta1Client) ComputeDomainCliqueRetirementEvidences(namespace string) ComputeDomainCliqueRetirementEvidenceInterface {
+	return newComputeDomainCliqueRetirementEvidences(c, namespace)
 }
 
 func (c *ResourceV1beta1Client) ComputeDomainCliqueSnapshots(namespace string) ComputeDomainCliqueSnapshotInterface {

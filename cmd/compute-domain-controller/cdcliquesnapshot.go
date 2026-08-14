@@ -1159,7 +1159,8 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		assignment.State = nvapi.ComputeDomainCliqueAssignmentStateBound
 		members = append(members, nvapi.ComputeDomainCliqueMember{
 			Index: assignment.Index, NodeName: node.Name, NodeUID: node.UID,
-			PodName: pod.Name, PodUID: pod.UID, PodIP: pod.Status.PodIP,
+			NodeBootID: node.Status.NodeInfo.BootID,
+			PodName:    pod.Name, PodUID: pod.UID, PodIP: pod.Status.PodIP,
 			DaemonSetUID: ds.UID,
 		})
 	}

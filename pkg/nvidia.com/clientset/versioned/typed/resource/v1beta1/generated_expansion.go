@@ -24,4 +24,6 @@ type ComputeDomainCliqueExpansion interface{}
 
 type ComputeDomainCliqueReservationExpansion interface{}
 
+type ComputeDomainCliqueRetirementEvidenceExpansion interface{}
+
 type ComputeDomainCliqueSnapshotExpansion interface{}

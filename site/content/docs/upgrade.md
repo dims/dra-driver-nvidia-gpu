@@ -80,8 +80,9 @@ kubectl apply \
 
 For a release which contains `ControllerOwnedCDCliques`, download that exact
 release's chart or source archive. Render and apply its admission policies and
-bindings **before** applying the controller-owned ComputeDomainCliqueSnapshots
-and cluster-scoped ComputeDomainCliqueReservations CRDs, and before upgrading
+bindings **before** applying the controller-owned ComputeDomainCliqueSnapshots,
+cluster-scoped ComputeDomainCliqueReservations, and namespaced
+ComputeDomainCliqueRetirementEvidences CRDs, and before upgrading
 the controller or kubelet plugin binaries. Admission resource rules may safely
 name a GVR which is not served yet; this order prevents a namespace writer from
 pre-seeding controller-owned protocol or snapshot state in the CRD-to-binary
@@ -117,16 +118,21 @@ kubectl apply -f controller-owned-admission.yaml
 
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquesnapshots.yaml"
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquereservations.yaml"
+kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliqueretirementevidences.yaml"
 
 kubectl wait --for=condition=Established \
     crd/computedomaincliquesnapshots.resource.nvidia.com
 kubectl wait --for=condition=Established \
     crd/computedomaincliquereservations.resource.nvidia.com
+kubectl wait --for=condition=Established \
+    crd/computedomaincliqueretirementevidences.resource.nvidia.com
 
 # Verify the served version and the snapshot status subresource. The dry-run
 # must pass authorization and schema routing without creating an object.
 kubectl get --raw /apis/resource.nvidia.com/v1beta1 | \
     grep -q 'computedomaincliquesnapshots/status'
+kubectl get --raw /apis/resource.nvidia.com/v1beta1 | \
+    grep -q 'computedomaincliqueretirementevidences'
 kubectl auth can-i update computedomaincliquesnapshots/status \
     --api-group=resource.nvidia.com \
     --as=system:serviceaccount:nvidia-dra-driver-gpu:nvidia-dra-driver-gpu-controller \
@@ -134,7 +140,8 @@ kubectl auth can-i update computedomaincliquesnapshots/status \
 ```
 
 Verify that the rendered `computedomain-protocol-policy`, reserved-metadata,
-Node-topology, reservation-writer, and snapshot-writer policies all have active
+Node-topology, reservation-writer, snapshot-writer, and retirement-evidence
+policies all have active
 `ValidatingAdmissionPolicyBinding` objects before continuing. The controller
 also rejects a persisted protocol marker which predates its finalizer, but the
 admission layer is required to prevent that invalid state rather than merely
@@ -205,7 +212,7 @@ guard prevents a new competing installation; it does not revoke privileges
 which a different legacy release already holds. The primary control namespace
 is a trusted administrative namespace: do not grant tenants permission to
 create Pods, Jobs, ReplicaSets, or other workloads using the protected ServiceAccounts.
-Also inventory the two new GVRs and reserved ComputeDomain/Node metadata before
+Also inventory the three new GVRs and reserved ComputeDomain/Node metadata before
 enabling admission. A prior default install may have installed the CRDs while
 the opt-in policies were disabled; preexisting protocol markers, reservations,
 snapshots, isolation labels, or controller attestations must be absent or
@@ -258,17 +265,27 @@ for new admission. Normal deletion of a healthy controller-v1 ComputeDomain is
 evidence-bearing: first terminate its workload Pods, then delete the
 ComputeDomain. The controller retains the exact daemon Pods and Node routes,
 changes each snapshot from `Active` to `Retiring`, and waits while every daemon
-stops and reaps its supervised IMEX child and publishes an immutable exact
-receipt. It then records `Fenced`, releases the reservation, removes the
-snapshot and runtime objects, and clears the ComputeDomain finalizer. Watch
+stops and reaps its supervised IMEX child and publishes immutable, Pod-bound
+retirement evidence. If the original daemon Pod was lost in a real Node reboot,
+a replacement daemon may instead publish `NodeReboot` evidence only when the
+snapshot's activation boot ID and the live Node boot ID are both nonempty and
+different. Same-boot Pod replacement remains blocked. Evidence is stored in a
+ComputeDomainCliqueRetirementEvidence object rather than on the witness Pod, so
+later Pod deletion cannot erase a verified fence. The controller then records
+`Fenced`, durably marks the reservation `Released`, removes the evidence,
+snapshot, and runtime objects, and clears the ComputeDomain finalizer. Watch
 `status.conditions[type=CliqueRetirementReady]` while deletion is in progress.
 
 Do not force-delete daemon Pods, remove Node routing labels, or strip snapshot,
-reservation, or ComputeDomain finalizers during this sequence. Pod/Node absence,
-timeout, `NotReady`, and object deletion are not fence evidence; if an exact
-daemon disappears before its receipt, deletion remains blocked and requires an
-externally verified whole-clique reset/recovery procedure. Do not recreate the
-clique as legacy-v1 as a shortcut.
+reservation, evidence, or ComputeDomain finalizers during this sequence.
+Pod/Node absence, timeout, `NotReady`, and object deletion are not fence
+evidence. A same-boot replacement cannot stand in for the published daemon. A
+snapshot created before member boot IDs were recorded also cannot use
+`NodeReboot` evidence and still requires an externally verified whole-clique
+reset/recovery procedure. After every member is fenced, the controller writes a
+one-shot Node retirement-fence marker; a topology-invalid kubelet plugin may
+consume that marker to clear the stale startup identity and republish freshly
+discovered topology. Do not recreate the clique as legacy-v1 as a shortcut.
 Helm rollback does not roll CRD schemas back. Existing ComputeDomains retain
 their persisted protocol; disabling the feature gate stops new controller-v1
 admission but does not stop reconciliation of active controller-v1 domains.
@@ -277,7 +294,7 @@ controller-v1 while any reservation or controller-v1 ComputeDomain exists.
 The admission policies are normal chart resources while CRDs and strict
 tombstones outlive an uninstall; removing those policies would remove the
 writer/delete guard from retained state, and old binaries do not understand
-the protocol, receipt, or reservation fence. Likewise, do not switch
+the protocol, retirement evidence, or reservation fence. Likewise, do not switch
 `imex.mode` from `driverManaged` to `hostManaged` until every controller-v1
 domain has gone through the verified whole-fabric recovery procedure; current
 binaries refuse that transition while controller-owned state remains.

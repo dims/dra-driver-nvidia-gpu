@@ -748,11 +748,14 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 	if config.Protocol != persistedProtocol {
 		return nil, permanentError{fmt.Errorf("daemon claim clique protocol %q does not match ComputeDomain protocol %q", config.Protocol, persistedProtocol)}
 	}
-	if err := s.computeDomainManager.AssertPhysicalCliqueAvailable(ctx, config.DomainID); err != nil {
-		// Reservation ownership is durable, but the API read used to prove it
-		// can fail transiently. Keep Prepare retryable rather than checkpointing
-		// a timeout, 429, or short API outage as a permanent claim failure.
-		return nil, err
+	recoveryOnly := s.computeDomainManager.retirementRecoveryAllowed(cd, config.Protocol)
+	if !recoveryOnly {
+		if err := s.computeDomainManager.AssertPhysicalCliqueAvailable(ctx, config.DomainID); err != nil {
+			// Reservation ownership is durable, but the API read used to prove it
+			// can fail transiently. Keep Prepare retryable rather than checkpointing
+			// a timeout, 429, or short API outage as a permanent claim failure.
+			return nil, err
+		}
 	}
 	// Get the list of claim requests this config is being applied over.
 	var requests []string
@@ -778,6 +781,7 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 
 	// Create new ComputeDomain daemon settings from the ComputeDomainManager.
 	computeDomainDaemonSettings := s.computeDomainManager.NewSettings(config.DomainID)
+	computeDomainDaemonSettings.recoveryOnly = recoveryOnly
 
 	// Prepare injecting IMEX daemon config files even if IMEX is not supported.
 	// This for example creates
@@ -799,7 +803,7 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 	// Only inject dev nodes related to
 	// /proc/driver/nvidia/capabilities/fabric-imex-mgmt if IMEX is supported
 	// (if we want to start the IMEX daemon process in the CD daemon pod).
-	if s.computeDomainManager.CliqueID() != "" {
+	if s.computeDomainManager.CliqueID() != "" && !recoveryOnly {
 		nvcapPath := nvidiaCapFabricImexMgmtPath
 		if common.UsingAltProcDevices() {
 			nvcapPath = filepath.Join(s.config.flags.containerDriverRoot, "proc/driver/nvidia/capabilities/fabric-imex-mgmt")

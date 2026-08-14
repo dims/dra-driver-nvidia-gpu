@@ -294,6 +294,7 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 	namespaces := append([]string{m.config.driverNamespace}, m.config.additionalNamespaces...)
 	seenNamespaces := make(map[string]struct{}, len(namespaces))
 	var snapshots []nvapi.ComputeDomainCliqueSnapshot
+	var retirementEvidence []nvapi.ComputeDomainCliqueRetirementEvidence
 	for _, namespace := range namespaces {
 		if _, seen := seenNamespaces[namespace]; seen {
 			continue
@@ -306,6 +307,13 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 			return err
 		}
 		snapshots = append(snapshots, listed.Items...)
+		evidence, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: labels.SelectorFromSet(labels.Set{nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel: cdUID}).String(),
+		})
+		if err != nil {
+			return err
+		}
+		retirementEvidence = append(retirementEvidence, evidence.Items...)
 	}
 	// Validate every namespace before deleting any object or global reservation.
 	for i := range snapshots {
@@ -407,6 +415,19 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 				return updateErr
 			}
 			reservations.Items[i] = *result
+		}
+	}
+	// Evidence is intentionally independent of the witness Pod. Delete it only
+	// after every physical reservation has durably reached Released above.
+	for i := range retirementEvidence {
+		evidence := &retirementEvidence[i]
+		if evidence.Spec.ComputeDomainUID != types.UID(cdUID) {
+			return fmt.Errorf("retirement evidence %s/%s has mismatched ComputeDomain UID", evidence.Namespace, evidence.Name)
+		}
+		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(evidence.Namespace).Delete(ctx, evidence.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &evidence.UID}})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceEvidence, metrics.CliqueAPIOperationDelete, err)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
 		}
 	}
 	for i := range snapshots {
@@ -603,13 +624,13 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 				return fmt.Errorf("prepare controller-owned clique retirement: %w", err)
 			}
 			if !ready {
-				message := "waiting for every exact daemon to stop and publish its process-exit receipt"
+				message := "waiting for every published member to provide durable process-exit or node-reboot evidence"
 				if conditionErr := m.updateRetirementCondition(ctx, cd, metav1.ConditionFalse, "RetirementInProgress", message); conditionErr != nil {
 					return fmt.Errorf("update controller-owned clique retirement condition: %w", conditionErr)
 				}
-				return fmt.Errorf("controller-owned clique retirement is waiting for durable process-exit evidence")
+				return fmt.Errorf("controller-owned clique retirement is waiting for durable runtime-fence evidence")
 			}
-			if err := m.updateRetirementCondition(ctx, cd, metav1.ConditionTrue, "RuntimeFenced", "all published controller-v1 clique runtimes have verified process-exit receipts"); err != nil {
+			if err := m.updateRetirementCondition(ctx, cd, metav1.ConditionTrue, "RuntimeFenced", "all published controller-v1 clique runtimes have durable process-exit or node-reboot evidence"); err != nil {
 				return fmt.Errorf("record controller-owned clique retirement readiness: %w", err)
 			}
 		}

@@ -43,6 +43,10 @@ const (
 	// exited and been reaped. The controller validates every published member's
 	// receipt before it marks the whole snapshot Fenced.
 	ComputeDomainCliqueRetirementReceiptAnnotation = "resource.nvidia.com/computeDomainCliqueRetirementReceipt"
+	// ComputeDomainCliqueRetirementFencedAnnotation is a one-shot controller
+	// authorization allowing the bound kubelet plugin to clear stale startup
+	// topology after every published runtime for the ComputeDomain is fenced.
+	ComputeDomainCliqueRetirementFencedAnnotation = "resource.nvidia.com/computeDomainCliqueRetirementFenced"
 )
 
 // +genclient
@@ -166,6 +170,10 @@ type ComputeDomainCliqueMember struct {
 	NodeName string `json:"nodeName"`
 	// +kubebuilder:validation:XValidation:rule="self != ''",message="nodeUID must not be empty"
 	NodeUID types.UID `json:"nodeUID"`
+	// NodeBootID is the kernel boot epoch observed when this member was
+	// published. Empty is accepted only for snapshots created before reboot
+	// evidence was introduced; those snapshots cannot use NodeReboot evidence.
+	NodeBootID string `json:"nodeBootID,omitempty"`
 	// +kubebuilder:validation:MinLength=1
 	PodName string `json:"podName"`
 	// +kubebuilder:validation:XValidation:rule="self != ''",message="podUID must not be empty"

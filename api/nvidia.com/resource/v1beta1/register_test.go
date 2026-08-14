@@ -128,3 +128,36 @@ func TestComputeDomainCliqueReservationSchemeRoundTrip(t *testing.T) {
 	require.Equal(t, reservation.GetObjectKind().GroupVersionKind(), *gvk)
 	require.Equal(t, reservation, decoded)
 }
+
+func TestComputeDomainCliqueRetirementEvidenceSchemeRoundTrip(t *testing.T) {
+	evidence := ComputeDomainCliqueRetirementEvidence{
+		TypeMeta:   metav1.TypeMeta{APIVersion: SchemeGroupVersion.String(), Kind: ComputeDomainCliqueRetirementEvidenceKind},
+		ObjectMeta: metav1.ObjectMeta{Name: "retirement-snapshot-0", Namespace: "driver", UID: types.UID("evidence-uid")},
+		Spec: ComputeDomainCliqueRetirementEvidenceSpec{
+			Protocol: ComputeDomainCliqueProtocolControllerV1, Reason: ComputeDomainCliqueRetirementEvidenceReasonNodeReboot,
+			ComputeDomainUID: types.UID("compute-domain-uid"), SnapshotName: "snapshot", SnapshotUID: types.UID("snapshot-uid"),
+			SnapshotGeneration: 3, SnapshotHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Index: 0, NodeName: "node-0", NodeUID: types.UID("node-uid"), ActivationBootID: "boot-old", WitnessBootID: "boot-new",
+			OriginalPodName: "daemon-old", OriginalPodUID: types.UID("pod-old"), WitnessPodName: "daemon-new", WitnessPodUID: types.UID("pod-new"),
+			DaemonSetName: "daemonset", DaemonSetUID: types.UID("daemonset-uid"),
+		},
+	}
+	tests := []runtime.Object{
+		&evidence,
+		&ComputeDomainCliqueRetirementEvidenceList{
+			TypeMeta: metav1.TypeMeta{APIVersion: SchemeGroupVersion.String(), Kind: ComputeDomainCliqueRetirementEvidenceKind + "List"},
+			Items:    []ComputeDomainCliqueRetirementEvidence{evidence},
+		},
+	}
+	for _, object := range tests {
+		scheme := runtime.NewScheme()
+		require.NoError(t, AddToScheme(scheme))
+		codecs := serializer.NewCodecFactory(scheme)
+		encoded, err := runtime.Encode(codecs.LegacyCodec(SchemeGroupVersion), object)
+		require.NoError(t, err)
+		decoded, gvk, err := codecs.UniversalDecoder(SchemeGroupVersion).Decode(encoded, nil, nil)
+		require.NoError(t, err)
+		require.Equal(t, object.GetObjectKind().GroupVersionKind(), *gvk)
+		require.Equal(t, object, decoded)
+	}
+}

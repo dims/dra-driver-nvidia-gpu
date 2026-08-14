@@ -41,6 +41,7 @@ func newTestSnapshotManager() *ComputeDomainCliqueSnapshotManager {
 			podUID:                 "pod-a-uid",
 			podIP:                  "10.0.0.1",
 			podNamespace:           "driver",
+			bootID:                 "boot-a",
 			maxNodesPerIMEXDomain:  18,
 		},
 		desiredStateChan: make(chan *ControllerSnapshotDesiredState, 1),
@@ -77,13 +78,13 @@ func newTestSnapshot(t *testing.T) *nvapi.ComputeDomainCliqueSnapshot {
 			Phase:      nvapi.ComputeDomainCliqueSnapshotPhaseActive,
 			Generation: 7,
 			Assignments: []nvapi.ComputeDomainCliqueAssignment{
-				{Index: 0, NodeName: "node-a", NodeUID: types.UID("node-a-uid"), State: nvapi.ComputeDomainCliqueAssignmentStateBound, CurrentPodUID: types.UID("pod-a-uid")},
-				{Index: 1, NodeName: "node-b", NodeUID: types.UID("node-b-uid"), State: nvapi.ComputeDomainCliqueAssignmentStateBound, CurrentPodUID: types.UID("pod-b-uid")},
+				{Index: 0, NodeName: "node-a", NodeUID: types.UID("node-a-uid"), State: nvapi.ComputeDomainCliqueAssignmentStateBound, CurrentPodUID: types.UID("pod-a-uid"), EverPublished: true},
+				{Index: 1, NodeName: "node-b", NodeUID: types.UID("node-b-uid"), State: nvapi.ComputeDomainCliqueAssignmentStateBound, CurrentPodUID: types.UID("pod-b-uid"), EverPublished: true},
 			},
 			// Deliberately unordered: canonical validation and delivery sort by index.
 			Members: []nvapi.ComputeDomainCliqueMember{
-				{Index: 1, NodeName: "node-b", NodeUID: types.UID("node-b-uid"), PodName: "pod-b", PodUID: types.UID("pod-b-uid"), PodIP: "10.0.0.2", DaemonSetUID: types.UID("daemonset-uid")},
-				{Index: 0, NodeName: "node-a", NodeUID: types.UID("node-a-uid"), PodName: "pod-a", PodUID: types.UID("pod-a-uid"), PodIP: "10.0.0.1", DaemonSetUID: types.UID("daemonset-uid")},
+				{Index: 1, NodeName: "node-b", NodeUID: types.UID("node-b-uid"), NodeBootID: "boot-b", PodName: "pod-b", PodUID: types.UID("pod-b-uid"), PodIP: "10.0.0.2", DaemonSetUID: types.UID("daemonset-uid")},
+				{Index: 0, NodeName: "node-a", NodeUID: types.UID("node-a-uid"), NodeBootID: "boot-a", PodName: "pod-a", PodUID: types.UID("pod-a-uid"), PodIP: "10.0.0.1", DaemonSetUID: types.UID("daemonset-uid")},
 			},
 			MemberCount: 2,
 		},
@@ -177,11 +178,14 @@ func TestSnapshotConsumerDeliversRetirementForExactPublishedPod(t *testing.T) {
 	desired := <-m.desiredStateChan
 	require.Nil(t, desired.Receipt)
 	require.Empty(t, desired.Members)
-	require.Equal(t, &nvapi.ComputeDomainCliqueRetirementReceipt{
-		ComputeDomainUID: types.UID("cd-uid"), SnapshotUID: types.UID("snapshot-uid"),
-		SnapshotGeneration: 7, SnapshotHash: active.Status.Hash,
-		NodeUID: types.UID("node-a-uid"), PodUID: types.UID("pod-a-uid"), Index: 0,
-	}, desired.RetirementReceipt)
+	require.Equal(t, &nvapi.ComputeDomainCliqueRetirementEvidenceSpec{
+		Protocol: nvapi.ComputeDomainCliqueProtocolControllerV1, Reason: nvapi.ComputeDomainCliqueRetirementEvidenceReasonProcessExit,
+		ComputeDomainUID: types.UID("cd-uid"), SnapshotName: active.Name, SnapshotUID: types.UID("snapshot-uid"),
+		SnapshotGeneration: 7, SnapshotHash: active.Status.Hash, Index: 0,
+		NodeName: "node-a", NodeUID: types.UID("node-a-uid"), ActivationBootID: "boot-a", WitnessBootID: "boot-a",
+		OriginalPodName: "pod-a", OriginalPodUID: types.UID("pod-a-uid"), WitnessPodName: "pod-a", WitnessPodUID: types.UID("pod-a-uid"),
+		DaemonSetName: active.Spec.DaemonSetName, DaemonSetUID: active.Spec.DaemonSetUID,
+	}, desired.RetirementEvidence)
 
 	m.MarkRetired(desired)
 	require.NoError(t, m.consume(retiring))
@@ -207,8 +211,33 @@ func TestSnapshotConsumerWithoutDiscoveredCliqueAcceptsOnlyExactRetirement(t *te
 	retiring.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
 	require.NoError(t, m.consume(retiring))
 	desired := <-m.desiredStateChan
-	require.NotNil(t, desired.RetirementReceipt)
-	require.Equal(t, types.UID("pod-a-uid"), desired.RetirementReceipt.PodUID)
+	require.NotNil(t, desired.RetirementEvidence)
+	require.Equal(t, types.UID("pod-a-uid"), desired.RetirementEvidence.OriginalPodUID)
+}
+
+func TestSnapshotConsumerAcceptsReplacementOnlyAfterNodeReboot(t *testing.T) {
+	m := newTestSnapshotManager()
+	active := newTestSnapshot(t)
+	require.NoError(t, m.consume(active))
+	installed := <-m.desiredStateChan
+	m.MarkApplied(installed)
+
+	m.config.podName = "replacement"
+	m.config.podUID = "replacement-uid"
+	m.config.podIP = "10.0.0.9"
+	retiring := active.DeepCopy()
+	retiring.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
+	retiring.Status.Assignments[0].State = nvapi.ComputeDomainCliqueAssignmentStateQuarantined
+	require.ErrorContains(t, m.consume(retiring), "same-boot replacement")
+
+	m.config.bootID = "boot-after-reboot"
+	require.NoError(t, m.consume(retiring))
+	desired := <-m.desiredStateChan
+	require.Equal(t, nvapi.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot, desired.RetirementEvidence.Reason)
+	require.Equal(t, types.UID("pod-a-uid"), desired.RetirementEvidence.OriginalPodUID)
+	require.Equal(t, types.UID("replacement-uid"), desired.RetirementEvidence.WitnessPodUID)
+	require.Equal(t, "boot-a", desired.RetirementEvidence.ActivationBootID)
+	require.Equal(t, "boot-after-reboot", desired.RetirementEvidence.WitnessBootID)
 }
 
 func TestSnapshotConsumerRejectsInvalidSnapshots(t *testing.T) {
@@ -370,7 +399,7 @@ func TestApplyControllerSnapshotFreshProcessNeedsNoRestart(t *testing.T) {
 }
 
 func TestApplyControllerSnapshotRetiresBeforePublishingEvidence(t *testing.T) {
-	desired := &ControllerSnapshotDesiredState{RetirementReceipt: &nvapi.ComputeDomainCliqueRetirementReceipt{
+	desired := &ControllerSnapshotDesiredState{RetirementEvidence: &nvapi.ComputeDomainCliqueRetirementEvidenceSpec{
 		SnapshotUID: types.UID("snapshot-uid"), SnapshotGeneration: 7, SnapshotHash: "hash",
 	}}
 	var order []string
@@ -379,7 +408,7 @@ func TestApplyControllerSnapshotRetiresBeforePublishingEvidence(t *testing.T) {
 			order = append(order, "stopped-and-reaped")
 			return nil
 		},
-		writeRetirementReceipt: func(state *ControllerSnapshotDesiredState) error {
+		writeRetirementEvidence: func(state *ControllerSnapshotDesiredState) error {
 			require.Same(t, desired, state)
 			order = append(order, "receipt")
 			return nil
@@ -390,13 +419,13 @@ func TestApplyControllerSnapshotRetiresBeforePublishingEvidence(t *testing.T) {
 }
 
 func TestApplyControllerSnapshotNeverPublishesReceiptWhenStopFails(t *testing.T) {
-	desired := &ControllerSnapshotDesiredState{RetirementReceipt: &nvapi.ComputeDomainCliqueRetirementReceipt{
+	desired := &ControllerSnapshotDesiredState{RetirementEvidence: &nvapi.ComputeDomainCliqueRetirementEvidenceSpec{
 		SnapshotUID: types.UID("snapshot-uid"), SnapshotGeneration: 7, SnapshotHash: "hash",
 	}}
 	receiptCalls := 0
 	err := applyControllerSnapshot(&controllerSnapshotApplyState{desired: desired}, controllerSnapshotApplyOperations{
 		retireIMEX: func() error { return errors.New("still running") },
-		writeRetirementReceipt: func(*ControllerSnapshotDesiredState) error {
+		writeRetirementEvidence: func(*ControllerSnapshotDesiredState) error {
 			receiptCalls++
 			return nil
 		},

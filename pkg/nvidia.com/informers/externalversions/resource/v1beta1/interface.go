@@ -30,6 +30,8 @@ type Interface interface {
 	ComputeDomainCliques() ComputeDomainCliqueInformer
 	// ComputeDomainCliqueReservations returns a ComputeDomainCliqueReservationInformer.
 	ComputeDomainCliqueReservations() ComputeDomainCliqueReservationInformer
+	// ComputeDomainCliqueRetirementEvidences returns a ComputeDomainCliqueRetirementEvidenceInformer.
+	ComputeDomainCliqueRetirementEvidences() ComputeDomainCliqueRetirementEvidenceInformer
 	// ComputeDomainCliqueSnapshots returns a ComputeDomainCliqueSnapshotInformer.
 	ComputeDomainCliqueSnapshots() ComputeDomainCliqueSnapshotInformer
 }
@@ -58,6 +60,11 @@ func (v *version) ComputeDomainCliques() ComputeDomainCliqueInformer {
 // ComputeDomainCliqueReservations returns a ComputeDomainCliqueReservationInformer.
 func (v *version) ComputeDomainCliqueReservations() ComputeDomainCliqueReservationInformer {
 	return &computeDomainCliqueReservationInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// ComputeDomainCliqueRetirementEvidences returns a ComputeDomainCliqueRetirementEvidenceInformer.
+func (v *version) ComputeDomainCliqueRetirementEvidences() ComputeDomainCliqueRetirementEvidenceInformer {
+	return &computeDomainCliqueRetirementEvidenceInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // ComputeDomainCliqueSnapshots returns a ComputeDomainCliqueSnapshotInformer.

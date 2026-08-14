@@ -170,6 +170,75 @@ func TestSetGPUCliqueLabelRejectsMissingRestartTopology(t *testing.T) {
 	require.Error(t, manager.assertTopologyValid())
 }
 
+func TestComputeDomainManagerStartsInRetirementRecoveryOnlyMode(t *testing.T) {
+	now := metav1.Now()
+	cd := &nvapi.ComputeDomain{ObjectMeta: metav1.ObjectMeta{
+		Name: "domain", Namespace: "workload", UID: types.UID("cd-uid"), DeletionTimestamp: &now,
+		Finalizers:  []string{computeDomainLabelKey},
+		Annotations: map[string]string{nvapi.ComputeDomainCliqueProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolControllerV1)},
+	}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: testNodeName, Labels: map[string]string{gpuCliqueLabelKey: "old-clique"},
+		Annotations: map[string]string{computeDomainCliqueStartupAnnotationKey: "old-clique"},
+	}}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(cd), coreClient, "")
+	manager.controllerOwnedEnabled = func() bool { return true }
+	manager.config.flags.gpuCliqueLabelEnabled = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, manager.Start(ctx), "a persisted retiring stream must not crash-loop the kubelet plugin after reboot")
+	require.True(t, manager.controllerReadersOn)
+	require.True(t, manager.topologyIsInvalid())
+	require.Error(t, manager.assertTopologyValid(), "new workload Prepare must remain fail-closed")
+	cancel()
+	require.NoError(t, manager.Stop())
+}
+
+func TestTopologyRecoveryConsumesControllerFenceAndRepublishesIdentity(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   testNodeName,
+		Labels: map[string]string{gpuCliqueLabelKey: "old-clique"},
+		Annotations: map[string]string{
+			computeDomainCliqueStartupAnnotationKey:             "old-clique",
+			computeDomainCliqueCapabilityAnnotationKey:          string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+			nvapi.ComputeDomainCliqueRetirementFencedAnnotation: "retired-cd-uid",
+		},
+	}}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(), coreClient, "old-clique")
+	manager.config.flags.gpuCliqueLabelEnabled = true
+	manager.getCliqueIDFunc = func() (string, error) { return "new-clique", nil }
+	manager.cliqueIDMu.Lock()
+	manager.topologyInvalid = true
+	manager.cliqueIDMu.Unlock()
+
+	require.NoError(t, manager.tryRecoverTopologyIdentity(context.Background()))
+	require.False(t, manager.topologyIsInvalid())
+	require.Equal(t, "new-clique", manager.CliqueID())
+	updated := coreClient.nodes[testNodeName]
+	require.Equal(t, "new-clique", updated.Labels[gpuCliqueLabelKey])
+	require.Equal(t, "new-clique", updated.Annotations[computeDomainCliqueStartupAnnotationKey])
+	require.Equal(t, string(nvapi.ComputeDomainCliqueProtocolControllerV1), updated.Annotations[computeDomainCliqueCapabilityAnnotationKey])
+	require.Empty(t, updated.Annotations[nvapi.ComputeDomainCliqueRetirementFencedAnnotation])
+}
+
+func TestTopologyRecoveryWaitsForControllerFence(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:        testNodeName,
+		Annotations: map[string]string{computeDomainCliqueStartupAnnotationKey: "old-clique"},
+	}}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(), coreClient, "old-clique")
+	manager.cliqueIDMu.Lock()
+	manager.topologyInvalid = true
+	manager.cliqueIDMu.Unlock()
+
+	require.NoError(t, manager.tryRecoverTopologyIdentity(context.Background()))
+	require.True(t, manager.topologyIsInvalid())
+	require.Equal(t, "old-clique", coreClient.nodes[testNodeName].Annotations[computeDomainCliqueStartupAnnotationKey])
+}
+
 func TestRefreshGPUCliqueIDInvalidatesNonemptyToEmpty(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: testNodeName,
@@ -590,7 +659,8 @@ func (n *recordingNodes) Patch(_ context.Context, name string, _ types.PatchType
 	}
 	var patch struct {
 		Metadata struct {
-			Labels map[string]*string `json:"labels"`
+			Labels      map[string]*string `json:"labels"`
+			Annotations map[string]*string `json:"annotations"`
 		} `json:"metadata"`
 	}
 	if err := json.Unmarshal(data, &patch); err != nil {
@@ -605,6 +675,16 @@ func (n *recordingNodes) Patch(_ context.Context, name string, _ types.PatchType
 			node.Labels = map[string]string{}
 		}
 		node.Labels[key] = *value
+	}
+	for key, value := range patch.Metadata.Annotations {
+		if value == nil {
+			delete(node.Annotations, key)
+			continue
+		}
+		if node.Annotations == nil {
+			node.Annotations = map[string]string{}
+		}
+		node.Annotations[key] = *value
 	}
 	return node.DeepCopy(), nil
 }

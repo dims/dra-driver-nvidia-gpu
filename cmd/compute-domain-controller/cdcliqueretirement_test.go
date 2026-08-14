@@ -60,7 +60,7 @@ func retirementFixture(t *testing.T, workloadPhase corev1.PodPhase) (*Controller
 				State: nvapi.ComputeDomainCliqueAssignmentStateBound, EverPublished: true, CurrentPodUID: types.UID("daemon-pod-uid"),
 			}},
 			Members: []nvapi.ComputeDomainCliqueMember{{
-				Index: 0, NodeName: "node", NodeUID: types.UID("node-uid"), PodName: "daemon-pod",
+				Index: 0, NodeName: "node", NodeUID: types.UID("node-uid"), NodeBootID: "boot-old", PodName: "daemon-pod",
 				PodUID: types.UID("daemon-pod-uid"), PodIP: "10.0.0.1", DaemonSetUID: types.UID("ds-uid"),
 			}},
 		},
@@ -74,7 +74,7 @@ func retirementFixture(t *testing.T, workloadPhase corev1.PodPhase) (*Controller
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: types.UID("node-uid"),
 		Labels:      map[string]string{computeDomainLabelKey: string(cd.UID)},
 		Annotations: map[string]string{computeDomainAttestationAnnotationKey: string(encoded)},
-	}}
+	}, Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{BootID: "boot-old"}}}
 	templateName := "workload-template"
 	workload := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "workload-pod", Namespace: cd.Namespace, UID: attestation.PodUID},
@@ -189,6 +189,80 @@ func TestRetirementFencesOnlyAfterExactReceipt(t *testing.T) {
 	require.True(t, ready)
 }
 
+func retirementEvidenceFor(snapshot *nvapi.ComputeDomainCliqueSnapshot, reason, witnessPodName string, witnessPodUID types.UID, witnessBootID string) *nvapi.ComputeDomainCliqueRetirementEvidence {
+	member := snapshot.Status.Members[0]
+	return &nvapi.ComputeDomainCliqueRetirementEvidence{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nvapi.ComputeDomainCliqueRetirementEvidenceName(snapshot.UID, member.Index), Namespace: snapshot.Namespace, UID: types.UID("evidence-uid"),
+			Labels: map[string]string{
+				nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel: string(snapshot.Spec.ComputeDomainUID),
+				nvapi.ComputeDomainCliqueRetirementEvidenceSnapshotUIDLabel:   string(snapshot.UID),
+			},
+		},
+		Spec: nvapi.ComputeDomainCliqueRetirementEvidenceSpec{
+			Protocol: nvapi.ComputeDomainCliqueProtocolControllerV1, Reason: reason,
+			ComputeDomainUID: snapshot.Spec.ComputeDomainUID, SnapshotName: snapshot.Name, SnapshotUID: snapshot.UID,
+			SnapshotGeneration: snapshot.Status.Generation, SnapshotHash: snapshot.Status.Hash,
+			Index: member.Index, NodeName: member.NodeName, NodeUID: member.NodeUID,
+			ActivationBootID: member.NodeBootID, WitnessBootID: witnessBootID,
+			OriginalPodName: member.PodName, OriginalPodUID: member.PodUID,
+			WitnessPodName: witnessPodName, WitnessPodUID: witnessPodUID,
+			DaemonSetName: snapshot.Spec.DaemonSetName, DaemonSetUID: snapshot.Spec.DaemonSetUID,
+		},
+	}
+}
+
+func TestRetirementEvidenceSurvivesOriginalPodDeletion(t *testing.T) {
+	manager, cd, original, core := retirementFixture(t, corev1.PodSucceeded)
+	_, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.NoError(t, err)
+	retiring, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots("driver").Get(context.Background(), original.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	evidence := retirementEvidenceFor(retiring, nvapi.ComputeDomainCliqueRetirementEvidenceReasonProcessExit, "daemon-pod", types.UID("daemon-pod-uid"), "boot-old")
+	_, err = manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences("driver").Create(context.Background(), evidence, metav1.CreateOptions{})
+	require.NoError(t, err)
+	delete(core.pods, podMapKey("driver", "daemon-pod"))
+
+	ready, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.NoError(t, err)
+	require.False(t, ready)
+	fenced, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots("driver").Get(context.Background(), original.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, nvapi.ComputeDomainCliqueSnapshotPhaseFenced, fenced.Status.Phase)
+}
+
+func TestRetirementAcceptsReplacementAfterVerifiedNodeReboot(t *testing.T) {
+	manager, cd, original, core := retirementFixture(t, corev1.PodSucceeded)
+	_, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.NoError(t, err)
+	retiring, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots("driver").Get(context.Background(), original.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	core.nodes["node"].Status.NodeInfo.BootID = "boot-new"
+	evidence := retirementEvidenceFor(retiring, nvapi.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot, "replacement-daemon", types.UID("replacement-uid"), "boot-new")
+	_, err = manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences("driver").Create(context.Background(), evidence, metav1.CreateOptions{})
+	require.NoError(t, err)
+	delete(core.pods, podMapKey("driver", "daemon-pod"))
+
+	ready, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.NoError(t, err)
+	require.False(t, ready)
+}
+
+func TestRetirementRejectsReplacementWithoutBootEpochChange(t *testing.T) {
+	manager, cd, original, _ := retirementFixture(t, corev1.PodSucceeded)
+	_, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.NoError(t, err)
+	retiring, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots("driver").Get(context.Background(), original.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	evidence := retirementEvidenceFor(retiring, nvapi.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot, "replacement-daemon", types.UID("replacement-uid"), "boot-old")
+	_, err = manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences("driver").Create(context.Background(), evidence, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	ready, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.ErrorContains(t, err, "lacks distinct activation and witness boot epochs")
+	require.False(t, ready)
+}
+
 func TestRetirementDoesNotTreatMissingDaemonPodAsFence(t *testing.T) {
 	manager, cd, _, core := retirementFixture(t, corev1.PodSucceeded)
 	_, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
@@ -285,11 +359,20 @@ func TestDeleteSnapshotsReleasesFencedRuntime(t *testing.T) {
 		Phase: nvapi.ComputeDomainCliqueReservationPhaseActive, SnapshotUID: snapshot.UID,
 		ActivationGeneration: 1, ActivationHash: snapshot.Status.Hash,
 	}
-	manager := deletionManager(snapshot, reservation)
+	evidence := &nvapi.ComputeDomainCliqueRetirementEvidence{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "retirement-evidence", Namespace: "driver", UID: types.UID("evidence-uid"),
+			Labels: map[string]string{nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel: string(cdUID)},
+		},
+		Spec: nvapi.ComputeDomainCliqueRetirementEvidenceSpec{ComputeDomainUID: cdUID},
+	}
+	manager := deletionManager(snapshot, reservation, evidence)
 	require.NoError(t, manager.DeleteSnapshots(context.Background(), string(cdUID)))
 	_, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots("driver").Get(context.Background(), snapshot.Name, metav1.GetOptions{})
 	require.True(t, apierrors.IsNotFound(err))
 	_, err = manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(context.Background(), reservation.Name, metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err))
+	_, err = manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences("driver").Get(context.Background(), evidence.Name, metav1.GetOptions{})
 	require.True(t, apierrors.IsNotFound(err))
 }
 

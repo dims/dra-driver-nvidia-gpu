@@ -263,6 +263,12 @@ spec:
                     index:
                       minimum: 0
                       type: integer
+                    nodeBootID:
+                      description: |-
+                        NodeBootID is the kernel boot epoch observed when this member was
+                        published. Empty is accepted only for snapshots created before reboot
+                        evidence was introduced; those snapshots cannot use NodeReboot evidence.
+                      type: string
                     nodeName:
                       maxLength: 253
                       minLength: 1

@@ -1,0 +1,193 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.1
+  name: computedomaincliqueretirementevidences.resource.nvidia.com
+spec:
+  group: resource.nvidia.com
+  names:
+    kind: ComputeDomainCliqueRetirementEvidence
+    listKind: ComputeDomainCliqueRetirementEvidenceList
+    plural: computedomaincliqueretirementevidences
+    shortNames:
+    - cdcretirementevidence
+    singular: computedomaincliqueretirementevidence
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.reason
+      name: Reason
+      type: string
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .spec.index
+      name: Index
+      type: integer
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ComputeDomainCliqueRetirementEvidence is a durable, immutable witness that
+          one published member's old IMEX process cannot still be running. It is not
+          owned by the daemon Pod because Pod deletion must not erase fence evidence.
+          The controller deletes it only after reservation release is durable.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ComputeDomainCliqueRetirementEvidenceSpec binds the original published
+              member to the exact Pod-bound witness which created this object. ProcessExit
+              requires the original daemon itself. NodeReboot permits a replacement
+              daemon only when the published and current kernel boot IDs differ.
+            properties:
+              activationBootID:
+                type: string
+              computeDomainUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+                x-kubernetes-validations:
+                - message: computeDomainUID must not be empty
+                  rule: self != ''
+              daemonSetName:
+                minLength: 1
+                type: string
+              daemonSetUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+                x-kubernetes-validations:
+                - message: daemonSetUID must not be empty
+                  rule: self != ''
+              index:
+                minimum: 0
+                type: integer
+              nodeName:
+                minLength: 1
+                type: string
+              nodeUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+                x-kubernetes-validations:
+                - message: nodeUID must not be empty
+                  rule: self != ''
+              originalPodName:
+                minLength: 1
+                type: string
+              originalPodUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+                x-kubernetes-validations:
+                - message: originalPodUID must not be empty
+                  rule: self != ''
+              protocol:
+                description: |-
+                  ComputeDomainCliqueProtocol identifies the component which owns clique
+                  allocation and membership for one ComputeDomain. The value is persisted in
+                  generated claim configuration, so it must not be inferred from feature-gate
+                  state or from whether a particular API object happens to exist.
+                enum:
+                - controller-v1
+                type: string
+              reason:
+                enum:
+                - ProcessExit
+                - NodeReboot
+                type: string
+              snapshotGeneration:
+                format: int64
+                minimum: 1
+                type: integer
+              snapshotHash:
+                pattern: ^[a-f0-9]{64}$
+                type: string
+              snapshotName:
+                minLength: 1
+                type: string
+              snapshotUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+                x-kubernetes-validations:
+                - message: snapshotUID must not be empty
+                  rule: self != ''
+              witnessBootID:
+                type: string
+              witnessPodName:
+                minLength: 1
+                type: string
+              witnessPodUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+                x-kubernetes-validations:
+                - message: witnessPodUID must not be empty
+                  rule: self != ''
+            required:
+            - computeDomainUID
+            - daemonSetName
+            - daemonSetUID
+            - index
+            - nodeName
+            - nodeUID
+            - originalPodName
+            - originalPodUID
+            - protocol
+            - reason
+            - snapshotGeneration
+            - snapshotHash
+            - snapshotName
+            - snapshotUID
+            - witnessPodName
+            - witnessPodUID
+            type: object
+            x-kubernetes-validations:
+            - message: process-exit evidence must come from the original published
+                daemon
+              rule: self.reason != 'ProcessExit' || (self.originalPodName == self.witnessPodName
+                && self.originalPodUID == self.witnessPodUID)
+            - message: node-reboot evidence requires distinct nonempty boot IDs
+              rule: self.reason != 'NodeReboot' || (self.activationBootID != '' &&
+                self.witnessBootID != '' && self.activationBootID != self.witnessBootID)
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: retirement evidence is immutable
+          rule: self.spec == oldSelf.spec
+    served: true
+    storage: true
+    subresources: {}

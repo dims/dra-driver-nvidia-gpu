@@ -27,6 +27,8 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
+
+	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 )
 
 type NodeManager struct {
@@ -118,31 +120,51 @@ func (m *NodeManager) RemoveComputeDomainLabels(ctx context.Context, cdUID strin
 // after controller-v1 retirement has durably fenced every published daemon.
 // Legacy callers leave the controller-only attestation key untouched.
 func (m *NodeManager) RemoveComputeDomainLabelsAndAttestations(ctx context.Context, cdUID string, removeAttestation bool) error {
-	labelSelector := &metav1.LabelSelector{
-		MatchExpressions: []metav1.LabelSelectorRequirement{
-			{
-				Key:      computeDomainLabelKey,
-				Operator: metav1.LabelSelectorOpIn,
-				Values:   []string{cdUID},
-			},
-		},
+	listNodes := func(key string) (*corev1.NodeList, error) {
+		selector := &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+			Key: key, Operator: metav1.LabelSelectorOpIn, Values: []string{cdUID},
+		}}}
+		return m.config.clientsets.Core.CoreV1().Nodes().List(ctx, metav1.ListOptions{
+			LabelSelector: metav1.FormatLabelSelector(selector),
+		})
 	}
-
-	nodes, err := m.config.clientsets.Core.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-		LabelSelector: metav1.FormatLabelSelector(labelSelector),
-	})
+	routedNodes, err := listNodes(computeDomainLabelKey)
 	if err != nil {
-		return fmt.Errorf("error retrieving nodes: %w", err)
+		return fmt.Errorf("error retrieving routed nodes: %w", err)
+	}
+	nodesByName := make(map[string]*corev1.Node, len(routedNodes.Items))
+	for i := range routedNodes.Items {
+		node := &routedNodes.Items[i]
+		nodesByName[node.Name] = node
+	}
+	if removeAttestation {
+		// A reboot or topology validation failure can remove the routable label
+		// before retirement completes. The controller-owned isolation label is
+		// the durable inventory for those Nodes; include it so every fenced Node
+		// receives the one-shot topology-recovery authorization.
+		isolatedNodes, listErr := listNodes(controllerOwnedCliqueIsolationLabelKey)
+		if listErr != nil {
+			return fmt.Errorf("error retrieving controller-isolated nodes: %w", listErr)
+		}
+		for i := range isolatedNodes.Items {
+			node := &isolatedNodes.Items[i]
+			nodesByName[node.Name] = node
+		}
 	}
 
 	var names []string
-	for _, node := range nodes.Items {
-		// Rely on above's List() API call to only return node objects that
-		// really have this label set. Remove it.
+	for _, node := range nodesByName {
+		// Every object was selected by either the route or the durable
+		// controller-owned isolation inventory for this ComputeDomain.
 		newNode := node.DeepCopy()
 		delete(newNode.Labels, computeDomainLabelKey)
 		if removeAttestation {
+			delete(newNode.Labels, controllerOwnedCliqueIsolationLabelKey)
+			if newNode.Annotations == nil {
+				newNode.Annotations = map[string]string{}
+			}
 			delete(newNode.Annotations, computeDomainAttestationAnnotationKey)
+			newNode.Annotations[nvapi.ComputeDomainCliqueRetirementFencedAnnotation] = cdUID
 		}
 		if _, err := m.config.clientsets.Core.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{}); err != nil {
 			return fmt.Errorf("error updating node %s: %w", newNode.Name, err)

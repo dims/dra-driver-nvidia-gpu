@@ -67,8 +67,9 @@ const (
 
 	gpuCliqueLabelRefreshInterval = 10 * time.Minute
 
-	informerResyncPeriod = 10 * time.Minute
-	cleanupInterval      = 10 * time.Minute
+	informerResyncPeriod     = 10 * time.Minute
+	cleanupInterval          = 10 * time.Minute
+	topologyRecoveryInterval = 5 * time.Second
 
 	ComputeDomainDaemonConfigFilesDirName = "domains"
 	ComputeDomainDaemonConfigTemplatePath = "/templates/compute-domain-daemon-config.tmpl.cfg"
@@ -109,6 +110,7 @@ type ComputeDomainDaemonSettings struct {
 	rootDir         string
 	configTmplPath  string
 	nodesConfigPath string
+	recoveryOnly    bool
 }
 
 func NewComputeDomainManager(config *Config, getCliqueIDFunc func() (string, error)) (*ComputeDomainManager, error) {
@@ -196,6 +198,18 @@ func (m *ComputeDomainManager) assertTopologyValid() error {
 	return nil
 }
 
+func (m *ComputeDomainManager) topologyIsInvalid() bool {
+	m.cliqueIDMu.RLock()
+	defer m.cliqueIDMu.RUnlock()
+	return m.topologyInvalid
+}
+
+func (m *ComputeDomainManager) retirementRecoveryAllowed(cd *nvapi.ComputeDomain, protocol nvapi.ComputeDomainCliqueProtocol) bool {
+	return cd != nil && cd.DeletionTimestamp != nil &&
+		nvapi.EffectiveComputeDomainCliqueProtocol(protocol) == nvapi.ComputeDomainCliqueProtocolControllerV1 &&
+		m.topologyIsInvalid()
+}
+
 func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancelContext = cancel
@@ -255,7 +269,10 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 
 	if m.config.flags.gpuCliqueLabelEnabled {
 		if err := m.SetGPUCliqueLabel(ctx); err != nil {
-			return fmt.Errorf("error setting %s node label: %w", gpuCliqueLabelKey, err)
+			if !m.controllerReadersOn || !m.topologyIsInvalid() {
+				return fmt.Errorf("error setting %s node label: %w", gpuCliqueLabelKey, err)
+			}
+			klog.Errorf("starting in retirement-recovery-only mode after topology validation failed: %v", err)
 		}
 	}
 
@@ -264,6 +281,11 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 		go func() {
 			defer m.waitGroup.Done()
 			m.periodicGPUCliqueIDRefresh(ctx)
+		}()
+		m.waitGroup.Add(1)
+		go func() {
+			defer m.waitGroup.Done()
+			m.periodicTopologyRecovery(ctx)
 		}()
 	}
 
@@ -338,10 +360,16 @@ func (s *ComputeDomainDaemonSettings) GetCDIContainerEditsCommon(ctx context.Con
 		return nil, fmt.Errorf("compute domain not found: %s", s.domainID)
 	}
 
+	cliqueID := s.manager.CliqueID()
+	if s.recoveryOnly {
+		// A recovery daemon must not join either the old or newly discovered
+		// fabric. The empty scope starts only the retirement snapshot reader.
+		cliqueID = ""
+	}
 	edits := &cdiapi.ContainerEdits{
 		ContainerEdits: &cdispec.ContainerEdits{
 			Env: []string{
-				fmt.Sprintf("CLIQUE_ID=%s", s.manager.CliqueID()),
+				fmt.Sprintf("CLIQUE_ID=%s", cliqueID),
 				fmt.Sprintf("COMPUTE_DOMAIN_UUID=%s", cd.UID),
 				fmt.Sprintf("COMPUTE_DOMAIN_NAME=%s", cd.Name),
 				fmt.Sprintf("COMPUTE_DOMAIN_NAMESPACE=%s", cd.Namespace),
@@ -833,6 +861,9 @@ func (m *ComputeDomainManager) SetGPUCliqueLabel(ctx context.Context) error {
 		return fmt.Errorf("read Node startup topology: %w", err)
 	}
 	if startupCliqueID := node.Annotations[computeDomainCliqueStartupAnnotationKey]; startupCliqueID != "" && startupCliqueID != cliqueID {
+		m.cliqueIDMu.Lock()
+		m.topologyInvalid = true
+		m.cliqueIDMu.Unlock()
 		return fmt.Errorf("GPU clique ID %q does not match immutable Node startup clique %q; drain and fence the node before clearing the startup topology annotation", cliqueID, startupCliqueID)
 	}
 
@@ -902,6 +933,74 @@ func (m *ComputeDomainManager) periodicGPUCliqueIDRefresh(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// periodicTopologyRecovery consumes the controller's one-shot fence marker
+// after a controller-v1 ComputeDomain has fully retired. Until that marker is
+// present, topologyInvalid continues to reject all workload Prepare calls.
+func (m *ComputeDomainManager) periodicTopologyRecovery(ctx context.Context) {
+	ticker := time.NewTicker(topologyRecoveryInterval)
+	defer ticker.Stop()
+	for {
+		if err := m.tryRecoverTopologyIdentity(ctx); err != nil {
+			klog.Errorf("topology retirement recovery is still blocked: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *ComputeDomainManager) tryRecoverTopologyIdentity(ctx context.Context) error {
+	if !m.topologyIsInvalid() {
+		return nil
+	}
+	node, err := m.config.clientsets.Core.CoreV1().Nodes().Get(ctx, m.config.flags.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read Node for topology recovery: %w", err)
+	}
+	fencedCD := node.Annotations[nvapi.ComputeDomainCliqueRetirementFencedAnnotation]
+	if fencedCD == "" {
+		return nil
+	}
+	if node.Labels[computeDomainLabelKey] != "" || node.Labels[controllerOwnedCliqueIsolationLabelKey] != "" ||
+		node.Annotations[computeDomainAttestationAnnotationKey] != "" {
+		return fmt.Errorf("controller fence %q is present but ComputeDomain route, isolation, or attestation still exists", fencedCD)
+	}
+	newCliqueID, err := m.getCliqueIDFunc()
+	if err != nil {
+		return fmt.Errorf("rediscover GPU clique after retirement fence: %w", err)
+	}
+	patch := map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]any{gpuCliqueLabelKey: nil},
+			"annotations": map[string]any{
+				computeDomainCliqueStartupAnnotationKey:             nil,
+				computeDomainCliqueCapabilityAnnotationKey:          nil,
+				nvapi.ComputeDomainCliqueRetirementFencedAnnotation: nil,
+			},
+		},
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	if _, err := m.config.clientsets.Core.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{}); err != nil {
+		return fmt.Errorf("consume topology retirement fence: %w", err)
+	}
+	m.cliqueIDMu.Lock()
+	m.cliqueID = newCliqueID
+	m.topologyInvalid = false
+	m.cliqueIDMu.Unlock()
+	if m.config.flags.gpuCliqueLabelEnabled && newCliqueID != "" {
+		if err := m.SetGPUCliqueLabel(ctx); err != nil {
+			return fmt.Errorf("publish rediscovered GPU clique after retirement: %w", err)
+		}
+	}
+	klog.Infof("consumed retirement fence %q and reset startup topology identity to %q", fencedCD, newCliqueID)
+	return nil
 }
 
 // refreshGPUCliqueID re-reads the GPU clique ID. Topology is fixed for this

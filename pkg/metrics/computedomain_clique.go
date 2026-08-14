@@ -28,6 +28,7 @@ import (
 const (
 	CliqueAPIResourceSnapshot    = "snapshot"
 	CliqueAPIResourceReservation = "reservation"
+	CliqueAPIResourceEvidence    = "retirement_evidence"
 	CliqueAPIResourceNode        = "node"
 
 	CliqueAPIOperationCreate            = "create"
