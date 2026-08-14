@@ -143,7 +143,7 @@ kubectl auth can-i update computedomaincliquesnapshots/status \
 
 Verify that the rendered `computedomain-protocol-policy`, reserved-metadata,
 Node-topology, reservation-writer, snapshot-writer, and retirement-evidence
-policies all have active
+policies, plus `controllerownedcdc-lifecycle-policy`, all have active
 `ValidatingAdmissionPolicyBinding` objects before continuing. The controller
 also rejects a persisted protocol marker which predates its finalizer, but the
 admission layer is required to prevent that invalid state rather than merely
@@ -249,6 +249,12 @@ same namespace to the recorded legacy workload and RBAC names is supported.
 The retained policies continue to reject any other release, namespace, or
 ServiceAccount during and after that rollback. Test that exact chart transition
 on the target Kubernetes version before relying on it as a recovery path.
+
+The lifecycle admission policy rejects deletion of the protected controller
+Deployment, kubelet-plugin DaemonSet, and NVIDIA ComputeDomain CRDs until the
+installation marker carries the explicit unsafe-decommission approval. This
+makes an ordinary `helm uninstall` fail closed while the controller and API
+state remain available; it does not turn approval into runtime fence evidence.
 
 A full decommission or any rollback with controller-owned state still requires
 an explicit reviewed procedure which must

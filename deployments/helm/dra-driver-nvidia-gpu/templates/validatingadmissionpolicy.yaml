@@ -267,6 +267,47 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "controllerownedcdc-lifecycle-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["DELETE"]
+      resources: ["deployments"]
+      resourceNames: [{{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerWorkloadName" . | quote }}]
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["DELETE"]
+      resources: ["daemonsets"]
+      resourceNames: [{{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletWorkloadName" . | quote }}]
+    - apiGroups: ["apiextensions.k8s.io"]
+      apiVersions: ["v1"]
+      operations: ["DELETE"]
+      resources: ["customresourcedefinitions"]
+      resourceNames:
+      - computedomains.resource.nvidia.com
+      - computedomaincliques.resource.nvidia.com
+      - computedomaincliquesnapshots.resource.nvidia.com
+      - computedomaincliquereservations.resource.nvidia.com
+      - computedomaincliqueretirementevidences.resource.nvidia.com
+  validations:
+  - expression: >-
+      params != null &&
+      params.metadata.?annotations.orValue({})[?'resource.nvidia.com/unsafe-controller-owned-cdc-decommission'].orValue('') == 'approved'
+    message: controller-owned CDC workloads and APIs may be deleted only after the reviewed decommission is explicitly approved on the installation marker
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
   name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "resourceslices-policy" }}
   labels:
     {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
