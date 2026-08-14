@@ -271,6 +271,9 @@ func ValidateFeatureGates() error {
 	if Enabled(ControllerOwnedCDCliques) && !Enabled(IMEXDaemonsWithDNSNames) {
 		return fmt.Errorf("feature gate %s requires %s to also be enabled", ControllerOwnedCDCliques, IMEXDaemonsWithDNSNames)
 	}
+	if Enabled(ControllerOwnedCDCliques) && !Enabled(CrashOnNVLinkFabricErrors) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", ControllerOwnedCDCliques, CrashOnNVLinkFabricErrors)
+	}
 
 	if Enabled(DynamicMIG) && Enabled(PassthroughSupport) {
 		return fmt.Errorf("feature gate %s is currently mutually exclusive with %s", DynamicMIG, PassthroughSupport)

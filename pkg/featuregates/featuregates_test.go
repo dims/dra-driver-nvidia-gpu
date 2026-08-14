@@ -465,9 +465,9 @@ func TestValidateFeatureGates(t *testing.T) {
 		},
 		{
 			name:        "Controller-owned cliques with dependencies",
-			fgMap:       map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true},
+			fgMap:       map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true, CrashOnNVLinkFabricErrors: true},
 			expectError: false,
-			description: "should be valid when controller-owned cliques and both dependencies are enabled",
+			description: "should be valid when controller-owned cliques and all dependencies are enabled",
 		},
 		{
 			name:         "Controller-owned cliques without CDCliques",
@@ -478,10 +478,17 @@ func TestValidateFeatureGates(t *testing.T) {
 		},
 		{
 			name:         "Controller-owned cliques without DNSNames",
-			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: false},
+			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: false, CrashOnNVLinkFabricErrors: true},
 			expectError:  true,
 			errorMessage: "feature gate ComputeDomainCliques requires IMEXDaemonsWithDNSNames to also be enabled",
 			description:  "should fail without IMEXDaemonsWithDNSNames",
+		},
+		{
+			name:         "Controller-owned cliques without strict NVLink fabric errors",
+			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true, CrashOnNVLinkFabricErrors: false},
+			expectError:  true,
+			errorMessage: "feature gate ControllerOwnedCDCliques requires CrashOnNVLinkFabricErrors to also be enabled",
+			description:  "should fail when a controller-owned node could silently fall back to non-fabric mode",
 		},
 		{
 			name:         "DynamicMIG enabled with PassthroughSupport",

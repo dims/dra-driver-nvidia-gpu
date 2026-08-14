@@ -429,4 +429,7 @@ implementation.
 {{- if and $enabled (not .Values.controller.leaderElection.enabled) -}}
   {{- fail "featureGates.ControllerOwnedCDCliques=true requires controller.leaderElection.enabled=true; clique allocation requires one active writer" -}}
 {{- end -}}
+{{- if and $enabled (and (hasKey .Values.featureGates "CrashOnNVLinkFabricErrors") (not .Values.featureGates.CrashOnNVLinkFabricErrors)) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires featureGates.CrashOnNVLinkFabricErrors=true; controller-owned topology must fail closed instead of falling back to non-fabric mode" -}}
+{{- end -}}
 {{- end -}}

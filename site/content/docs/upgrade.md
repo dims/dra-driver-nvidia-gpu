@@ -104,6 +104,7 @@ helm template nvidia-dra-driver-gpu \
     --api-versions resource.k8s.io/v1 \
     --set controllerOwnedCDCliques.admissionEnabled=true \
     --set featureGates.ControllerOwnedCDCliques=true \
+    --set featureGates.CrashOnNVLinkFabricErrors=true \
     --set kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled=true \
     --set controller.leaderElection.enabled=true \
     --set-json 'controllerOwnedCDCliques.canaryNamespaces=["my-canary-namespace"]' \
@@ -170,6 +171,7 @@ allowlist an operator-controlled canary namespace:
 ```yaml
 featureGates:
   ControllerOwnedCDCliques: true
+  CrashOnNVLinkFabricErrors: true
 kubeletPlugin:
   containers:
     computeDomains:
@@ -188,6 +190,10 @@ Alpha requires Kubernetes v1.34 or newer with the served
 by legacy-v1 only. Alpha supports one chart installation in one fixed primary
 driver namespace and is not supported on OpenShift until SCC bindings are
 covered by the same immutable admission boundary.
+`CrashOnNVLinkFabricErrors` must remain enabled while controller-v1 state
+exists. A controller-owned Node must fail closed when NVML cannot verify its
+startup fabric identity; silently falling back to non-fabric mode would make a
+temporary observation indistinguishable from an authorized topology change.
 Do not install another release, rename or move the controller ServiceAccount,
 or migrate the control namespace while controller-owned admission policies or
 state exist. The policies are cluster-scoped and authorize the exact release

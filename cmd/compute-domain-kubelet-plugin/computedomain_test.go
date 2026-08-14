@@ -109,6 +109,24 @@ func TestComputeDomainManagerLegacyDefaultSkipsControllerReaders(t *testing.T) {
 	coreClient.assertNoInformerFor(t, "nodes")
 }
 
+func TestPersistedControllerV1RequiresStrictFabricErrorsAfterGateDisable(t *testing.T) {
+	cd := &nvapi.ComputeDomain{ObjectMeta: metav1.ObjectMeta{
+		Name: "domain", Namespace: "workload", UID: types.UID("domain-uid"),
+		Annotations: map[string]string{
+			nvapi.ComputeDomainCliqueProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+		},
+	}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(cd), &recordingCoreClient{}, "clique-a")
+	manager.controllerOwnedEnabled = func() bool { return false }
+	manager.strictFabricErrorsEnabled = func() bool { return false }
+	require.NoError(t, manager.informer.GetStore().Add(cd))
+	require.True(t, manager.hasPersistedControllerV1())
+	manager.controllerReadersOn = manager.controllerOwnedEnabled() || manager.hasPersistedControllerV1()
+
+	err := manager.validateControllerReaderPrerequisites()
+	require.ErrorContains(t, err, "controller-v1 state requires feature gate CrashOnNVLinkFabricErrors=true")
+}
+
 func TestSetGPUCliqueLabelRejectsRestartTopologyChange(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: testNodeName,
@@ -123,6 +141,23 @@ func TestSetGPUCliqueLabelRejectsRestartTopologyChange(t *testing.T) {
 
 	require.Equal(t, "old-clique", node.Annotations[computeDomainCliqueStartupAnnotationKey])
 	require.Empty(t, node.Labels[gpuCliqueLabelKey])
+}
+
+func TestSetGPUCliqueLabelRepublishesSameRestartTopology(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   testNodeName,
+		Labels: map[string]string{gpuCliqueLabelKey: "clique-a"},
+		Annotations: map[string]string{
+			computeDomainCliqueStartupAnnotationKey:    "clique-a",
+			computeDomainCliqueCapabilityAnnotationKey: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+		},
+	}}
+	coreClient := &recordingCoreClient{nodes: map[string]*corev1.Node{testNodeName: node}}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(), coreClient, "clique-a")
+	require.NoError(t, manager.SetGPUCliqueLabel(context.Background()))
+	require.NoError(t, manager.assertTopologyValid())
+	require.Equal(t, "clique-a", coreClient.nodes[testNodeName].Labels[gpuCliqueLabelKey])
+	require.Equal(t, "clique-a", coreClient.nodes[testNodeName].Annotations[computeDomainCliqueStartupAnnotationKey])
 }
 
 func TestStopPreservesVerifiedGPUCliqueLabel(t *testing.T) {
@@ -276,7 +311,7 @@ func TestRefreshGPUCliqueIDLegacyAdoptsLateNonemptyClique(t *testing.T) {
 	require.Equal(t, "late-clique", manager.CliqueID())
 }
 
-func TestRefreshGPUCliqueIDInvalidatesOnDiscoveryError(t *testing.T) {
+func TestRefreshGPUCliqueIDFailsClosedWithoutErasingLastVerifiedTopology(t *testing.T) {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: testNodeName,
 		Labels: map[string]string{
@@ -293,8 +328,13 @@ func TestRefreshGPUCliqueIDInvalidatesOnDiscoveryError(t *testing.T) {
 	err := manager.refreshGPUCliqueID(context.Background())
 	require.ErrorContains(t, err, `verifying GPU clique ID "old-clique" failed`)
 	require.Error(t, manager.assertTopologyValid())
-	require.Empty(t, node.Labels[gpuCliqueLabelKey])
+	require.Equal(t, "old-clique", node.Labels[gpuCliqueLabelKey])
 	require.Equal(t, "old-clique", node.Annotations[computeDomainCliqueStartupAnnotationKey])
+
+	manager.getCliqueIDFunc = func() (string, error) { return "old-clique", nil }
+	require.NoError(t, manager.refreshGPUCliqueID(context.Background()))
+	require.NoError(t, manager.assertTopologyValid(), "re-verifying the exact startup topology should clear only the transient fail-closed state")
+	require.Equal(t, "old-clique", node.Labels[gpuCliqueLabelKey])
 }
 
 func TestControllerOwnedReadinessUsesExactCachedIdentityAndReceipt(t *testing.T) {

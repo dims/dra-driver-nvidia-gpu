@@ -96,12 +96,14 @@ type ComputeDomainManager struct {
 
 	configFilesRoot string
 
-	cliqueIDMu      sync.RWMutex
-	cliqueID        string
-	topologyInvalid bool
+	cliqueIDMu               sync.RWMutex
+	cliqueID                 string
+	topologyInvalid          bool
+	topologyVerificationLost bool
 
-	getCliqueIDFunc        func() (string, error)
-	controllerOwnedEnabled func() bool
+	getCliqueIDFunc           func() (string, error)
+	controllerOwnedEnabled    func() bool
+	strictFabricErrorsEnabled func() bool
 }
 
 type ComputeDomainDaemonSettings struct {
@@ -169,6 +171,9 @@ func NewComputeDomainManager(config *Config, getCliqueIDFunc func() (string, err
 		controllerOwnedEnabled: func() bool {
 			return featuregates.Enabled(featuregates.ControllerOwnedCDCliques)
 		},
+		strictFabricErrorsEnabled: func() bool {
+			return featuregates.Enabled(featuregates.CrashOnNVLinkFabricErrors)
+		},
 	}
 
 	return m, nil
@@ -195,6 +200,9 @@ func (m *ComputeDomainManager) assertTopologyValid() error {
 	if m.topologyInvalid {
 		return fmt.Errorf("GPU clique topology changed after plugin startup; drain and fence this node before preparing more ComputeDomain resources")
 	}
+	if m.topologyVerificationLost {
+		return fmt.Errorf("GPU clique topology cannot currently be verified; refusing new ComputeDomain work until the same startup topology is verified again")
+	}
 	return nil
 }
 
@@ -202,6 +210,12 @@ func (m *ComputeDomainManager) topologyIsInvalid() bool {
 	m.cliqueIDMu.RLock()
 	defer m.cliqueIDMu.RUnlock()
 	return m.topologyInvalid
+}
+
+func (m *ComputeDomainManager) setTopologyVerificationLost(lost bool) {
+	m.cliqueIDMu.Lock()
+	defer m.cliqueIDMu.Unlock()
+	m.topologyVerificationLost = lost
 }
 
 func (m *ComputeDomainManager) retirementRecoveryAllowed(cd *nvapi.ComputeDomain, protocol nvapi.ComputeDomainCliqueProtocol) bool {
@@ -240,6 +254,9 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 	// controller-v1 state must keep working after the gate is disabled.
 	m.controllerReadersOn = m.controllerOwnedEnabled() || m.hasPersistedControllerV1()
 	if m.controllerReadersOn {
+		if err := m.validateControllerReaderPrerequisites(); err != nil {
+			return err
+		}
 		m.snapshotAPIAvailable, err = m.probeSnapshotAPI(ctx)
 		if err != nil {
 			return err
@@ -300,6 +317,13 @@ func (m *ComputeDomainManager) hasPersistedControllerV1() bool {
 		}
 	}
 	return false
+}
+
+func (m *ComputeDomainManager) validateControllerReaderPrerequisites() error {
+	if m.controllerReadersOn && !m.strictFabricErrorsEnabled() {
+		return fmt.Errorf("controller-v1 state requires feature gate %s=true; fabric discovery may not fall back to non-fabric mode", featuregates.CrashOnNVLinkFabricErrors)
+	}
+	return nil
 }
 
 // probeSnapshotAPI lets legacy-only installations start before the snapshot
@@ -891,8 +915,9 @@ func (m *ComputeDomainManager) SetGPUCliqueLabel(ctx context.Context) error {
 	return nil
 }
 
-// RemoveGPUCliqueLabel removes the nvidia.com/gpu.clique node label, e.g. on
-// plugin shutdown.
+// RemoveGPUCliqueLabel removes the nvidia.com/gpu.clique routing projection
+// after a verified topology change. Ordinary plugin shutdown preserves the
+// last verified label; process exit is not evidence that the fabric changed.
 func (m *ComputeDomainManager) RemoveGPUCliqueLabel(ctx context.Context) error {
 	patch := map[string]any{
 		"metadata": map[string]any{
@@ -993,6 +1018,7 @@ func (m *ComputeDomainManager) tryRecoverTopologyIdentity(ctx context.Context) e
 	m.cliqueIDMu.Lock()
 	m.cliqueID = newCliqueID
 	m.topologyInvalid = false
+	m.topologyVerificationLost = false
 	m.cliqueIDMu.Unlock()
 	if m.config.flags.gpuCliqueLabelEnabled && newCliqueID != "" {
 		if err := m.SetGPUCliqueLabel(ctx); err != nil {
@@ -1010,23 +1036,17 @@ func (m *ComputeDomainManager) tryRecoverTopologyIdentity(ctx context.Context) e
 func (m *ComputeDomainManager) refreshGPUCliqueID(ctx context.Context) error {
 	newCliqueID, err := m.getCliqueIDFunc()
 	if err != nil {
-		// Once a non-empty topology has been published, losing the ability to
-		// verify it is a safety event rather than merely an observability
-		// failure. Continuing to admit new ComputeDomain work would authorize
-		// it from stale topology. Keep the immutable startup annotation as the
-		// fence, remove the routable label, and require an explicit drain/reset.
-		if oldCliqueID := m.CliqueID(); oldCliqueID != "" {
-			m.cliqueIDMu.Lock()
-			m.topologyInvalid = true
-			m.cliqueIDMu.Unlock()
-			if m.config.flags.gpuCliqueLabelEnabled {
-				if removeErr := m.RemoveGPUCliqueLabel(ctx); removeErr != nil {
-					return fmt.Errorf("verifying GPU clique ID %q failed (%v) and removing the stale Node label failed: %w", oldCliqueID, err, removeErr)
-				}
-			}
-			return fmt.Errorf("verifying GPU clique ID %q failed: %w; refusing new ComputeDomain work until the node and IMEX fabric are drained and fenced", oldCliqueID, err)
+		// A discovery error is not proof that the hardware topology changed.
+		// Keep the last verified routing projection so an observability failure
+		// cannot itself quarantine an Active clique, but reject new local work
+		// until NVML verifies that exact startup topology again. Startup errors
+		// are handled earlier by NewComputeDomainManager and never publish a
+		// topology in the first place.
+		oldCliqueID := m.CliqueID()
+		if oldCliqueID != "" || m.controllerReadersOn {
+			m.setTopologyVerificationLost(true)
 		}
-		return fmt.Errorf("error getting cliqueID: %w", err)
+		return fmt.Errorf("verifying GPU clique ID %q failed: %w; preserving the last verified routing projection but refusing new ComputeDomain work", oldCliqueID, err)
 	}
 
 	oldCliqueID := m.CliqueID()
@@ -1038,6 +1058,7 @@ func (m *ComputeDomainManager) refreshGPUCliqueID(ctx context.Context) error {
 	} else if newCliqueID != oldCliqueID {
 		m.cliqueIDMu.Lock()
 		m.topologyInvalid = true
+		m.topologyVerificationLost = false
 		m.cliqueIDMu.Unlock()
 		if m.config.flags.gpuCliqueLabelEnabled {
 			if removeErr := m.RemoveGPUCliqueLabel(ctx); removeErr != nil {
@@ -1046,6 +1067,7 @@ func (m *ComputeDomainManager) refreshGPUCliqueID(ctx context.Context) error {
 		}
 		return fmt.Errorf("GPU clique ID changed from %q to %q; refusing in-place topology migration until the node and IMEX fabric are drained and fenced", oldCliqueID, newCliqueID)
 	}
+	m.setTopologyVerificationLost(false)
 
 	if m.config.flags.gpuCliqueLabelEnabled {
 		if err := m.SetGPUCliqueLabel(ctx); err != nil {
