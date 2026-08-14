@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
   annotations:
-    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCMarkerAnnotations" . | nindent 4 }}
 rules:
 # This is installation identity data, not an RBAC grant: the synthetic API
 # group does not exist. Keeping the canary namespaces in a typed list lets the

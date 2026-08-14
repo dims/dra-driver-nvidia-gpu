@@ -223,7 +223,7 @@ policies to a second release or control namespace.
 {{- printf "system:serviceaccount:%s:%s-kubeletplugin" (include "dra-driver-nvidia-gpu.namespace" . | trim) (include "dra-driver-nvidia-gpu.serviceAccountName" . | trim) -}}
 {{- end -}}
 
-{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" -}}
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCMarkerAnnotations" -}}
 helm.sh/resource-policy: keep
 meta.helm.sh/release-name: {{ .Release.Name | quote }}
 meta.helm.sh/release-namespace: {{ .Release.Namespace | quote }}
@@ -251,6 +251,16 @@ resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-role: {{ in
 resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceBindingName" . | quote }}
 resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceRoleName" . | quote }}
 resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceBindingName" . | quote }}
+{{- end -}}
+
+{{/*
+Safety policies and bindings are deliberately release-neutral objects. Helm's
+live install adds its ownership metadata after the admission-first bootstrap;
+an offline render must not contain metadata with which another release could
+claim those retained objects.
+*/}}
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" -}}
+helm.sh/resource-policy: keep
 {{- end -}}
 
 {{- define "dra-driver-nvidia-gpu.controllerOwnedCDCObjectIdentity" -}}

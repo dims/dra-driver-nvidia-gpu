@@ -113,8 +113,10 @@ helm template nvidia-dra-driver-gpu \
     > controller-owned-admission.yaml
 kubectl apply -f controller-owned-admission.yaml
 
-# The rendered objects carry this release's Helm ownership metadata. The
-# later ordinary Helm upgrade adopts them without --take-ownership.
+# The immutable marker carries this release's Helm ownership metadata. The
+# policies and bindings intentionally do not: use Helm v3.17 or newer and pass
+# --take-ownership on the first live install/upgrade after this bootstrap so
+# Helm adopts those pre-applied, release-neutral safety objects.
 
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquesnapshots.yaml"
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquereservations.yaml"
@@ -201,14 +203,18 @@ the protected roles. The marker carries the canary namespace allowlist as
 parameters for every safety policy. `helm install`/`helm upgrade` uses a live
 lookup and rejects a different release or namespace before rendering
 namespaced resources. The installation policy denies identity changes or
-deletion of the ClusterRole marker, and the controller checks the recorded
-identity at startup. Client-only `helm template` cannot perform a live lookup.
+deletion of the ClusterRole marker. The controller checks the recorded identity
+at startup. Client-only `helm template` cannot perform a live lookup.
 Do not use `helm template | kubectl apply` to install or upgrade the chart:
 multi-document apply is not transactional. The retained RBAC-binding policy
 prevents an offline second render from transferring the protected controller or
-kubelet ClusterRoles and the protected namespaced Roles/RoleBindings. It may
-still leave unprivileged partial objects. Use live
-`helm upgrade --atomic` for the chart after the admission-first bootstrap.
+kubelet ClusterRoles and the protected namespaced Roles/RoleBindings. The
+policies and bindings omit release-specific Helm ownership annotations from
+offline renders, so the second render also cannot take ownership of the
+retained admission boundary. It may still leave unprivileged partial objects.
+Use live `helm upgrade --atomic --take-ownership` for the first chart operation
+after the admission-first bootstrap; later in-place upgrades may omit
+`--take-ownership`.
 
 Before enabling `admissionEnabled` on brownfield, inventory and remove every
 other driver release, controller/kubelet workload, and associated RBAC. The
