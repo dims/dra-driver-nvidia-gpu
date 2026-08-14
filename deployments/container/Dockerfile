@@ -36,6 +36,11 @@ ENV GOPROXY=$GOPROXY
 # Override at build time: --build-arg GO_MOD=mod when using deployments/container/Makefile
 ARG GO_MOD=vendor
 
+# Optional Go build tags. Release builds leave this empty. The
+# controllerownedcdctest tag is reserved for deliberately non-production e2e
+# images and compiles a persistent synthetic GPU clique provider.
+ARG GO_BUILD_TAGS=""
+
 # BUILDARCH, TARGETARCH (and others) are defined in the global scope by
 # BuiltKit. BUILDARCH is the architecture of the build platform. TARGETARCH is
 # set via the --platform arg provided to the `docker buildx build ...` command.
@@ -91,7 +96,7 @@ RUN mkdir /artifacts
 RUN --mount=type=cache,target=/mc/go/build-cache,id=gocache \
     --mount=type=cache,target=/mc/go/pkg/mod,id=gomodcache \
     case "$TARGETARCH" in "$BUILDARCH") cc=gcc;; arm64) cc=aarch64-linux-gnu-gcc;; amd64) cc=x86_64-linux-gnu-gcc;; esac && \
-    time make CC=${cc} GOARCH=${TARGETARCH} GO_MOD=${GO_MOD} PREFIX=/artifacts cmds
+    time make CC=${cc} GOARCH=${TARGETARCH} GO_MOD=${GO_MOD} GO_BUILD_TAGS=${GO_BUILD_TAGS} PREFIX=/artifacts cmds
 
 # Static bash binary, sourced from the Debian 'bash-static' package on
 # trixie. Replaces a from-source build that was flaky in CI (autoconf

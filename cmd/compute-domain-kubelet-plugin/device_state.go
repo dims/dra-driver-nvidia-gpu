@@ -111,7 +111,8 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		return nil, fmt.Errorf("unable to create CDI handler: %w", err)
 	}
 
-	computeDomainManager, err := NewComputeDomainManager(config, nvdevlib.getCliqueID)
+	getCliqueID := gpuCliqueIDProvider(config, nvdevlib.getCliqueID)
+	computeDomainManager, err := NewComputeDomainManager(config, getCliqueID)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create computedomain manager: %v", err)
 	}

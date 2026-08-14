@@ -47,6 +47,8 @@ else
 CLI_VERSION = $(VERSION)
 endif
 CLI_VERSION_PACKAGE = $(MODULE)/internal/info
+GO_BUILD_TAGS ?=
+GO_BUILD_OPTIONS = $(if $(strip $(GO_BUILD_TAGS)),-tags=$(GO_BUILD_TAGS))
 
 binaries: cmds
 ifneq ($(PREFIX),)
@@ -56,10 +58,10 @@ cmds: $(CMD_TARGETS)
 $(CMD_TARGETS): cmd-%:
 	CGO_LDFLAGS_ALLOW='-Wl,--unresolved-symbols=ignore-in-object-files' \
 		CC=$(CC) CGO_ENABLED=1 GOOS=$(GOOS) GOARCH=$(GOARCH) \
-		go build -ldflags "-s -w -X $(CLI_VERSION_PACKAGE).gitCommit=$(GIT_COMMIT) -X $(CLI_VERSION_PACKAGE).version=$(CLI_VERSION)" $(COMMAND_BUILD_OPTIONS) $(MODULE)/cmd/$(*)
+		go build $(GO_BUILD_OPTIONS) -ldflags "-s -w -X $(CLI_VERSION_PACKAGE).gitCommit=$(GIT_COMMIT) -X $(CLI_VERSION_PACKAGE).version=$(CLI_VERSION)" $(COMMAND_BUILD_OPTIONS) $(MODULE)/cmd/$(*)
 
 build:
-	CC=$(CC) GOOS=$(GOOS) GOARCH=$(GOARCH) go build ./...
+	CC=$(CC) GOOS=$(GOOS) GOARCH=$(GOARCH) go build $(GO_BUILD_OPTIONS) ./...
 
 clean:
 	@for cmd in $(CMDS); do \
@@ -266,6 +268,12 @@ e2e-gcp-nvkind:
 .PHONY: test-controller-owned-cdc-admission
 test-controller-owned-cdc-admission:
 	bash hack/ci/controller-owned-cdc-admission-test.sh
+
+# Compile and test the deliberately non-production topology provider used by
+# controller-owned CDC e2e environments without an NVSwitch fabric.
+.PHONY: test-controller-owned-cdc-topology-provider
+test-controller-owned-cdc-topology-provider:
+	go test -mod=vendor -tags=controllerownedcdctest ./cmd/compute-domain-kubelet-plugin
 
 # Run the Go/Ginkgo e2e suite against the current kubectl context. Assumes
 # the cluster already has GPU Operator (minimal mode) + the DRA driver

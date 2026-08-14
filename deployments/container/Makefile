@@ -88,6 +88,9 @@ endif
 GOPROXY ?= https://proxy.golang.org,direct
 # Go module mode passed to the Dockerfile as -mod=<value>. vendor (default) or mod.
 GO_MOD ?= vendor
+# Optional build tags for deliberately non-production test images. Release
+# builds must leave this empty.
+GO_BUILD_TAGS ?=
 
 build:
 	mkdir -p $(DIST_DIR)
@@ -104,6 +107,7 @@ build:
 		--build-arg GOMODCACHE="$(GOMODCACHE)" \
 		--build-arg GOPROXY="$(GOPROXY)" \
 		--build-arg GO_MOD="$(GO_MOD)" \
+		--build-arg GO_BUILD_TAGS="$(GO_BUILD_TAGS)" \
 		--progress=plain \
 		-f $(DOCKERFILE) \
 		$(CURDIR)
