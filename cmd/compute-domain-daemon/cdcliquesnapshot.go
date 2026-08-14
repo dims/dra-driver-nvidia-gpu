@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
@@ -41,17 +42,25 @@ import (
 // has been started or restarted. Keeping these in one event prevents a consumer
 // from acknowledging a different snapshot than the one it just applied.
 type ControllerSnapshotDesiredState struct {
-	Members []*nvapi.ComputeDomainDaemonInfo
-	Receipt *nvapi.ComputeDomainCliqueSnapshotReceipt
+	Members           []*nvapi.ComputeDomainDaemonInfo
+	Receipt           *nvapi.ComputeDomainCliqueSnapshotReceipt
+	RetirementReceipt *nvapi.ComputeDomainCliqueRetirementReceipt
 }
 
 type controllerSnapshotIdentity struct {
 	uid        types.UID
 	generation int64
 	hash       string
+	retiring   bool
 }
 
 func (s *ControllerSnapshotDesiredState) identity() controllerSnapshotIdentity {
+	if s.RetirementReceipt != nil {
+		return controllerSnapshotIdentity{
+			uid: s.RetirementReceipt.SnapshotUID, generation: s.RetirementReceipt.SnapshotGeneration,
+			hash: s.RetirementReceipt.SnapshotHash, retiring: true,
+		}
+	}
 	return controllerSnapshotIdentity{
 		uid:        s.Receipt.SnapshotUID,
 		generation: s.Receipt.SnapshotGeneration,
@@ -75,20 +84,29 @@ type ComputeDomainCliqueSnapshotManager struct {
 	currentHash        string
 	desired            controllerSnapshotIdentity
 	applied            controllerSnapshotIdentity
+	retired            controllerSnapshotIdentity
+	retirementStarted  bool
 	desiredStateChan   chan *ControllerSnapshotDesiredState
 }
 
 func NewComputeDomainCliqueSnapshotManager(config *ManagerConfig) *ComputeDomainCliqueSnapshotManager {
-	digest := sha256.Sum256([]byte(config.cliqueID))
-	name := fmt.Sprintf("%s.%s", config.computeDomainUUID, hex.EncodeToString(digest[:8]))
-	factory := nvinformers.NewSharedInformerFactoryWithOptions(
-		config.clientsets.Nvidia,
-		informerResyncPeriod,
-		nvinformers.WithNamespace(config.podNamespace),
-		nvinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+	options := []nvinformers.SharedInformerOption{nvinformers.WithNamespace(config.podNamespace)}
+	if config.cliqueID != "" {
+		digest := sha256.Sum256([]byte(config.cliqueID))
+		name := fmt.Sprintf("%s.%s", config.computeDomainUUID, hex.EncodeToString(digest[:8]))
+		options = append(options, nvinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
 			options.FieldSelector = "metadata.name=" + name
-		}),
-	)
+		}))
+	} else {
+		// The no-clique path exists only so an exact daemon from a previously
+		// published stream can acknowledge Retiring after local topology loss.
+		// Scope that exceptional reader to its immutable ComputeDomain rather
+		// than making it watch every snapshot in the driver namespace.
+		options = append(options, nvinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = computeDomainLabelKey + "=" + config.computeDomainUUID
+		}))
+	}
+	factory := nvinformers.NewSharedInformerFactoryWithOptions(config.clientsets.Nvidia, informerResyncPeriod, options...)
 	return &ComputeDomainCliqueSnapshotManager{
 		config:           config,
 		factory:          factory,
@@ -145,6 +163,51 @@ func (m *ComputeDomainCliqueSnapshotManager) MarkApplied(state *ControllerSnapsh
 	}
 }
 
+func (m *ComputeDomainCliqueSnapshotManager) MarkRetired(state *ControllerSnapshotDesiredState) {
+	if state == nil || state.RetirementReceipt == nil {
+		return
+	}
+	identity := state.identity()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if identity == m.desired {
+		m.retired = identity
+	}
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) PublishRetirementReceipt(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+	if state == nil || state.RetirementReceipt == nil {
+		return fmt.Errorf("retirement receipt is missing")
+	}
+	encoded, err := json.Marshal(state.RetirementReceipt)
+	if err != nil {
+		return err
+	}
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		pod, err := m.config.clientsets.Core.CoreV1().Pods(m.config.podNamespace).Get(ctx, m.config.podName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if string(pod.UID) != m.config.podUID || pod.UID != state.RetirementReceipt.PodUID {
+			return fmt.Errorf("live Pod UID %q does not match retirement identity %q", pod.UID, state.RetirementReceipt.PodUID)
+		}
+		existing := pod.Annotations[nvapi.ComputeDomainCliqueRetirementReceiptAnnotation]
+		if existing == string(encoded) {
+			return nil
+		}
+		if existing != "" {
+			return fmt.Errorf("Pod already has a different immutable retirement receipt")
+		}
+		updated := pod.DeepCopy()
+		if updated.Annotations == nil {
+			updated.Annotations = map[string]string{}
+		}
+		updated.Annotations[nvapi.ComputeDomainCliqueRetirementReceiptAnnotation] = string(encoded)
+		_, err = m.config.clientsets.Core.CoreV1().Pods(m.config.podNamespace).Update(ctx, updated, metav1.UpdateOptions{})
+		return err
+	})
+}
+
 func (m *ComputeDomainCliqueSnapshotManager) enqueue(obj any) {
 	snapshot, ok := obj.(*nvapi.ComputeDomainCliqueSnapshot)
 	if !ok {
@@ -167,7 +230,7 @@ func (m *ComputeDomainCliqueSnapshotManager) consume(snapshot *nvapi.ComputeDoma
 	if err := m.acceptIdentityLocked(identity); err != nil {
 		return err
 	}
-	if identity == m.applied || identity == m.desired {
+	if identity == m.applied || identity == m.retired || identity == m.desired {
 		return nil
 	}
 	m.desired = identity
@@ -185,6 +248,12 @@ func (m *ComputeDomainCliqueSnapshotManager) consume(snapshot *nvapi.ComputeDoma
 }
 
 func (m *ComputeDomainCliqueSnapshotManager) acceptIdentityLocked(identity controllerSnapshotIdentity) error {
+	if m.retirementStarted && !identity.retiring {
+		return fmt.Errorf("snapshot returned to active after retirement started")
+	}
+	if identity.retiring {
+		m.retirementStarted = true
+	}
 	if m.currentSnapshotUID == "" {
 		m.currentSnapshotUID = identity.uid
 		m.currentGeneration = identity.generation
@@ -204,9 +273,10 @@ func (m *ComputeDomainCliqueSnapshotManager) acceptIdentityLocked(identity contr
 	}
 	// A new Kubernetes object UID is a new allocation stream, not evidence
 	// that the IMEX child authorized by the old object stopped using its slot.
-	// Strict controller-v1 has no per-member fence verifier yet, so a running
-	// daemon never crosses this boundary in place. Recovery drains/recreates
-	// the daemon Pod after a verified whole-clique reset.
+	// Normal whole-ComputeDomain deletion now has an exact retirement verifier,
+	// but that transition terminates this daemon Pod; an in-place running daemon
+	// still never crosses object UIDs. Ambiguous recovery requires a verified
+	// whole-clique reset or a future per-member handoff verifier.
 	return fmt.Errorf("snapshot object UID changed from %q to %q without verified handoff", m.currentSnapshotUID, identity.uid)
 }
 
@@ -225,9 +295,14 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 	}
 	if snapshot.Spec.ComputeDomainUID != types.UID(m.config.computeDomainUUID) ||
 		snapshot.Spec.ComputeDomainName != m.config.computeDomainName ||
-		snapshot.Spec.ComputeDomainNamespace != m.config.computeDomainNamespace ||
-		snapshot.Spec.CliqueID != m.config.cliqueID {
+		snapshot.Spec.ComputeDomainNamespace != m.config.computeDomainNamespace {
 		return nil, fmt.Errorf("snapshot scope does not match this daemon")
+	}
+	if m.config.cliqueID != "" && snapshot.Spec.CliqueID != m.config.cliqueID {
+		return nil, fmt.Errorf("snapshot scope does not match this daemon")
+	}
+	if m.config.cliqueID == "" && snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseRetiring && snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseFenced {
+		return nil, fmt.Errorf("daemon without a discovered clique may consume only retirement state")
 	}
 	if snapshot.Spec.Capacity != m.config.maxNodesPerIMEXDomain {
 		return nil, fmt.Errorf("snapshot capacity %d does not match daemon capacity %d", snapshot.Spec.Capacity, m.config.maxNodesPerIMEXDomain)
@@ -240,10 +315,10 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 		controller.Name != snapshot.Spec.DaemonSetName || controller.UID != snapshot.Spec.DaemonSetUID {
 		return nil, fmt.Errorf("snapshot controller owner does not match its DaemonSet scope")
 	}
-	if snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhasePending {
+	if snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhasePending || snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhaseFenced {
 		return nil, nil
 	}
-	if snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseActive {
+	if snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseActive && snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseRetiring {
 		return nil, fmt.Errorf("snapshot has invalid phase %q", snapshot.Status.Phase)
 	}
 	if snapshot.Status.Generation <= 0 {
@@ -374,7 +449,7 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 		return nil, fmt.Errorf("active snapshot does not authorize this exact Pod IP")
 	}
 
-	return &ControllerSnapshotDesiredState{
+	state := &ControllerSnapshotDesiredState{
 		Members: daemons,
 		Receipt: &nvapi.ComputeDomainCliqueSnapshotReceipt{
 			ComputeDomainUID:   snapshot.Spec.ComputeDomainUID,
@@ -385,7 +460,17 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 			PodUID:             self.PodUID,
 			Index:              self.Index,
 		},
-	}, nil
+	}
+	if snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhaseRetiring {
+		state.Members = nil
+		state.Receipt = nil
+		state.RetirementReceipt = &nvapi.ComputeDomainCliqueRetirementReceipt{
+			ComputeDomainUID: snapshot.Spec.ComputeDomainUID, SnapshotUID: snapshot.UID,
+			SnapshotGeneration: snapshot.Status.Generation, SnapshotHash: snapshot.Status.Hash,
+			NodeUID: self.NodeUID, PodUID: self.PodUID, Index: self.Index,
+		}
+	}
+	return state, nil
 }
 
 func canonicalSnapshotHash(members []nvapi.ComputeDomainCliqueMember) (string, error) {

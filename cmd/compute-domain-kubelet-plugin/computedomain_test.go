@@ -258,6 +258,18 @@ func TestControllerOwnedReadinessUsesExactCachedIdentityAndReceipt(t *testing.T)
 
 }
 
+func TestControllerOwnedReadinessLiveDeletionBarrier(t *testing.T) {
+	manager, cd, _, _ := readyControllerOwnedManager(t)
+	deleting := cd.DeepCopy()
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	_, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(cd.Namespace).Update(context.Background(), deleting, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	err = manager.AssertComputeDomainReady(context.Background(), string(cd.UID), nvapi.ComputeDomainCliqueProtocolControllerV1)
+	require.ErrorContains(t, err, "ComputeDomain is deleting")
+}
+
 func TestComputeDomainReadyRejectsProtocolMismatchBeforeSelectingPath(t *testing.T) {
 	manager, cd, _, _ := readyControllerOwnedManager(t)
 
@@ -312,10 +324,6 @@ func newTestComputeDomainManager(t *testing.T, nvidiaClient *nvfake.Clientset, c
 
 func readyControllerOwnedManager(t *testing.T) (*ComputeDomainManager, *nvapi.ComputeDomain, *nvapi.ComputeDomainCliqueSnapshot, *corev1.Pod) {
 	t.Helper()
-	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(), &recordingCoreClient{}, "clique-a")
-	manager.snapshotAPIAvailable = true
-	require.NoError(t, manager.informer.AddIndexers(cacheIndexersForComputeDomainUID()))
-
 	cd := &nvapi.ComputeDomain{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "domain",
@@ -326,6 +334,9 @@ func readyControllerOwnedManager(t *testing.T) (*ComputeDomainManager, *nvapi.Co
 			},
 		},
 	}
+	manager := newTestComputeDomainManager(t, nvfake.NewSimpleClientset(cd.DeepCopy()), &recordingCoreClient{}, "clique-a")
+	manager.snapshotAPIAvailable = true
+	require.NoError(t, manager.informer.AddIndexers(cacheIndexersForComputeDomainUID()))
 	require.NoError(t, manager.informer.GetIndexer().Add(cd))
 
 	digest := sha256.Sum256([]byte(manager.CliqueID()))

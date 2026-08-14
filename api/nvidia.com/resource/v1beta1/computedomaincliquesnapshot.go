@@ -22,8 +22,10 @@ import (
 )
 
 const (
-	ComputeDomainCliqueSnapshotPhasePending = "Pending"
-	ComputeDomainCliqueSnapshotPhaseActive  = "Active"
+	ComputeDomainCliqueSnapshotPhasePending  = "Pending"
+	ComputeDomainCliqueSnapshotPhaseActive   = "Active"
+	ComputeDomainCliqueSnapshotPhaseRetiring = "Retiring"
+	ComputeDomainCliqueSnapshotPhaseFenced   = "Fenced"
 
 	ComputeDomainCliqueAssignmentStateBound       = "Bound"
 	ComputeDomainCliqueAssignmentStateQuarantined = "Quarantined"
@@ -31,10 +33,16 @@ const (
 
 	// ComputeDomainCliqueSnapshotFinalizer deliberately keeps an allocation
 	// tombstone after its DaemonSet and ComputeDomain are gone. The controller
-	// has no Kubernetes-only proof that an old IMEX process can no longer use a
-	// published index, so it must not make that index look reusable merely
-	// because API objects disappeared.
+	// may remove it only after the exact published daemons have supplied the
+	// evidence required by the retirement protocol; API object disappearance is
+	// never sufficient evidence by itself.
 	ComputeDomainCliqueSnapshotFinalizer = "resource.nvidia.com/imex-index-fence"
+
+	// ComputeDomainCliqueRetirementReceiptAnnotation is written once by an
+	// exact, Pod-bound controller-v1 daemon after its supervised IMEX child has
+	// exited and been reaped. The controller validates every published member's
+	// receipt before it marks the whole snapshot Fenced.
+	ComputeDomainCliqueRetirementReceiptAnnotation = "resource.nvidia.com/computeDomainCliqueRetirementReceipt"
 )
 
 // +genclient
@@ -49,8 +57,11 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.members) || self.status.members.all(m, m.index < self.spec.capacity)",message="member indices must be below snapshot capacity"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.assignments) || self.status.assignments.map(a, a.index).size() == self.status.assignments.size()",message="assignment indices must be unique"
 // +kubebuilder:validation:XValidation:rule="!has(self.status) || (!has(self.status.members) ? self.status.memberCount == 0 : self.status.memberCount == self.status.members.size())",message="memberCount must equal the member list size"
-// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.phase) || self.status.phase != 'Active' || (self.status.memberCount > 0 && self.status.hash.size() == 64)",message="Active snapshots require members and a SHA-256 hash"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.phase) || !(self.status.phase in ['Active', 'Retiring', 'Fenced']) || (self.status.memberCount > 0 && self.status.hash.size() == 64)",message="published and retiring snapshots require members and a SHA-256 hash"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(self.status) || self.status.generation >= oldSelf.status.generation",message="snapshot generation may not decrease"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.phase) || oldSelf.status.phase == self.status.phase || (oldSelf.status.phase == 'Pending' && self.status.phase == 'Active') || (oldSelf.status.phase == 'Active' && self.status.phase == 'Retiring') || (oldSelf.status.phase == 'Retiring' && self.status.phase == 'Fenced')",message="snapshot phase transition is invalid"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.phase) || !(oldSelf.status.phase in ['Active', 'Retiring']) || !(self.status.phase in ['Retiring', 'Fenced']) || (self.status.generation == oldSelf.status.generation && self.status.hash == oldSelf.status.hash && self.status.members == oldSelf.status.members && self.status.memberCount == oldSelf.status.memberCount)",message="retirement may not change the published generation, hash, or member set"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.phase) || self.status.phase != 'Fenced' || self.status.assignments.all(a, !a.everPublished || a.state == 'Fenced')",message="Fenced snapshots require every published assignment to be Fenced"
 
 // ComputeDomainCliqueSnapshot is the controller-owned allocation and current
 // membership snapshot for one hardware clique in one ComputeDomain. Daemons
@@ -99,7 +110,7 @@ type ComputeDomainCliqueSnapshotSpec struct {
 }
 
 type ComputeDomainCliqueSnapshotStatus struct {
-	// +kubebuilder:validation:Enum=Pending;Active
+	// +kubebuilder:validation:Enum=Pending;Active;Retiring;Fenced
 	Phase string `json:"phase,omitempty"`
 	// Generation increases only when the semantic active membership changes.
 	// +kubebuilder:validation:Minimum=0
@@ -171,6 +182,21 @@ type ComputeDomainCliqueMember struct {
 // process READY. The kubelet plugin checks the receipt
 // together with PodReady before releasing a workload.
 type ComputeDomainCliqueSnapshotReceipt struct {
+	ComputeDomainUID   types.UID `json:"computeDomainUID"`
+	SnapshotUID        types.UID `json:"snapshotUID"`
+	SnapshotGeneration int64     `json:"snapshotGeneration"`
+	SnapshotHash       string    `json:"snapshotHash"`
+	NodeUID            types.UID `json:"nodeUID"`
+	PodUID             types.UID `json:"podUID"`
+	Index              int       `json:"index"`
+}
+
+// ComputeDomainCliqueRetirementReceipt is durable process-exit evidence from
+// one exact daemon Pod. It is published only after the daemon has stopped and
+// reaped the IMEX child authorized by the referenced snapshot. Receipt
+// absence, Pod disappearance, timeout, and a new Pod UID are not equivalent
+// evidence.
+type ComputeDomainCliqueRetirementReceipt struct {
 	ComputeDomainUID   types.UID `json:"computeDomainUID"`
 	SnapshotUID        types.UID `json:"snapshotUID"`
 	SnapshotGeneration int64     `json:"snapshotGeneration"`

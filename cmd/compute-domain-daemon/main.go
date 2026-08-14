@@ -264,16 +264,20 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		}
 	}
 
-	// When cliqueID is empty, skip starting the controller and IMEX daemon management entirely.
-	// The compute-domain-controller will watch this pod's label and sync its node info to the
-	// ComputeDomain status. There's no clique to manage, no DNS indices to determine, and no
-	// IMEX daemon to run.
-	if flags.cliqueID == "" {
+	// A controller-v1 daemon must keep its exact snapshot reader alive even when
+	// local hardware discovery reports no clique. It will reject Active
+	// membership because its scope is empty and will never start IMEX, but it can
+	// still observe Retiring and attest the already-stopped state. Legacy mode
+	// retains the historical no-clique idle path.
+	if flags.cliqueID == "" && protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 {
 		klog.Infof("no cliqueID: skipping controller and IMEX daemon management")
 		// Just wait for shutdown signal
 		<-ctx.Done()
 		klog.Infof("Exiting")
 		return nil
+	}
+	if flags.cliqueID == "" {
+		klog.Infof("no cliqueID: starting controller-v1 retirement-capable snapshot reader with IMEX disabled")
 	}
 
 	config := &ControllerConfig{
@@ -313,6 +317,17 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	// Prepare IMEX daemon process manager.
 	daemonCommandLine := []string{imexDaemonBinaryName, "-c", imexDaemonConfigPath}
 	processManager := NewProcessManager(daemonCommandLine)
+	processCtx, stopProcess := context.WithCancel(ctx)
+	processDone := make(chan struct{})
+	var retireProcessOnce sync.Once
+	var retireProcessErr error
+	retireProcess := func() error {
+		retireProcessOnce.Do(func() {
+			stopProcess()
+			<-processDone
+		})
+		return retireProcessErr
+	}
 
 	// Prepare controller with CD manager (not invoking the controller yet).
 	controller, err := NewController(config)
@@ -340,7 +355,7 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		defer wg.Done()
 		switch {
 		case protocol == nvapi.ComputeDomainCliqueProtocolControllerV1:
-			if err := IMEXDaemonUpdateLoopWithControllerSnapshot(ctx, controller, processManager, dnsNameManager); err != nil {
+			if err := IMEXDaemonUpdateLoopWithControllerSnapshot(ctx, controller, processManager, dnsNameManager, retireProcess); err != nil {
 				klog.Errorf("controller snapshot update loop failed, initiate shutdown: %s", err)
 				cancel()
 			}
@@ -366,7 +381,10 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		defer wg.Done()
 		// Watchdog restarts the IMEX daemon upon unexpected termination, and
 		// shuts it down gracefully upon our own shutdown.
-		if err := processManager.Watchdog(ctx); err != nil {
+		err := processManager.Watchdog(processCtx)
+		retireProcessErr = err
+		close(processDone)
+		if err != nil {
 			klog.Errorf("watch failed, initiate shutdown: %s", err)
 			cancel()
 		}
@@ -470,11 +488,13 @@ type controllerSnapshotApplyState struct {
 }
 
 type controllerSnapshotApplyOperations struct {
-	updateHosts  func([]*nvapi.ComputeDomainDaemonInfo) (bool, error)
-	ensureIMEX   func() (bool, error)
-	restartIMEX  func() error
-	checkIMEX    func() error
-	writeReceipt func(*nvapi.ComputeDomainCliqueSnapshotReceipt) error
+	updateHosts            func([]*nvapi.ComputeDomainDaemonInfo) (bool, error)
+	ensureIMEX             func() (bool, error)
+	restartIMEX            func() error
+	checkIMEX              func() error
+	writeReceipt           func(*nvapi.ComputeDomainCliqueSnapshotReceipt) error
+	retireIMEX             func() error
+	writeRetirementReceipt func(*ControllerSnapshotDesiredState) error
 }
 
 // IMEXDaemonUpdateLoopWithControllerSnapshot retries local installation
@@ -482,7 +502,7 @@ type controllerSnapshotApplyOperations struct {
 // the one being retried. The manager is told that a generation was applied
 // only after hosts installation, an IMEX start/restart, a READY observation,
 // and receipt persistence all succeed.
-func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller *Controller, processManager *ProcessManager, dnsNameManager *DNSNameManager) error {
+func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller *Controller, processManager *ProcessManager, dnsNameManager *DNSNameManager, retireIMEX func() error) error {
 	if dnsNameManager == nil {
 		return fmt.Errorf("controller-v1 requires DNS name-based IMEX configuration")
 	}
@@ -500,6 +520,10 @@ func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller 
 			return checkIMEXReady(checkCtx)
 		},
 		writeReceipt: writeSnapshotReceipt,
+		retireIMEX:   retireIMEX,
+		writeRetirementReceipt: func(state *ControllerSnapshotDesiredState) error {
+			return controller.PublishSnapshotRetirementReceipt(ctx, state)
+		},
 	}
 
 	var pending controllerSnapshotApplyState
@@ -524,11 +548,16 @@ func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller 
 		}
 
 		if err := applyControllerSnapshot(&pending, ops); err == nil {
-			controller.MarkSnapshotApplied(pending.desired)
+			if pending.desired.RetirementReceipt != nil {
+				controller.MarkSnapshotRetired(pending.desired)
+			} else {
+				controller.MarkSnapshotApplied(pending.desired)
+			}
 			pending.desired = nil
 			continue
 		} else {
-			klog.Errorf("failed to apply controller snapshot %s/%d: %v; retrying", pending.desired.Receipt.SnapshotUID, pending.desired.Receipt.SnapshotGeneration, err)
+			identity := pending.desired.identity()
+			klog.Errorf("failed to apply controller snapshot %s/%d: %v; retrying", identity.uid, identity.generation, err)
 		}
 
 		retry := time.NewTimer(time.Second)
@@ -544,6 +573,19 @@ func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller 
 }
 
 func applyControllerSnapshot(state *controllerSnapshotApplyState, ops controllerSnapshotApplyOperations) error {
+	if state.desired.RetirementReceipt != nil {
+		if ops.retireIMEX == nil || ops.writeRetirementReceipt == nil {
+			return fmt.Errorf("retirement operations are unavailable")
+		}
+		if err := ops.retireIMEX(); err != nil {
+			return fmt.Errorf("failed to stop and reap IMEX daemon: %w", err)
+		}
+		if err := ops.writeRetirementReceipt(state.desired); err != nil {
+			return fmt.Errorf("failed to publish process-exit retirement receipt: %w", err)
+		}
+		state.restartRequired = false
+		return nil
+	}
 	updated, err := ops.updateHosts(state.desired.Members)
 	if err != nil {
 		return fmt.Errorf("failed to update DNS name mappings: %w", err)

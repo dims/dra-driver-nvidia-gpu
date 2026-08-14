@@ -161,4 +161,19 @@ spec:
     name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
     parameterNotFoundAction: Deny
   validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-retirement-receipt-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-retirement-receipt-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
 {{- end }}

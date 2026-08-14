@@ -118,8 +118,8 @@ func (c *Controller) Run(ctx context.Context) error {
 					klog.Errorf("controller-owned API discovery preflight failed: %v", err)
 				}
 				controllerOwnedAvailable = false
-			} else if !apiResourcePresent(resources.APIResources, "computedomaincliquesnapshots/status") || !apiResourcePresent(resources.APIResources, "computedomaincliquereservations") {
-				klog.Errorf("controller-owned API discovery is missing the snapshot status subresource or physical clique reservations")
+			} else if !apiResourcePresent(resources.APIResources, "computedomaincliquesnapshots/status") || !apiResourcePresent(resources.APIResources, "computedomaincliquereservations") || !apiResourcePresent(resources.APIResources, "computedomaincliquereservations/status") {
+				klog.Errorf("controller-owned API discovery is missing the snapshot or reservation status subresource")
 				controllerOwnedAvailable = false
 			}
 		}
@@ -185,6 +185,7 @@ func (c *Controller) Run(ctx context.Context) error {
 			return fmt.Errorf("error starting controller-owned clique manager for namespace %s: %w", managerConfig.driverNamespace, err)
 		}
 		cliqueManagers = append(cliqueManagers, cliqueManager)
+		cdManager.controllerOwnedCliqueManager = cliqueManager
 	}
 
 	if err := cdManager.Start(ctx); err != nil {

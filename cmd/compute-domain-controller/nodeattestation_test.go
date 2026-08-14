@@ -176,6 +176,30 @@ func TestLiveNodeAttestationRejectsStaleClaimAfterRestart(t *testing.T) {
 	require.False(t, f.manager.liveNodeAttestationAuthorized(node), "generation zero must not trust a stale routing projection")
 }
 
+func TestPublishedSnapshotKeepsDaemonRouteAfterWorkloadDeletion(t *testing.T) {
+	f := newNodeAttestationFixture(t, "retirement-route", nvapi.ComputeDomainCliqueProtocolControllerV1)
+	require.NoError(t, f.manager.reconcileNodeAttestation(context.Background(), f.node.Name))
+	node, err := f.core.CoreV1().Nodes().Get(context.Background(), f.node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.NoError(t, f.manager.attestationNodeInformer.GetStore().Update(node.DeepCopy()))
+	require.NoError(t, f.manager.workloadPodInformer.GetStore().Delete(f.pod))
+	snapshot := &nvapi.ComputeDomainCliqueSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snapshot", Namespace: "driver"},
+		Spec:       nvapi.ComputeDomainCliqueSnapshotSpec{ComputeDomainUID: f.cd.UID},
+		Status: nvapi.ComputeDomainCliqueSnapshotStatus{
+			Phase: nvapi.ComputeDomainCliqueSnapshotPhaseActive, Generation: 1,
+			Members: []nvapi.ComputeDomainCliqueMember{{NodeUID: node.UID}},
+		},
+	}
+	require.NoError(t, f.manager.snapshotInformer.GetStore().Add(snapshot))
+
+	require.NoError(t, f.manager.reconcileNodeAttestation(context.Background(), node.Name))
+	after, err := f.core.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, string(f.cd.UID), after.Labels[computeDomainLabelKey])
+	require.True(t, validNodeAttestation(after, nvapi.ComputeDomainCliqueProtocolControllerV1))
+}
+
 func TestReservationCreateIsSerializedPerPhysicalClique(t *testing.T) {
 	f := newNodeAttestationFixture(t, "singleflight", nvapi.ComputeDomainCliqueProtocolControllerV1)
 	start := make(chan struct{})
@@ -364,8 +388,10 @@ func TestSplitWholeCliqueIsolationPublishesNeitherContender(t *testing.T) {
 
 type attestationCoreClient struct {
 	kubernetes.Interface
-	mu    sync.Mutex
-	nodes map[string]*corev1.Node
+	mu         sync.Mutex
+	nodes      map[string]*corev1.Node
+	pods       map[string]*corev1.Pod
+	podListErr error
 }
 
 func (c *attestationCoreClient) CoreV1() coretyped.CoreV1Interface {
@@ -378,6 +404,12 @@ func (c *attestationCoreClient) putNode(node *corev1.Node) {
 	c.nodes[node.Name] = node.DeepCopy()
 }
 
+func (c *attestationCoreClient) putPod(pod *corev1.Pod) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pods[podMapKey(pod.Namespace, pod.Name)] = pod.DeepCopy()
+}
+
 type attestationCoreV1 struct {
 	coretyped.CoreV1Interface
 	client *attestationCoreClient
@@ -387,9 +419,57 @@ func (c *attestationCoreV1) Nodes() coretyped.NodeInterface {
 	return &attestationNodes{client: c.client}
 }
 
+func (c *attestationCoreV1) Pods(namespace string) coretyped.PodInterface {
+	return &attestationPods{client: c.client, namespace: namespace}
+}
+
 type attestationNodes struct {
 	coretyped.NodeInterface
 	client *attestationCoreClient
+}
+
+type attestationPods struct {
+	coretyped.PodInterface
+	client    *attestationCoreClient
+	namespace string
+}
+
+func podMapKey(namespace, name string) string { return namespace + "/" + name }
+
+func (p *attestationPods) Get(_ context.Context, name string, _ metav1.GetOptions) (*corev1.Pod, error) {
+	p.client.mu.Lock()
+	defer p.client.mu.Unlock()
+	pod := p.client.pods[podMapKey(p.namespace, name)]
+	if pod == nil {
+		return nil, apierrors.NewNotFound(corev1.Resource("pods"), name)
+	}
+	return pod.DeepCopy(), nil
+}
+
+func (p *attestationPods) List(_ context.Context, _ metav1.ListOptions) (*corev1.PodList, error) {
+	p.client.mu.Lock()
+	defer p.client.mu.Unlock()
+	if p.client.podListErr != nil {
+		return nil, p.client.podListErr
+	}
+	list := &corev1.PodList{}
+	for _, pod := range p.client.pods {
+		if pod.Namespace == p.namespace {
+			list.Items = append(list.Items, *pod.DeepCopy())
+		}
+	}
+	return list, nil
+}
+
+func (p *attestationPods) Update(_ context.Context, pod *corev1.Pod, _ metav1.UpdateOptions) (*corev1.Pod, error) {
+	p.client.mu.Lock()
+	defer p.client.mu.Unlock()
+	key := podMapKey(p.namespace, pod.Name)
+	if p.client.pods[key] == nil {
+		return nil, apierrors.NewNotFound(corev1.Resource("pods"), pod.Name)
+	}
+	p.client.pods[key] = pod.DeepCopy()
+	return pod.DeepCopy(), nil
 }
 
 func (n *attestationNodes) Get(_ context.Context, name string, _ metav1.GetOptions) (*corev1.Node, error) {

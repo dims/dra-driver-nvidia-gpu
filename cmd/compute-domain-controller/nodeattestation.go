@@ -240,6 +240,38 @@ func (m *ControllerOwnedCliqueManager) reconcileNodeAttestation(ctx context.Cont
 	if err != nil {
 		return nil
 	}
+	// Once deletion begins, freeze an existing controller-v1 route and its
+	// workload identity. The route keeps the exact DaemonSet Pod alive until
+	// retirement receipts are durable; the identity lets the retirement path
+	// wait for the corresponding workload Pod to terminate. No new attestation
+	// is created for a deleting ComputeDomain.
+	if validNodeAttestation(node, nvapi.ComputeDomainCliqueProtocolControllerV1) {
+		var current computeDomainNodeAttestation
+		if json.Unmarshal([]byte(node.Annotations[computeDomainAttestationAnnotationKey]), &current) == nil {
+			objects, indexErr := m.computeDomainInformer.GetIndexer().ByIndex("uid", string(current.ComputeDomainUID))
+			if indexErr != nil {
+				return indexErr
+			}
+			if len(objects) == 1 {
+				if cd, ok := objects[0].(*nvapi.ComputeDomain); ok && cd.DeletionTimestamp != nil {
+					return nil
+				}
+			}
+			// Workload deletion may remove the claim-derived candidate before the
+			// ComputeDomain owner deletion arrives. Preserve the route while any
+			// published snapshot still names this Node: that keeps the exact daemon
+			// alive so the later retirement reconcile can stop/reap it and collect
+			// positive evidence. Absence of the workload Pod is quiescence, not a
+			// reason to destroy the only fence agent.
+			retained, indexErr := m.publishedSnapshotRetainsNode(current.ComputeDomainUID, node.UID, node.Annotations[computeDomainCliqueStartupAnnotationKey])
+			if indexErr != nil {
+				return indexErr
+			}
+			if retained {
+				return nil
+			}
+		}
+	}
 	podObjects, err := m.workloadPodInformer.GetIndexer().ByIndex(workloadPodNodeIndex, nodeName)
 	if err != nil {
 		return err
@@ -315,6 +347,37 @@ func (m *ControllerOwnedCliqueManager) reconcileNodeAttestation(ctx context.Cont
 		return err
 	}
 	return m.publishNodeAttestation(ctx, node, &winner)
+}
+
+func (m *ControllerOwnedCliqueManager) publishedSnapshotRetainsNode(cdUID, nodeUID types.UID, cliqueID string) (bool, error) {
+	// The activation write commits before the first Active snapshot status. Its
+	// in-process memo closes the short returned-object/informer lag window where
+	// a workload delete could otherwise tear down the daemon immediately after
+	// activation but before the snapshot watch observes generation one.
+	if cliqueID != "" {
+		m.reservationMu.RLock()
+		activated := m.validatedActivations[physicalCliqueReservationName(cliqueID)] != ""
+		m.reservationMu.RUnlock()
+		if activated {
+			return true, nil
+		}
+	}
+	objects, err := m.snapshotInformer.GetIndexer().ByIndex(computeDomainUIDIndex, string(cdUID))
+	if err != nil {
+		return false, err
+	}
+	for _, object := range objects {
+		snapshot, ok := object.(*nvapi.ComputeDomainCliqueSnapshot)
+		if !ok || snapshot.Status.Generation == 0 {
+			continue
+		}
+		for i := range snapshot.Status.Members {
+			if snapshot.Status.Members[i].NodeUID == nodeUID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // wholeCliqueIsolated is the explicit scheduling boundary between legacy and

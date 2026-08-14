@@ -426,6 +426,8 @@ func TestControllerOwnedCliqueExpectedSetFormationActionSequence(t *testing.T) {
 		"create:computedomaincliquereservations",
 		"create:computedomaincliquesnapshots",
 		"update:computedomaincliquesnapshots",
+		"get:computedomaincliquereservations",
+		"update:computedomaincliquereservations/status",
 		"update:computedomaincliquesnapshots/status",
 	}, fakeActionNames(h.observed))
 	snapshot = h.syncSnapshotInformer(t)
@@ -435,15 +437,15 @@ func TestControllerOwnedCliqueExpectedSetFormationActionSequence(t *testing.T) {
 	require.Len(t, snapshot.Status.Members, 2)
 
 	// Formation has exactly three snapshot mutations plus the cluster-scoped
-	// reservation Create. AlreadyExists and its validating GET are API actions,
-	// not writes.
+	// reservation Create and activation-status write. The activation identity
+	// makes a missing snapshot distinguishable from a never-published stream.
 	require.Equal(t, 3, countFakeMutations(h.observed, "computedomaincliquesnapshots"))
-	require.Equal(t, 1, countFakeMutations(h.observed, "computedomaincliquereservations"))
-	require.Len(t, h.observed, 4)
+	require.Equal(t, 2, countFakeMutations(h.observed, "computedomaincliquereservations"))
+	require.Len(t, h.observed, 6)
 
 	// A semantic no-op uses the immutable reservation cache and makes no API call.
 	writesBeforeNoop := countFakeMutations(h.observed, "computedomaincliquesnapshots") + countFakeMutations(h.observed, "computedomaincliquereservations")
 	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
 	require.Equal(t, writesBeforeNoop, countFakeMutations(h.observed, "computedomaincliquesnapshots")+countFakeMutations(h.observed, "computedomaincliquereservations"))
-	require.Empty(t, h.observed[4:])
+	require.Empty(t, h.observed[6:])
 }

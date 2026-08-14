@@ -111,6 +111,13 @@ func (m *NodeManager) Stop() error {
 // a specific CD (as identified via CD UID). It then removes that label from all
 // such nodes.
 func (m *NodeManager) RemoveComputeDomainLabels(ctx context.Context, cdUID string) error {
+	return m.RemoveComputeDomainLabelsAndAttestations(ctx, cdUID, false)
+}
+
+// RemoveComputeDomainLabelsAndAttestations clears the routing projection only
+// after controller-v1 retirement has durably fenced every published daemon.
+// Legacy callers leave the controller-only attestation key untouched.
+func (m *NodeManager) RemoveComputeDomainLabelsAndAttestations(ctx context.Context, cdUID string, removeAttestation bool) error {
 	labelSelector := &metav1.LabelSelector{
 		MatchExpressions: []metav1.LabelSelectorRequirement{
 			{
@@ -134,6 +141,9 @@ func (m *NodeManager) RemoveComputeDomainLabels(ctx context.Context, cdUID strin
 		// really have this label set. Remove it.
 		newNode := node.DeepCopy()
 		delete(newNode.Labels, computeDomainLabelKey)
+		if removeAttestation {
+			delete(newNode.Annotations, computeDomainAttestationAnnotationKey)
+		}
 		if _, err := m.config.clientsets.Core.CoreV1().Nodes().Update(ctx, newNode, metav1.UpdateOptions{}); err != nil {
 			return fmt.Errorf("error updating node %s: %w", newNode.Name, err)
 		}

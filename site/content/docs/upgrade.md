@@ -254,9 +254,21 @@ cross-protocol scheduling lock.
 
 Keep leader election and topology publication enabled while any persisted
 controller-v1 ComputeDomain exists, including after disabling the feature gate
-for new admission. Strict v1 deliberately blocks deletion/index reuse after an
-Active snapshot until the whole physical clique has been externally quiesced
-and reset; do not recreate it as legacy-v1 as a shortcut.
+for new admission. Normal deletion of a healthy controller-v1 ComputeDomain is
+evidence-bearing: first terminate its workload Pods, then delete the
+ComputeDomain. The controller retains the exact daemon Pods and Node routes,
+changes each snapshot from `Active` to `Retiring`, and waits while every daemon
+stops and reaps its supervised IMEX child and publishes an immutable exact
+receipt. It then records `Fenced`, releases the reservation, removes the
+snapshot and runtime objects, and clears the ComputeDomain finalizer. Watch
+`status.conditions[type=CliqueRetirementReady]` while deletion is in progress.
+
+Do not force-delete daemon Pods, remove Node routing labels, or strip snapshot,
+reservation, or ComputeDomain finalizers during this sequence. Pod/Node absence,
+timeout, `NotReady`, and object deletion are not fence evidence; if an exact
+daemon disappears before its receipt, deletion remains blocked and requires an
+externally verified whole-clique reset/recovery procedure. Do not recreate the
+clique as legacy-v1 as a shortcut.
 Helm rollback does not roll CRD schemas back. Existing ComputeDomains retain
 their persisted protocol; disabling the feature gate stops new controller-v1
 admission but does not stop reconciliation of active controller-v1 domains.

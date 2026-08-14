@@ -315,6 +315,8 @@ spec:
                 enum:
                 - Pending
                 - Active
+                - Retiring
+                - Fenced
                 type: string
             type: object
         required:
@@ -333,13 +335,31 @@ spec:
         - message: memberCount must equal the member list size
           rule: '!has(self.status) || (!has(self.status.members) ? self.status.memberCount
             == 0 : self.status.memberCount == self.status.members.size())'
-        - message: Active snapshots require members and a SHA-256 hash
-          rule: '!has(self.status) || !has(self.status.phase) || self.status.phase
-            != ''Active'' || (self.status.memberCount > 0 && self.status.hash.size()
-            == 64)'
+        - message: published and retiring snapshots require members and a SHA-256
+            hash
+          rule: '!has(self.status) || !has(self.status.phase) || !(self.status.phase
+            in [''Active'', ''Retiring'', ''Fenced'']) || (self.status.memberCount
+            > 0 && self.status.hash.size() == 64)'
         - message: snapshot generation may not decrease
           rule: '!has(oldSelf.status) || !has(self.status) || self.status.generation
             >= oldSelf.status.generation'
+        - message: snapshot phase transition is invalid
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.phase) || oldSelf.status.phase
+            == self.status.phase || (oldSelf.status.phase == ''Pending'' && self.status.phase
+            == ''Active'') || (oldSelf.status.phase == ''Active'' && self.status.phase
+            == ''Retiring'') || (oldSelf.status.phase == ''Retiring'' && self.status.phase
+            == ''Fenced'')'
+        - message: retirement may not change the published generation, hash, or member
+            set
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.phase) || !(oldSelf.status.phase
+            in [''Active'', ''Retiring'']) || !(self.status.phase in [''Retiring'',
+            ''Fenced'']) || (self.status.generation == oldSelf.status.generation &&
+            self.status.hash == oldSelf.status.hash && self.status.members == oldSelf.status.members
+            && self.status.memberCount == oldSelf.status.memberCount)'
+        - message: Fenced snapshots require every published assignment to be Fenced
+          rule: '!has(self.status) || !has(self.status.phase) || self.status.phase
+            != ''Fenced'' || self.status.assignments.all(a, !a.everPublished || a.state
+            == ''Fenced'')'
     served: true
     storage: true
     subresources:

@@ -30,8 +30,9 @@ spec:
           ComputeDomainCliqueReservation is the API-server-atomic ownership record for
           one physical hardware clique. Its name is derived only from cliqueID, so two
           ComputeDomains, controller workers, namespaces, or controller instances must
-          race on the same Kubernetes Create. Strict v1 never deletes a reservation:
-          Kubernetes object absence cannot prove that an old IMEX runtime is fenced.
+          race on the same Kubernetes Create. A reservation may be deleted only after
+          its status durably records either that no snapshot was ever published or
+          that every exact published daemon acknowledged supervised IMEX process exit.
         properties:
           apiVersion:
             description: |-
@@ -51,10 +52,7 @@ spec:
           metadata:
             type: object
           spec:
-            description: |-
-              ComputeDomainCliqueReservationSpec is immutable. A future verified fence
-              protocol may introduce an explicit handoff object; it must not mutate or
-              silently recycle this record.
+            description: ComputeDomainCliqueReservationSpec is immutable.
             properties:
               cliqueID:
                 minLength: 1
@@ -93,9 +91,98 @@ spec:
             x-kubernetes-validations:
             - message: physical clique reservation is immutable
               rule: self == oldSelf
+          status:
+            properties:
+              activationGeneration:
+                description: |-
+                  ActivationGeneration and ActivationHash identify the proposed first
+                  snapshot generation. The controller commits this intent before publishing
+                  that generation, so it remains as audit evidence even if the subsequent
+                  snapshot status write never commits. It is immutable if later semantic
+                  membership changes advance the snapshot generation.
+                format: int64
+                minimum: 0
+                type: integer
+              activationHash:
+                pattern: ^$|^[a-f0-9]{64}$
+                type: string
+              fencedGeneration:
+                description: |-
+                  FencedGeneration and FencedHash identify the final published generation
+                  for which every exact daemon supplied process-exit evidence.
+                format: int64
+                minimum: 0
+                type: integer
+              fencedHash:
+                pattern: ^$|^[a-f0-9]{64}$
+                type: string
+              phase:
+                description: |-
+                  Empty means reserved. The controller persists Active before snapshot
+                  generation one, and Released before DELETE.
+                enum:
+                - Active
+                - Released
+                type: string
+              releaseReason:
+                enum:
+                - NeverPublished
+                - VerifiedProcessExit
+                type: string
+              releasedAt:
+                format: date-time
+                type: string
+              snapshotUID:
+                description: |-
+                  UID is a type that holds unique ID values, including UUIDs.  Because we
+                  don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                  intent and helps make sure that UIDs and names do not get conflated.
+                type: string
+            type: object
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: reservation status may advance only from Active to Released
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.phase) || oldSelf.status.phase
+            == self.status.phase || (oldSelf.status.phase == ''Active'' && self.status.phase
+            == ''Released'')'
+        - message: Active reservation status requires a snapshot UID and exact first-activation
+            identity
+          rule: '!has(self.status) || !has(self.status.phase) || self.status.phase
+            != ''Active'' || (self.status.snapshotUID != '''' && self.status.activationGeneration
+            > 0 && self.status.activationHash.size() == 64)'
+        - message: Released reservation status requires typed release evidence and
+            timestamp
+          rule: '!has(self.status) || !has(self.status.phase) || self.status.phase
+            != ''Released'' || (has(self.status.releasedAt) && self.status.releaseReason
+            in [''NeverPublished'', ''VerifiedProcessExit''])'
+        - message: verified process-exit release requires exact activation and fenced
+            snapshot identities
+          rule: '!has(self.status) || !has(self.status.phase) || self.status.phase
+            != ''Released'' || self.status.releaseReason != ''VerifiedProcessExit''
+            || (self.status.snapshotUID != '''' && self.status.activationGeneration
+            > 0 && self.status.activationHash.size() == 64 && self.status.fencedGeneration
+            >= self.status.activationGeneration && self.status.fencedHash.size() ==
+            64)'
+        - message: never-published release may retain at most an exact pre-publication
+            activation intent and no fence evidence
+          rule: '!has(self.status) || !has(self.status.phase) || self.status.phase
+            != ''Released'' || self.status.releaseReason != ''NeverPublished'' ||
+            ((self.status.?snapshotUID.orValue('''') == '''' && self.status.?activationGeneration.orValue(0)
+            == 0 && self.status.?activationHash.orValue('''') == '''') || (self.status.?snapshotUID.orValue('''')
+            != '''' && self.status.?activationGeneration.orValue(0) > 0 && self.status.?activationHash.orValue('''').size()
+            == 64)) && self.status.?fencedGeneration.orValue(0) == 0 && self.status.?fencedHash.orValue('''')
+            == '''''
+        - message: activated snapshot identity is immutable
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.phase) || oldSelf.status.phase
+            != ''Active'' || (self.status.snapshotUID == oldSelf.status.snapshotUID
+            && self.status.activationGeneration == oldSelf.status.activationGeneration
+            && self.status.activationHash == oldSelf.status.activationHash)'
+        - message: released reservation evidence is immutable
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.phase) || oldSelf.status.phase
+            != ''Released'' || self.status == oldSelf.status'
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}

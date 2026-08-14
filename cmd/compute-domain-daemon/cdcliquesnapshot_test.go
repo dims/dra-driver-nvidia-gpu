@@ -164,6 +164,53 @@ func TestSnapshotConsumerScopesGenerationByObjectUID(t *testing.T) {
 	}
 }
 
+func TestSnapshotConsumerDeliversRetirementForExactPublishedPod(t *testing.T) {
+	m := newTestSnapshotManager()
+	active := newTestSnapshot(t)
+	require.NoError(t, m.consume(active))
+	installed := <-m.desiredStateChan
+	m.MarkApplied(installed)
+
+	retiring := active.DeepCopy()
+	retiring.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
+	require.NoError(t, m.consume(retiring))
+	desired := <-m.desiredStateChan
+	require.Nil(t, desired.Receipt)
+	require.Empty(t, desired.Members)
+	require.Equal(t, &nvapi.ComputeDomainCliqueRetirementReceipt{
+		ComputeDomainUID: types.UID("cd-uid"), SnapshotUID: types.UID("snapshot-uid"),
+		SnapshotGeneration: 7, SnapshotHash: active.Status.Hash,
+		NodeUID: types.UID("node-a-uid"), PodUID: types.UID("pod-a-uid"), Index: 0,
+	}, desired.RetirementReceipt)
+
+	m.MarkRetired(desired)
+	require.NoError(t, m.consume(retiring))
+	select {
+	case <-m.desiredStateChan:
+		t.Fatal("an already retired snapshot was delivered again")
+	default:
+	}
+}
+
+func TestSnapshotConsumerWithoutDiscoveredCliqueAcceptsOnlyExactRetirement(t *testing.T) {
+	m := newTestSnapshotManager()
+	m.config.cliqueID = ""
+	active := newTestSnapshot(t)
+	require.ErrorContains(t, m.consume(active), "only retirement state")
+	select {
+	case <-m.desiredStateChan:
+		t.Fatal("daemon without discovered topology consumed Active state")
+	default:
+	}
+
+	retiring := active.DeepCopy()
+	retiring.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
+	require.NoError(t, m.consume(retiring))
+	desired := <-m.desiredStateChan
+	require.NotNil(t, desired.RetirementReceipt)
+	require.Equal(t, types.UID("pod-a-uid"), desired.RetirementReceipt.PodUID)
+}
+
 func TestSnapshotConsumerRejectsInvalidSnapshots(t *testing.T) {
 	tests := map[string]func(*nvapi.ComputeDomainCliqueSnapshot){
 		"protocol mismatch": func(s *nvapi.ComputeDomainCliqueSnapshot) {
@@ -320,4 +367,40 @@ func TestApplyControllerSnapshotFreshProcessNeedsNoRestart(t *testing.T) {
 	require.Zero(t, restartCalls)
 	require.Equal(t, 1, checkCalls)
 	require.Equal(t, 1, receiptCalls)
+}
+
+func TestApplyControllerSnapshotRetiresBeforePublishingEvidence(t *testing.T) {
+	desired := &ControllerSnapshotDesiredState{RetirementReceipt: &nvapi.ComputeDomainCliqueRetirementReceipt{
+		SnapshotUID: types.UID("snapshot-uid"), SnapshotGeneration: 7, SnapshotHash: "hash",
+	}}
+	var order []string
+	err := applyControllerSnapshot(&controllerSnapshotApplyState{desired: desired}, controllerSnapshotApplyOperations{
+		retireIMEX: func() error {
+			order = append(order, "stopped-and-reaped")
+			return nil
+		},
+		writeRetirementReceipt: func(state *ControllerSnapshotDesiredState) error {
+			require.Same(t, desired, state)
+			order = append(order, "receipt")
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"stopped-and-reaped", "receipt"}, order)
+}
+
+func TestApplyControllerSnapshotNeverPublishesReceiptWhenStopFails(t *testing.T) {
+	desired := &ControllerSnapshotDesiredState{RetirementReceipt: &nvapi.ComputeDomainCliqueRetirementReceipt{
+		SnapshotUID: types.UID("snapshot-uid"), SnapshotGeneration: 7, SnapshotHash: "hash",
+	}}
+	receiptCalls := 0
+	err := applyControllerSnapshot(&controllerSnapshotApplyState{desired: desired}, controllerSnapshotApplyOperations{
+		retireIMEX: func() error { return errors.New("still running") },
+		writeRetirementReceipt: func(*ControllerSnapshotDesiredState) error {
+			receiptCalls++
+			return nil
+		},
+	})
+	require.ErrorContains(t, err, "stop and reap")
+	require.Zero(t, receiptCalls)
 }

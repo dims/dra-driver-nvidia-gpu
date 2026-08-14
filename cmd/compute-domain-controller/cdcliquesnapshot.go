@@ -67,6 +67,8 @@ const (
 	workloadPodUIDIndex                        = "workloadPodUID"
 	computeDomainAttestationAnnotationKey      = "resource.nvidia.com/computeDomainAttestation"
 	controllerOwnedCliqueIsolationLabelKey     = "resource.nvidia.com/controllerOwnedComputeDomain"
+	reservationActivationTrackingAnnotationKey = "resource.nvidia.com/reservationActivationTracking"
+	reservationActivationTrackingStatusV1      = "status-v1"
 	physicalCliqueIndex                        = "physicalClique"
 )
 
@@ -116,6 +118,7 @@ type ControllerOwnedCliqueManager struct {
 	pendingScopes           map[string]snapshotScope
 	reservationMu           sync.RWMutex
 	validatedReservations   map[string]nvapi.ComputeDomainCliqueReservationSpec
+	validatedActivations    map[string]types.UID
 	reservationLocksMu      sync.Mutex
 	reservationLocks        map[string]*sync.Mutex
 	liveAttestationCheck    func(*corev1.Node) bool
@@ -229,6 +232,7 @@ func NewControllerOwnedCliqueManager(config *ManagerConfig) *ControllerOwnedCliq
 		batchSignature:          make(map[string]string),
 		pendingScopes:           make(map[string]snapshotScope),
 		validatedReservations:   make(map[string]nvapi.ComputeDomainCliqueReservationSpec),
+		validatedActivations:    make(map[string]types.UID),
 		reservationLocks:        make(map[string]*sync.Mutex),
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
@@ -873,8 +877,9 @@ func physicalCliqueReservationName(cliqueID string) string {
 func (m *ControllerOwnedCliqueManager) reservePhysicalClique(ctx context.Context, owner *nvapi.ComputeDomain, cliqueID string, protocol nvapi.ComputeDomainCliqueProtocol) error {
 	reservation := &nvapi.ComputeDomainCliqueReservation{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   physicalCliqueReservationName(cliqueID),
-			Labels: map[string]string{computeDomainLabelKey: string(owner.UID)},
+			Name:        physicalCliqueReservationName(cliqueID),
+			Labels:      map[string]string{computeDomainLabelKey: string(owner.UID)},
+			Annotations: map[string]string{reservationActivationTrackingAnnotationKey: reservationActivationTrackingStatusV1},
 		},
 		Spec: nvapi.ComputeDomainCliqueReservationSpec{
 			CliqueID:               cliqueID,
@@ -944,9 +949,23 @@ func (m *ControllerOwnedCliqueManager) validateAndRememberReservation(reservatio
 		return fmt.Errorf("physical clique %q is still reserved by unfenced ComputeDomain %s/%s UID %q", expected.CliqueID, reservation.Spec.ComputeDomainNamespace, reservation.Spec.ComputeDomainName, reservation.Spec.ComputeDomainUID)
 	}
 	m.reservationMu.Lock()
+	if previous, found := m.validatedReservations[reservation.Name]; found && previous != expected {
+		// A successfully released reservation name can be reused by a new
+		// ComputeDomain in the same controller process. Never let the former
+		// stream's activation memo retain the successor's Node route before the
+		// successor has published generation one.
+		delete(m.validatedActivations, reservation.Name)
+	}
 	m.validatedReservations[reservation.Name] = reservation.Spec
 	m.reservationMu.Unlock()
 	return nil
+}
+
+func (m *ControllerOwnedCliqueManager) forgetReleasedReservation(name string) {
+	m.reservationMu.Lock()
+	delete(m.validatedReservations, name)
+	delete(m.validatedActivations, name)
+	m.reservationMu.Unlock()
 }
 
 func snapshotName(cdUID, cliqueID string) string {
@@ -1005,10 +1024,24 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 			}
 			return err
 		}
-		// An ever-published allocation is a tombstone until an external fence
-		// verifier exists. Do not remove the finalizer or recreate/reassign its
-		// slots merely because its owners are being deleted.
+		// An ever-published allocation remains a tombstone until the retirement
+		// state machine verifies exact process-exit receipts and marks it Fenced.
+		// Do not remove the finalizer merely because owners disappeared.
 		return nil
+	}
+	// Deletion retirement owns these terminal phases. Normal membership
+	// reconciliation must never turn a Retiring/Fenced snapshot back Active.
+	if snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhaseRetiring || snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhaseFenced {
+		return nil
+	}
+	if snapshot.Status.Generation > 0 {
+		ready, err := m.ensureReservationActivation(ctx, snapshot)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return nil
+		}
 	}
 	owners, err := m.computeDomainInformer.GetIndexer().ByIndex("uid", string(snapshot.Spec.ComputeDomainUID))
 	if err != nil {
@@ -1240,6 +1273,38 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 			updated.Status.Assignments[i].LastAuthorizedGeneration = updated.Status.Generation
 		}
 	}
+	if snapshot.Status.Generation == 0 && updated.Status.Generation > 0 {
+		reservationName := physicalCliqueReservationName(snapshot.Spec.CliqueID)
+		reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, reservationName, metav1.GetOptions{})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err)
+		if err != nil {
+			return fmt.Errorf("read physical clique reservation before first publication: %w", err)
+		}
+		if reservation.Spec.ComputeDomainUID != snapshot.Spec.ComputeDomainUID || reservation.Spec.CliqueID != snapshot.Spec.CliqueID {
+			return fmt.Errorf("physical clique reservation does not match first publication")
+		}
+		expectedStatus := nvapi.ComputeDomainCliqueReservationStatus{
+			Phase: nvapi.ComputeDomainCliqueReservationPhaseActive, SnapshotUID: snapshot.UID,
+			ActivationGeneration: updated.Status.Generation, ActivationHash: updated.Status.Hash,
+		}
+		if reservation.Status.Phase == "" {
+			activated := reservation.DeepCopy()
+			activated.Status = expectedStatus
+			_, err = m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().UpdateStatus(ctx, activated, metav1.UpdateOptions{})
+			observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, err)
+			if err != nil {
+				return fmt.Errorf("activate physical clique reservation before first publication: %w", err)
+			}
+		} else if reservation.Status.Phase != nvapi.ComputeDomainCliqueReservationPhaseActive ||
+			reservation.Status.SnapshotUID != snapshot.UID || reservation.Status.ActivationGeneration != updated.Status.Generation ||
+			reservation.Status.ActivationHash != updated.Status.Hash || reservation.Status.FencedGeneration != 0 ||
+			reservation.Status.FencedHash != "" || reservation.Status.ReleaseReason != "" || reservation.Status.ReleasedAt != nil {
+			return fmt.Errorf("physical clique reservation has mismatched activation status")
+		}
+		m.reservationMu.Lock()
+		m.validatedActivations[reservationName] = snapshot.UID
+		m.reservationMu.Unlock()
+	}
 	if allocationBlocked || handoffBlocked {
 		reason := "UnfencedIncumbent"
 		message := "all indices are bound or quarantined; object absence and elapsed time are not fence evidence"
@@ -1282,6 +1347,50 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		m.recordWrite(snapshot.Namespace+"/"+snapshot.Name, result.ResourceVersion)
 	}
 	return err
+}
+
+func (m *ControllerOwnedCliqueManager) ensureReservationActivation(ctx context.Context, snapshot *nvapi.ComputeDomainCliqueSnapshot) (bool, error) {
+	reservationName := physicalCliqueReservationName(snapshot.Spec.CliqueID)
+	m.reservationMu.RLock()
+	remembered := m.validatedActivations[reservationName]
+	m.reservationMu.RUnlock()
+	if remembered == snapshot.UID {
+		return true, nil
+	}
+	reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, reservationName, metav1.GetOptions{})
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err)
+	if err != nil {
+		return false, fmt.Errorf("read physical clique reservation activation: %w", err)
+	}
+	if reservation.Spec.ComputeDomainUID != snapshot.Spec.ComputeDomainUID || reservation.Spec.CliqueID != snapshot.Spec.CliqueID {
+		return false, fmt.Errorf("physical clique reservation does not match published snapshot")
+	}
+	if reservation.Status.Phase == nvapi.ComputeDomainCliqueReservationPhaseActive && reservation.Status.SnapshotUID == snapshot.UID &&
+		reservation.Status.ActivationGeneration > 0 && reservation.Status.ActivationGeneration <= snapshot.Status.Generation &&
+		len(reservation.Status.ActivationHash) == sha256.Size*2 && reservation.Status.FencedGeneration == 0 &&
+		reservation.Status.FencedHash == "" && reservation.Status.ReleaseReason == "" && reservation.Status.ReleasedAt == nil {
+		m.reservationMu.Lock()
+		m.validatedActivations[reservationName] = snapshot.UID
+		m.reservationMu.Unlock()
+		return true, nil
+	}
+	if reservation.Status.Phase != "" {
+		return false, fmt.Errorf("physical clique reservation has mismatched activation status")
+	}
+	updated := reservation.DeepCopy()
+	updated.Status = nvapi.ComputeDomainCliqueReservationStatus{
+		Phase: nvapi.ComputeDomainCliqueReservationPhaseActive, SnapshotUID: snapshot.UID,
+		ActivationGeneration: snapshot.Status.Generation, ActivationHash: snapshot.Status.Hash,
+	}
+	_, err = m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, err)
+	if err != nil {
+		return false, fmt.Errorf("backfill physical clique reservation activation: %w", err)
+	}
+	m.reservationMu.Lock()
+	m.validatedActivations[reservationName] = snapshot.UID
+	m.reservationMu.Unlock()
+	return false, nil
 }
 
 func (m *ControllerOwnedCliqueManager) nodeAttestationIsLive(node *corev1.Node) bool {

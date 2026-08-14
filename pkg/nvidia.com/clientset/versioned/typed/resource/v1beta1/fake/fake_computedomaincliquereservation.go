@@ -95,6 +95,17 @@ func (c *FakeComputeDomainCliqueReservations) Update(ctx context.Context, comput
 	return obj.(*v1beta1.ComputeDomainCliqueReservation), err
 }
 
+// UpdateStatus was generated because the type contains a Status member.
+// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
+func (c *FakeComputeDomainCliqueReservations) UpdateStatus(ctx context.Context, computeDomainCliqueReservation *v1beta1.ComputeDomainCliqueReservation, opts v1.UpdateOptions) (*v1beta1.ComputeDomainCliqueReservation, error) {
+	obj, err := c.Fake.
+		Invokes(testing.NewRootUpdateSubresourceAction(computedomaincliquereservationsResource, "status", computeDomainCliqueReservation), &v1beta1.ComputeDomainCliqueReservation{})
+	if obj == nil {
+		return nil, err
+	}
+	return obj.(*v1beta1.ComputeDomainCliqueReservation), err
+}
+
 // Delete takes name of the computeDomainCliqueReservation and deletes it. Returns an error if one occurs.
 func (c *FakeComputeDomainCliqueReservations) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
 	_, err := c.Fake.

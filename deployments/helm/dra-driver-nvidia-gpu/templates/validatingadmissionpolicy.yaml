@@ -538,12 +538,13 @@ spec:
     - apiGroups: ["resource.nvidia.com"]
       apiVersions: ["v1beta1"]
       operations: ["CREATE", "UPDATE", "DELETE"]
-      resources: ["computedomaincliquereservations"]
+      resources: ["computedomaincliquereservations", "computedomaincliquereservations/status"]
   validations:
   - expression: >-
-      request.operation != 'DELETE' && params != null && request.userInfo.username ==
-      params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-subject']
-    message: only the compute-domain controller may create reservations; strict v1 never deletes them without verified fence evidence
+      params != null && request.userInfo.username ==
+      params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-subject'] &&
+      (request.operation != 'DELETE' || oldObject.?status.phase.orValue('') == 'Released')
+    message: only the compute-domain controller may write reservations, and DELETE requires a durable Released status
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -569,4 +570,65 @@ spec:
       params != null && request.userInfo.username ==
       params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-subject']
     message: only the compute-domain controller may write controller-owned clique snapshots
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "computedomain-retirement-receipt-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["pods"]
+  matchConditions:
+  - name: readerOrRetirementReceiptChanged
+    expression: >-
+      (params != null && request.userInfo.username ==
+       'system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace']+':compute-domain-daemon-reader-service-account') ||
+      oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementReceipt'].orValue('') !=
+        object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementReceipt'].orValue('')
+  variables:
+  - name: podName
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/pod-name'][0].orValue('')
+  - name: podUID
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/pod-uid'][0].orValue('')
+  - name: key
+    expression: >-
+      'resource.nvidia.com/computeDomainCliqueRetirementReceipt'
+  - name: oldReceipt
+    expression: oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementReceipt'].orValue('')
+  - name: newReceipt
+    expression: object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementReceipt'].orValue('')
+  validations:
+  - expression: >-
+      params != null && request.userInfo.username ==
+      'system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace']+':compute-domain-daemon-reader-service-account'
+    message: only the compute-domain daemon reader may publish a retirement receipt
+  - expression: variables.podName != '' && variables.podUID != '' && object.metadata.name == variables.podName && string(object.metadata.uid) == variables.podUID
+    message: a daemon may publish retirement evidence only on the Pod bound into its service-account token
+  - expression: >-
+      object.spec == oldObject.spec && object.status == oldObject.status &&
+      object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+      object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+      object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])
+    message: a daemon retirement receipt update may not change Pod spec, status, labels, finalizers, or owners
+  - expression: >-
+      object.metadata.?annotations.orValue({}).all(k, v,
+        k == variables.key || oldObject.metadata.?annotations.orValue({})[?k].orValue('') == v) &&
+      oldObject.metadata.?annotations.orValue({}).all(k, v,
+        k == variables.key || object.metadata.?annotations.orValue({})[?k].orValue('') == v)
+    message: the daemon may change only its retirement receipt annotation
+  - expression: >-
+      variables.oldReceipt == '' || variables.oldReceipt == variables.newReceipt
+    message: a published retirement receipt is immutable
 {{- end }}

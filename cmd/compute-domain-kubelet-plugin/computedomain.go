@@ -439,7 +439,7 @@ func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdU
 		return fmt.Errorf("claim clique protocol %q does not match ComputeDomain protocol %q", protocol, persistedProtocol)
 	}
 	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
-		return m.assertCurrentNodeReadyInSnapshot(cd)
+		return m.assertCurrentNodeReadyInSnapshot(ctx, cd)
 	}
 
 	// Marker-less and explicit legacy-v1 claims retain the compatibility path.
@@ -450,8 +450,20 @@ func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdU
 	return nil
 }
 
-func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(cd *nvapi.ComputeDomain) error {
-	if cd.DeletionTimestamp != nil {
+func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(ctx context.Context, cd *nvapi.ComputeDomain) error {
+	// This quorum-backed read pairs with the controller's live workload-Pod
+	// inventory to close the destructive retirement barrier. If Prepare wins
+	// before deletion, its Pod already exists and the controller inventory sees
+	// it. If deletion wins first, this read observes the deletion timestamp and
+	// refuses release. Informer freshness alone cannot establish that ordering.
+	live, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(cd.Namespace).Get(ctx, cd.Name, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("live-read controller-owned ComputeDomain before release: %w", err)
+	}
+	if live.UID != cd.UID {
+		return fmt.Errorf("controller-owned ComputeDomain identity changed before release")
+	}
+	if live.DeletionTimestamp != nil {
 		return fmt.Errorf("controller-owned ComputeDomain is deleting")
 	}
 	cliqueID := m.CliqueID()
