@@ -115,8 +115,10 @@ kubectl apply -f controller-owned-admission.yaml
 
 # The immutable marker carries this release's Helm ownership metadata. The
 # policies and bindings intentionally do not: use Helm v3.17 or newer and pass
-# --take-ownership on the first live install/upgrade after this bootstrap so
-# Helm adopts those pre-applied, release-neutral safety objects.
+# --take-ownership on the live install/upgrade so Helm adopts every pre-applied,
+# release-neutral safety object. This is required again whenever a later chart
+# adds a new policy or binding which the release has never owned. Keeping the
+# flag on same-installation upgrades avoids having to predict that version diff.
 
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquesnapshots.yaml"
 kubectl apply -f "dra-driver-nvidia-gpu-${RELEASE_VERSION#v}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquereservations.yaml"
@@ -212,9 +214,12 @@ kubelet ClusterRoles and the protected namespaced Roles/RoleBindings. The
 policies and bindings omit release-specific Helm ownership annotations from
 offline renders, so the second render also cannot take ownership of the
 retained admission boundary. It may still leave unprivileged partial objects.
-Use live `helm upgrade --atomic --take-ownership` for the first chart operation
-after the admission-first bootstrap; later in-place upgrades may omit
-`--take-ownership`.
+Use live `helm upgrade --atomic --take-ownership` after the admission-first
+bootstrap. The flag is required for the first adoption and again whenever a
+later chart adds a release-neutral policy or binding which this release has
+never owned. Keeping it on same-installation upgrades is the simpler safe
+procedure; the immutable marker and live identity checks still reject another
+release or control namespace.
 
 Before enabling `admissionEnabled` on brownfield, inventory and remove every
 other driver release, controller/kubelet workload, and associated RBAC. The

@@ -550,7 +550,9 @@ spec:
   - expression: >-
       variables.oldIsolation == variables.newIsolation ||
       (variables.oldDomain == '' && variables.newDomain == '' &&
-       variables.oldAttestation == '' && variables.newAttestation == '')
+       variables.oldAttestation == '' && variables.newAttestation == '') ||
+      (variables.controller && variables.newDomain == '' &&
+       variables.newAttestation == '' && variables.newIsolation == '')
     message: whole-clique isolation may change only while the Node has no ComputeDomain route or attestation
 ---
 apiVersion: admissionregistration.k8s.io/v1
