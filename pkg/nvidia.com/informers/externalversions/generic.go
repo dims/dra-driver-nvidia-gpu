@@ -57,6 +57,12 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Resource().V1beta1().ComputeDomains().Informer()}, nil
 	case v1beta1.SchemeGroupVersion.WithResource("computedomaincliques"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Resource().V1beta1().ComputeDomainCliques().Informer()}, nil
+	case v1beta1.SchemeGroupVersion.WithResource("computedomaincliquereservations"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Resource().V1beta1().ComputeDomainCliqueReservations().Informer()}, nil
+	case v1beta1.SchemeGroupVersion.WithResource("computedomaincliqueretirementevidences"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Resource().V1beta1().ComputeDomainCliqueRetirementEvidences().Informer()}, nil
+	case v1beta1.SchemeGroupVersion.WithResource("computedomaincliquesnapshots"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Resource().V1beta1().ComputeDomainCliqueSnapshots().Informer()}, nil
 
 	}
 

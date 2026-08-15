@@ -261,6 +261,12 @@ image-build-and-copy-to-nodes:
 e2e-gcp-nvkind:
 	bash hack/ci/gcp-nvkind/e2e-test.sh
 
+# Run the controller-owned CDC admission contract against a disposable Kind
+# API server. This catches CEL behavior which fake clients cannot evaluate.
+.PHONY: test-controller-owned-cdc-admission
+test-controller-owned-cdc-admission:
+	bash hack/ci/controller-owned-cdc-admission-test.sh
+
 # Run the Go/Ginkgo e2e suite against the current kubectl context. Assumes
 # the cluster already has GPU Operator (minimal mode) + the DRA driver
 # installed. The -tags=e2e build tag keeps this out of `make test`.

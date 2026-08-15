@@ -1,0 +1,22 @@
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" . }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCMarkerAnnotations" . | nindent 4 }}
+rules:
+# This is installation identity data, not an RBAC grant: the synthetic API
+# group does not exist. Keeping the canary namespaces in a typed list lets the
+# protocol policy consume them through its ClusterRole parameter.
+- apiGroups: ["controller-owned-cdc.resource.nvidia.com"]
+  resources: ["canarynamespaces"]
+  resourceNames: {{ toJson .Values.controllerOwnedCDCliques.canaryNamespaces }}
+  verbs: ["get"]
+- apiGroups: ["controller-owned-cdc.resource.nvidia.com"]
+  resources: ["legacydaemonnamespaces"]
+  resourceNames: {{ splitList "," (include "dra-driver-nvidia-gpu.namespaces" .) | toJson }}
+  verbs: ["get"]
+{{- end }}

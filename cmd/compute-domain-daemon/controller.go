@@ -31,6 +31,9 @@ import (
 type DaemonInfoManager interface {
 	Start(ctx context.Context) error
 	Stop() error
+}
+
+type daemonInfoUpdateSource interface {
 	GetDaemonInfoUpdateChan() chan []*nvapi.ComputeDomainDaemonInfo
 }
 
@@ -49,6 +52,7 @@ type ManagerConfig struct {
 	podUID                 string
 	podName                string
 	podNamespace           string
+	bootID                 string
 	maxNodesPerIMEXDomain  int
 }
 
@@ -66,13 +70,16 @@ type ControllerConfig struct {
 	podUID                 string
 	podName                string
 	podNamespace           string
+	bootID                 string
 	maxNodesPerIMEXDomain  int
+	protocol               nvapi.ComputeDomainCliqueProtocol
 }
 
 // Controller manages the lifecycle of compute domain operations.
 type Controller struct {
 	daemonInfoManager DaemonInfoManager
 	workQueue         *workqueue.WorkQueue
+	snapshotManager   *ComputeDomainCliqueSnapshotManager
 }
 
 // NewController creates and initializes a new Controller instance.
@@ -93,14 +100,18 @@ func NewController(config *ControllerConfig) (*Controller, error) {
 		podUID:                 config.podUID,
 		podName:                config.podName,
 		podNamespace:           config.podNamespace,
+		bootID:                 config.bootID,
 		maxNodesPerIMEXDomain:  config.maxNodesPerIMEXDomain,
 	}
 
 	// Choose the appropriate daemon info manager based on the feature gate
 	var daemonInfoManager DaemonInfoManager
-	if featuregates.Enabled(featuregates.ComputeDomainCliques) {
+	switch {
+	case config.protocol == nvapi.ComputeDomainCliqueProtocolControllerV1:
+		daemonInfoManager = NewComputeDomainCliqueSnapshotManager(mc)
+	case featuregates.Enabled(featuregates.ComputeDomainCliques):
 		daemonInfoManager = NewComputeDomainCliqueManager(mc)
-	} else {
+	default:
 		daemonInfoManager = NewComputeDomainStatusManager(mc)
 	}
 
@@ -108,8 +119,37 @@ func NewController(config *ControllerConfig) (*Controller, error) {
 		daemonInfoManager: daemonInfoManager,
 		workQueue:         workQueue,
 	}
+	if manager, ok := daemonInfoManager.(*ComputeDomainCliqueSnapshotManager); ok {
+		controller.snapshotManager = manager
+	}
 
 	return controller, nil
+}
+
+func (c *Controller) GetSnapshotDesiredStateChan() <-chan *ControllerSnapshotDesiredState {
+	if c.snapshotManager == nil {
+		return nil
+	}
+	return c.snapshotManager.DesiredStateChan()
+}
+
+func (c *Controller) MarkSnapshotApplied(state *ControllerSnapshotDesiredState) {
+	if c.snapshotManager != nil {
+		c.snapshotManager.MarkApplied(state)
+	}
+}
+
+func (c *Controller) MarkSnapshotRetired(state *ControllerSnapshotDesiredState) {
+	if c.snapshotManager != nil {
+		c.snapshotManager.MarkRetired(state)
+	}
+}
+
+func (c *Controller) PublishSnapshotRetirementEvidence(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+	if c.snapshotManager == nil {
+		return fmt.Errorf("controller-v1 snapshot manager is unavailable")
+	}
+	return c.snapshotManager.PublishRetirementEvidence(ctx, state)
 }
 
 // Run starts the controller's main loop and manages the lifecycle of its components.
@@ -135,5 +175,9 @@ func (c *Controller) Run(ctx context.Context) error {
 // currently present in the CD status or CDClique. This is only a complete set of
 // daemons (size `numNodes`) if IMEXDaemonsWithDNSNames=false.
 func (c *Controller) GetDaemonInfoUpdateChan() chan []*nvapi.ComputeDomainDaemonInfo {
-	return c.daemonInfoManager.GetDaemonInfoUpdateChan()
+	source, ok := c.daemonInfoManager.(daemonInfoUpdateSource)
+	if !ok {
+		return nil
+	}
+	return source.GetDaemonInfoUpdateChan()
 }

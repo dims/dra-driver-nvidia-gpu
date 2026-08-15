@@ -33,3 +33,23 @@ type ComputeDomainCliqueListerExpansion interface{}
 // ComputeDomainCliqueNamespaceListerExpansion allows custom methods to be added to
 // ComputeDomainCliqueNamespaceLister.
 type ComputeDomainCliqueNamespaceListerExpansion interface{}
+
+// ComputeDomainCliqueReservationListerExpansion allows custom methods to be added to
+// ComputeDomainCliqueReservationLister.
+type ComputeDomainCliqueReservationListerExpansion interface{}
+
+// ComputeDomainCliqueRetirementEvidenceListerExpansion allows custom methods to be added to
+// ComputeDomainCliqueRetirementEvidenceLister.
+type ComputeDomainCliqueRetirementEvidenceListerExpansion interface{}
+
+// ComputeDomainCliqueRetirementEvidenceNamespaceListerExpansion allows custom methods to be added to
+// ComputeDomainCliqueRetirementEvidenceNamespaceLister.
+type ComputeDomainCliqueRetirementEvidenceNamespaceListerExpansion interface{}
+
+// ComputeDomainCliqueSnapshotListerExpansion allows custom methods to be added to
+// ComputeDomainCliqueSnapshotLister.
+type ComputeDomainCliqueSnapshotListerExpansion interface{}
+
+// ComputeDomainCliqueSnapshotNamespaceListerExpansion allows custom methods to be added to
+// ComputeDomainCliqueSnapshotNamespaceLister.
+type ComputeDomainCliqueSnapshotNamespaceListerExpansion interface{}

@@ -28,6 +28,7 @@ import (
 	"sync"
 	"syscall"
 	"text/template"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +38,7 @@ import (
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/common"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/bootid"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	pkgflags "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
 )
@@ -61,6 +63,7 @@ type Flags struct {
 	podName                string
 	podNamespace           string
 	maxNodesPerIMEXDomain  int
+	protocol               string
 	httpEndpoint           string
 	metricsPath            string
 	klogVerbosity          int
@@ -163,6 +166,13 @@ func newApp() *cli.App {
 			EnvVars:     []string{"MAX_NODES_PER_IMEX_DOMAIN"},
 			Destination: &flags.maxNodesPerIMEXDomain,
 		},
+		&cli.StringFlag{
+			Name:        "cdc-protocol",
+			Usage:       "Immutable clique ownership protocol for this daemon.",
+			Value:       string(nvapi.ComputeDomainCliqueProtocolLegacyV1),
+			EnvVars:     []string{"CDC_PROTOCOL"},
+			Destination: &flags.protocol,
+		},
 	}
 	cliFlags = append(cliFlags, featureGateConfig.Flags()...)
 	cliFlags = append(cliFlags, loggingConfig.Flags()...)
@@ -224,6 +234,20 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	if err := featuregates.ValidateFeatureGates(); err != nil {
 		return fmt.Errorf("feature gate validation failed: %w", err)
 	}
+	protocol := nvapi.ComputeDomainCliqueProtocol(flags.protocol)
+	if err := nvapi.ValidateComputeDomainCliqueProtocol(protocol); err != nil {
+		return err
+	}
+	protocol = nvapi.EffectiveComputeDomainCliqueProtocol(protocol)
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		// Protocol is persisted per ComputeDomain and survives changes to the
+		// process-wide default feature gates. A rollback may disable the alpha
+		// admission gate, but it must not silently disable capabilities required
+		// by an already-created controller-v1 daemon.
+		if !featuregates.Enabled(featuregates.ComputeDomainCliques) || !featuregates.Enabled(featuregates.IMEXDaemonsWithDNSNames) {
+			return fmt.Errorf("persisted controller-v1 daemon requires feature gates %s and %s to remain enabled", featuregates.ComputeDomainCliques, featuregates.IMEXDaemonsWithDNSNames)
+		}
+	}
 
 	// Create clientsets for Kubernetes API access
 	kubeConfig := &pkgflags.KubeClientConfig{}
@@ -232,21 +256,36 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		return fmt.Errorf("failed to create client sets: %w", err)
 	}
 
-	// Add compute domain clique label to this pod
-	if err := addComputeDomainCliqueLabel(ctx, clientsets, flags); err != nil {
-		return fmt.Errorf("failed to add compute domain clique label to pod: %w", err)
+	// Legacy daemons still publish their discovered clique on their own Pod.
+	// Controller-v1 daemons use the read-only ServiceAccount; the controller
+	// derives clique membership from trusted Node topology instead.
+	if protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		if err := addComputeDomainCliqueLabel(ctx, clientsets, flags); err != nil {
+			return fmt.Errorf("failed to add compute domain clique label to pod: %w", err)
+		}
 	}
 
-	// When cliqueID is empty, skip starting the controller and IMEX daemon management entirely.
-	// The compute-domain-controller will watch this pod's label and sync its node info to the
-	// ComputeDomain status. There's no clique to manage, no DNS indices to determine, and no
-	// IMEX daemon to run.
-	if flags.cliqueID == "" {
+	// A controller-v1 daemon must keep its exact snapshot reader alive even when
+	// local hardware discovery reports no clique. It will reject Active
+	// membership because its scope is empty and will never start IMEX, but it can
+	// still observe Retiring and attest the already-stopped state. Legacy mode
+	// retains the historical no-clique idle path.
+	if flags.cliqueID == "" && protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 {
 		klog.Infof("no cliqueID: skipping controller and IMEX daemon management")
 		// Just wait for shutdown signal
 		<-ctx.Done()
 		klog.Infof("Exiting")
 		return nil
+	}
+	if flags.cliqueID == "" {
+		klog.Infof("no cliqueID: starting controller-v1 retirement-capable snapshot reader with IMEX disabled")
+	}
+	bootID, err := bootid.GetCurrentBootID()
+	if err != nil {
+		return fmt.Errorf("read kernel boot ID: %w", err)
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 && bootID == "" {
+		return fmt.Errorf("controller-v1 requires a nonempty kernel boot ID")
 	}
 
 	config := &ControllerConfig{
@@ -262,7 +301,9 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		podUID:                 flags.podUID,
 		podName:                flags.podName,
 		podNamespace:           flags.podNamespace,
+		bootID:                 bootID,
 		maxNodesPerIMEXDomain:  flags.maxNodesPerIMEXDomain,
+		protocol:               protocol,
 	}
 
 	// Render and write the IMEX daemon config with the current pod IP
@@ -285,6 +326,17 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	// Prepare IMEX daemon process manager.
 	daemonCommandLine := []string{imexDaemonBinaryName, "-c", imexDaemonConfigPath}
 	processManager := NewProcessManager(daemonCommandLine)
+	processCtx, stopProcess := context.WithCancel(ctx)
+	processDone := make(chan struct{})
+	var retireProcessOnce sync.Once
+	var retireProcessErr error
+	retireProcess := func() error {
+		retireProcessOnce.Do(func() {
+			stopProcess()
+			<-processDone
+		})
+		return retireProcessErr
+	}
 
 	// Prepare controller with CD manager (not invoking the controller yet).
 	controller, err := NewController(config)
@@ -310,13 +362,19 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if featuregates.Enabled(featuregates.IMEXDaemonsWithDNSNames) {
+		switch {
+		case protocol == nvapi.ComputeDomainCliqueProtocolControllerV1:
+			if err := IMEXDaemonUpdateLoopWithControllerSnapshot(ctx, controller, processManager, dnsNameManager, retireProcess); err != nil {
+				klog.Errorf("controller snapshot update loop failed, initiate shutdown: %s", err)
+				cancel()
+			}
+		case featuregates.Enabled(featuregates.IMEXDaemonsWithDNSNames):
 			// Use new DNS name-based functionality
 			if err := IMEXDaemonUpdateLoopWithDNSNames(ctx, controller, processManager, dnsNameManager); err != nil {
 				klog.Errorf("IMEXDaemonUpdateLoop failed, initiate shutdown: %s", err)
 				cancel()
 			}
-		} else {
+		default:
 			// Use original IP-based functionality
 			if err := IMEXDaemonUpdateLoopWithIPs(ctx, controller, flags.cliqueID, processManager); err != nil {
 				klog.Errorf("IMEXDaemonUpdateLoop failed, initiate shutdown: %s", err)
@@ -332,7 +390,10 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		defer wg.Done()
 		// Watchdog restarts the IMEX daemon upon unexpected termination, and
 		// shuts it down gracefully upon our own shutdown.
-		if err := processManager.Watchdog(ctx); err != nil {
+		err := processManager.Watchdog(processCtx)
+		retireProcessErr = err
+		close(processDone)
+		if err != nil {
 			klog.Errorf("watch failed, initiate shutdown: %s", err)
 			cancel()
 		}
@@ -404,7 +465,6 @@ func IMEXDaemonUpdateLoopWithDNSNames(ctx context.Context, controller *Controlle
 			if err != nil {
 				return fmt.Errorf("failed to ensure IMEX daemon is started: %w", err)
 			}
-
 			dnsNameManager.LogDNSNameMappings()
 
 			// Skip sending SIGUSR1 when the process is fresh (has newly been
@@ -425,9 +485,175 @@ func IMEXDaemonUpdateLoopWithDNSNames(ctx context.Context, controller *Controlle
 				// other error resulted in bad signal delivery, we may get away
 				// with it).
 				klog.Errorf("failed to send SIGUSR1 to child process: %s", err)
+				break
 			}
 		}
 	}
+}
+
+type controllerSnapshotApplyState struct {
+	desired         *ControllerSnapshotDesiredState
+	restartRequired bool
+}
+
+type controllerSnapshotApplyOperations struct {
+	updateHosts             func([]*nvapi.ComputeDomainDaemonInfo) (bool, error)
+	ensureIMEX              func() (bool, error)
+	restartIMEX             func() error
+	checkIMEX               func() error
+	writeReceipt            func(*nvapi.ComputeDomainCliqueSnapshotReceipt) error
+	retireIMEX              func() error
+	writeRetirementEvidence func(*ControllerSnapshotDesiredState) error
+}
+
+// IMEXDaemonUpdateLoopWithControllerSnapshot retries local installation
+// without waiting for another API event. A newer desired snapshot supersedes
+// the one being retried. The manager is told that a generation was applied
+// only after hosts installation, an IMEX start/restart, a READY observation,
+// and receipt persistence all succeed.
+func IMEXDaemonUpdateLoopWithControllerSnapshot(ctx context.Context, controller *Controller, processManager *ProcessManager, dnsNameManager *DNSNameManager, retireIMEX func() error) error {
+	if dnsNameManager == nil {
+		return fmt.Errorf("controller-v1 requires DNS name-based IMEX configuration")
+	}
+	desiredStateChan := controller.GetSnapshotDesiredStateChan()
+	if desiredStateChan == nil {
+		return fmt.Errorf("controller-v1 snapshot manager is unavailable")
+	}
+	ops := controllerSnapshotApplyOperations{
+		updateHosts: dnsNameManager.UpdateDNSNameMappings,
+		ensureIMEX:  processManager.EnsureStarted,
+		restartIMEX: processManager.Restart,
+		checkIMEX: func() error {
+			checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			return checkIMEXReady(checkCtx)
+		},
+		writeReceipt: writeSnapshotReceipt,
+		retireIMEX:   retireIMEX,
+		writeRetirementEvidence: func(state *ControllerSnapshotDesiredState) error {
+			return controller.PublishSnapshotRetirementEvidence(ctx, state)
+		},
+	}
+
+	var pending controllerSnapshotApplyState
+	for {
+		if pending.desired == nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			case pending.desired = <-desiredStateChan:
+			}
+		}
+
+		// Collapse any burst to the latest committed desired snapshot before
+		// starting local I/O. restartRequired is retained because a previous
+		// hosts write may still require an existing process to be restarted.
+		for draining := true; draining; {
+			select {
+			case pending.desired = <-desiredStateChan:
+			default:
+				draining = false
+			}
+		}
+
+		if err := applyControllerSnapshot(&pending, ops); err == nil {
+			if pending.desired.RetirementEvidence != nil {
+				controller.MarkSnapshotRetired(pending.desired)
+			} else {
+				controller.MarkSnapshotApplied(pending.desired)
+			}
+			pending.desired = nil
+			continue
+		} else {
+			identity := pending.desired.identity()
+			klog.Errorf("failed to apply controller snapshot %s/%d: %v; retrying", identity.uid, identity.generation, err)
+		}
+
+		retry := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			retry.Stop()
+			return nil
+		case pending.desired = <-desiredStateChan:
+			retry.Stop()
+		case <-retry.C:
+		}
+	}
+}
+
+func applyControllerSnapshot(state *controllerSnapshotApplyState, ops controllerSnapshotApplyOperations) error {
+	if state.desired.RetirementEvidence != nil {
+		if ops.retireIMEX == nil || ops.writeRetirementEvidence == nil {
+			return fmt.Errorf("retirement operations are unavailable")
+		}
+		if err := ops.retireIMEX(); err != nil {
+			return fmt.Errorf("failed to stop and reap IMEX daemon: %w", err)
+		}
+		if err := ops.writeRetirementEvidence(state.desired); err != nil {
+			return fmt.Errorf("failed to publish durable retirement evidence: %w", err)
+		}
+		state.restartRequired = false
+		return nil
+	}
+	updated, err := ops.updateHosts(state.desired.Members)
+	if err != nil {
+		return fmt.Errorf("failed to update DNS name mappings: %w", err)
+	}
+	state.restartRequired = state.restartRequired || updated
+
+	fresh, err := ops.ensureIMEX()
+	if err != nil {
+		return fmt.Errorf("failed to ensure IMEX daemon is started: %w", err)
+	}
+	if fresh {
+		// A newly started process reads the already-installed mapping. Starting
+		// a fresh process, rather than merely delivering a reload signal, is the
+		// causal boundary used by controller-v1 before it acknowledges a map.
+		state.restartRequired = false
+	} else if state.restartRequired {
+		if err := ops.restartIMEX(); err != nil {
+			return fmt.Errorf("failed to restart IMEX daemon with new mapping: %w", err)
+		}
+		state.restartRequired = false
+	}
+
+	// Do not publish a receipt merely because a signal was delivered or a
+	// process was spawned. The new process must answer READY after the mapping
+	// was installed. A future IMEX generation/digest acknowledgement can make
+	// this proof stronger without changing the snapshot protocol.
+	if err := ops.checkIMEX(); err != nil {
+		return fmt.Errorf("IMEX daemon did not become ready after applying snapshot: %w", err)
+	}
+
+	if err := ops.writeReceipt(state.desired.Receipt); err != nil {
+		return fmt.Errorf("failed to write installed snapshot receipt: %w", err)
+	}
+	return nil
+}
+
+func writeSnapshotReceipt(receipt *nvapi.ComputeDomainCliqueSnapshotReceipt) error {
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(imexDaemonConfigDirPath, ".snapshot-receipt-*")
+	if err != nil {
+		return err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryName, filepath.Join(imexDaemonConfigDirPath, "snapshot-receipt.json"))
 }
 
 // check verifies if the node is IMEX capable and if so, checks if the IMEX daemon is ready.
@@ -438,6 +664,14 @@ func check(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		return nil
 	}
 
+	return checkIMEXReady(ctx)
+}
+
+// checkIMEXReady probes the local daemon process. It intentionally does not
+// claim that IMEX exposes a configuration-generation acknowledgement: the
+// controller-v1 apply path pairs this check with a process start/restart that
+// happens strictly after the new peer map is installed.
+func checkIMEXReady(ctx context.Context) error {
 	// -q is documented with "Query the status of the IMEX daemon once and
 	// return". This probes if the local IMEX daemon is ready (not the entire
 	// domain). Reference:

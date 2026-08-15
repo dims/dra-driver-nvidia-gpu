@@ -109,6 +109,175 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Controller-owned CDC admission is cluster-scoped. Its names and authenticated
+subjects must not vary with nameOverride/fullnameOverride: doing so would make
+two releases either overwrite one another or install conjunctive policies.
+*/}}
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationName" -}}
+controller-owned-cdc-installation.dra-driver-nvidia-gpu
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" -}}
+{{- printf "%s/%s" (include "dra-driver-nvidia-gpu.namespace" . | trim) .Release.Name -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCControllerRoleName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-controller
+{{- else -}}
+{{- printf "%s-clusterrole-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletRoleName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-kubeletplugin
+{{- else -}}
+{{- printf "%s-clusterrole-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCControllerBindingName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-binding-controller
+{{- else -}}
+{{- printf "%s-clusterrole-binding-controller-%s" (include "dra-driver-nvidia-gpu.name" .) (include "dra-driver-nvidia-gpu.namespace" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletBindingName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-binding-kubeletplugin
+{{- else -}}
+{{- printf "%s-clusterrole-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCControllerWorkloadName" -}}
+{{- printf "%s-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletWorkloadName" -}}
+{{- printf "%s-kubelet-plugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceRoleName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}dra-driver-nvidia-gpu-role-controller{{- else -}}{{- printf "%s-role-controller" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceBindingName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}dra-driver-nvidia-gpu-role-binding-controller{{- else -}}{{- printf "%s-role-binding-controller" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceRoleName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}dra-driver-nvidia-gpu-role-kubeletplugin{{- else -}}{{- printf "%s-role-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceBindingName" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled -}}dra-driver-nvidia-gpu-role-binding-kubeletplugin{{- else -}}{{- printf "%s-role-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{/*
+Names emitted by charts which predate controller-owned CDC admission. The
+immutable installation marker records these aliases so a verified zero-state
+rollback can restore the old workloads and RBAC without opening the binding
+policies to a second release or control namespace.
+*/}}
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerRoleName" -}}
+{{- printf "%s-clusterrole-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletRoleName" -}}
+{{- printf "%s-clusterrole-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerBindingName" -}}
+{{- printf "%s-clusterrole-binding-controller-%s" (include "dra-driver-nvidia-gpu.name" .) (include "dra-driver-nvidia-gpu.namespace" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletBindingName" -}}
+{{- printf "%s-clusterrole-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceRoleName" -}}
+{{- printf "%s-role-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceBindingName" -}}
+{{- printf "%s-role-binding-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceRoleName" -}}
+{{- printf "%s-role-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceBindingName" -}}
+{{- printf "%s-role-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerServiceAccountUsername" -}}
+{{- printf "system:serviceaccount:%s:%s-controller" (include "dra-driver-nvidia-gpu.namespace" . | trim) (include "dra-driver-nvidia-gpu.serviceAccountName" . | trim) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.kubeletPluginServiceAccountUsername" -}}
+{{- printf "system:serviceaccount:%s:%s-kubeletplugin" (include "dra-driver-nvidia-gpu.namespace" . | trim) (include "dra-driver-nvidia-gpu.serviceAccountName" . | trim) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCMarkerAnnotations" -}}
+helm.sh/resource-policy: keep
+meta.helm.sh/release-name: {{ .Release.Name | quote }}
+meta.helm.sh/release-namespace: {{ .Release.Namespace | quote }}
+resource.nvidia.com/controller-owned-cdc-installation: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" . | quote }}
+resource.nvidia.com/controller-owned-cdc-control-namespace: {{ include "dra-driver-nvidia-gpu.namespace" . | trim | quote }}
+resource.nvidia.com/controller-owned-cdc-controller-subject: {{ include "dra-driver-nvidia-gpu.controllerServiceAccountUsername" . | quote }}
+resource.nvidia.com/controller-owned-cdc-kubelet-subject: {{ include "dra-driver-nvidia-gpu.kubeletPluginServiceAccountUsername" . | quote }}
+resource.nvidia.com/controller-owned-cdc-controller-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-kubelet-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-controller-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-kubelet-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-daemon-role: "compute-domain-daemon-role"
+resource.nvidia.com/controller-owned-cdc-legacy-daemon-binding: "compute-domain-daemon-role-binding"
+resource.nvidia.com/controller-owned-cdc-controller-workload: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerWorkloadName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-kubelet-workload: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletWorkloadName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-controller-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-controller-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCControllerNamespaceBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-kubelet-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-kubelet-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCKubeletNamespaceBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-controller-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyControllerNamespaceBindingName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-role: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceRoleName" . | quote }}
+resource.nvidia.com/controller-owned-cdc-legacy-kubelet-namespace-binding: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCLegacyKubeletNamespaceBindingName" . | quote }}
+{{- end -}}
+
+{{/*
+Safety policies and bindings are deliberately release-neutral objects. Helm's
+live install adds its ownership metadata after the admission-first bootstrap;
+an offline render must not contain metadata with which another release could
+claim those retained objects.
+*/}}
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" -}}
+helm.sh/resource-policy: keep
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCObjectIdentity" -}}
+{{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+resource.nvidia.com/controller-owned-cdc-installation: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" . | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" -}}
+app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" -}}
+{{- printf "%s-dra-driver-nvidia-gpu" . -}}
+{{- end -}}
+
+{{/*
 Create the name of the webhook service account to use
 */}}
 {{- define "dra-driver-nvidia-gpu.webhookServiceAccountName" -}}
@@ -232,5 +401,35 @@ on an invalid combination. Produces no output on success.
   {{- else -}}
     {{- fail (printf "unknown resources.computeDomains.imex.isolation %q: must be \"domain\" or \"channel\"" $isolation) -}}
   {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Controller-owned snapshots need an expected Node set before they may become
+Active. The kubelet plugin's topology label is that set in the initial
+implementation.
+*/}}
+{{- define "dra-driver-nvidia-gpu.validateControllerOwnedCDCliques" -}}
+{{- $enabled := and .Values.featureGates (and (hasKey .Values.featureGates "ControllerOwnedCDCliques") .Values.featureGates.ControllerOwnedCDCliques) -}}
+{{- if and $enabled (not .Values.controllerOwnedCDCliques.admissionEnabled) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires controllerOwnedCDCliques.admissionEnabled=true" -}}
+{{- end -}}
+{{- if and $enabled (include "dra-driver-nvidia-gpu.hostManagedIMEX" .) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true is incompatible with resources.computeDomains.imex.mode=hostManaged" -}}
+{{- end -}}
+{{- if and $enabled (.Capabilities.APIVersions.Has "security.openshift.io/v1/SecurityContextConstraints") -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true is not supported on OpenShift in this alpha; SCC bindings are not yet covered by the immutable single-install admission boundary" -}}
+{{- end -}}
+{{- if and $enabled (ne (include "dra-driver-nvidia-gpu.resourceApiVersion" . | trim) "resource.k8s.io/v1") -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires the served resource.k8s.io/v1 API; Kubernetes v1.32/v1.33 beta DRA APIs remain supported only by legacy-v1" -}}
+{{- end -}}
+{{- if and $enabled (not .Values.kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled=true" -}}
+{{- end -}}
+{{- if and $enabled (not .Values.controller.leaderElection.enabled) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires controller.leaderElection.enabled=true; clique allocation requires one active writer" -}}
+{{- end -}}
+{{- if and $enabled (and (hasKey .Values.featureGates "CrashOnNVLinkFabricErrors") (not .Values.featureGates.CrashOnNVLinkFabricErrors)) -}}
+  {{- fail "featureGates.ControllerOwnedCDCliques=true requires featureGates.CrashOnNVLinkFabricErrors=true; controller-owned topology must fail closed instead of falling back to non-fabric mode" -}}
 {{- end -}}
 {{- end -}}

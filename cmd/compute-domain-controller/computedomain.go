@@ -19,15 +19,21 @@ package main
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"slices"
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/metrics"
 	nvinformers "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/informers/externalversions"
 	nvlisters "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/listers/resource/v1beta1"
@@ -47,9 +53,10 @@ const (
 	// not so long that stale entries cause issues.
 	mutationCacheTTL = time.Hour
 
-	computeDomainLabelKey       = "resource.nvidia.com/computeDomain"
-	computeDomainCliqueLabelKey = "resource.nvidia.com/computeDomain.cliqueID"
-	computeDomainFinalizer      = computeDomainLabelKey
+	computeDomainLabelKey           = "resource.nvidia.com/computeDomain"
+	computeDomainCliqueLabelKey     = "resource.nvidia.com/computeDomain.cliqueID"
+	computeDomainFinalizer          = computeDomainLabelKey
+	computeDomainProtocolAnnotation = nvapi.ComputeDomainCliqueProtocolAnnotation
 
 	computeDomainDefaultChannelDeviceClass = "compute-domain-default-channel.nvidia.com"
 	computeDomainChannelDeviceClass        = "compute-domain-channel.nvidia.com"
@@ -59,6 +66,8 @@ const (
 	computeDomainResourceClaimTemplateTargetDaemon   = "Daemon"
 	computeDomainResourceClaimTemplateTargetWorkload = "Workload"
 )
+
+const computeDomainRetirementCondition = "CliqueRetirementReady"
 
 type ComputeDomainManager struct {
 	config        *ManagerConfig
@@ -79,6 +88,7 @@ type ComputeDomainManager struct {
 	daemonSetManager             *MultiNamespaceDaemonSetManager
 	resourceClaimTemplateManager *WorkloadResourceClaimTemplateManager
 	nodeManager                  *NodeManager
+	controllerOwnedCliqueManager *ControllerOwnedCliqueManager
 }
 
 // NewComputeDomainManager creates a new ComputeDomainManager.
@@ -235,6 +245,19 @@ func (m *ComputeDomainManager) UpdateStatus(ctx context.Context, cd *nvapi.Compu
 	return updatedCD, nil
 }
 
+func (m *ComputeDomainManager) updateRetirementCondition(ctx context.Context, cd *nvapi.ComputeDomain, status metav1.ConditionStatus, reason, message string) error {
+	updated := cd.DeepCopy()
+	apiMeta.SetStatusCondition(&updated.Status.Conditions, metav1.Condition{
+		Type: computeDomainRetirementCondition, Status: status, Reason: reason, Message: message,
+		ObservedGeneration: cd.Generation,
+	})
+	if reflect.DeepEqual(updated.Status.Conditions, cd.Status.Conditions) {
+		return nil
+	}
+	_, err := m.UpdateStatus(ctx, updated)
+	return err
+}
+
 // RemoveFinalizer removes the finalizer from a ComputeDomain.
 func (m *ComputeDomainManager) RemoveFinalizer(ctx context.Context, uid string) error {
 	cd, err := m.Get(uid)
@@ -264,6 +287,163 @@ func (m *ComputeDomainManager) RemoveFinalizer(ctx context.Context, uid string) 
 		return fmt.Errorf("error updating ComputeDomain: %w", err)
 	}
 
+	return nil
+}
+
+func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string) error {
+	namespace := m.config.driverNamespace
+	selector := labels.SelectorFromSet(labels.Set{computeDomainLabelKey: cdUID}).String()
+	snapshotList, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return err
+	}
+	evidenceList, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return err
+	}
+	snapshots, retirementEvidence := snapshotList.Items, evidenceList.Items
+	// Validate every namespace before deleting any object or global reservation.
+	for i := range snapshots {
+		snapshot := &snapshots[i]
+		if slices.Contains(snapshot.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer) &&
+			(snapshot.Status.Generation > 0 || snapshotEverPublished(snapshot)) && snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseFenced {
+			return fmt.Errorf("snapshot %s/%s retains published index tombstones without verified retirement evidence", snapshot.Namespace, snapshot.Name)
+		}
+	}
+	reservations, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{computeDomainLabelKey: cdUID}).String(),
+	})
+	if err != nil {
+		return err
+	}
+	snapshotsByClique := make(map[string]*nvapi.ComputeDomainCliqueSnapshot, len(snapshots))
+	for i := range snapshots {
+		snapshot := &snapshots[i]
+		if previous := snapshotsByClique[snapshot.Spec.CliqueID]; previous != nil {
+			return fmt.Errorf("multiple snapshots retain physical clique %q", snapshot.Spec.CliqueID)
+		}
+		snapshotsByClique[snapshot.Spec.CliqueID] = snapshot
+	}
+	for i := range reservations.Items {
+		reservation := &reservations.Items[i]
+		if reservation.Spec.ComputeDomainUID != types.UID(cdUID) {
+			return fmt.Errorf("physical clique reservation %s has mismatched ComputeDomain UID", reservation.Name)
+		}
+		snapshot := snapshotsByClique[reservation.Spec.CliqueID]
+		reason := nvapi.ComputeDomainCliqueReservationReleaseReasonNeverPublished
+		published := snapshot != nil && (snapshot.Status.Generation > 0 || snapshotEverPublished(snapshot))
+		if published {
+			if snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseFenced {
+				return fmt.Errorf("physical clique reservation %s cannot be released before snapshot %s/%s is fenced", reservation.Name, snapshot.Namespace, snapshot.Name)
+			}
+			reason = nvapi.ComputeDomainCliqueReservationReleaseReasonVerifiedFence
+		}
+		switch reservation.Status.Phase {
+		case nvapi.ComputeDomainCliqueReservationPhaseReleased:
+			if reservation.Status.ReleasedAt == nil {
+				return fmt.Errorf("released physical clique reservation %s lacks a release timestamp", reservation.Name)
+			}
+			switch reservation.Status.ReleaseReason {
+			case nvapi.ComputeDomainCliqueReservationReleaseReasonNeverPublished:
+				retainsIntent := reservation.Status.SnapshotUID != "" || reservation.Status.ActivationGeneration != 0 || reservation.Status.ActivationHash != ""
+				validIntent := reservation.Status.SnapshotUID != "" && reservation.Status.ActivationGeneration > 0 && len(reservation.Status.ActivationHash) == 64
+				if published || (retainsIntent && !validIntent) || reservation.Status.FencedGeneration != 0 || reservation.Status.FencedHash != "" {
+					return fmt.Errorf("released physical clique reservation %s has invalid never-published evidence", reservation.Name)
+				}
+			case nvapi.ComputeDomainCliqueReservationReleaseReasonVerifiedFence:
+				if reservation.Status.SnapshotUID == "" || reservation.Status.ActivationGeneration <= 0 || len(reservation.Status.ActivationHash) != 64 ||
+					reservation.Status.FencedGeneration < reservation.Status.ActivationGeneration || len(reservation.Status.FencedHash) != 64 {
+					return fmt.Errorf("released physical clique reservation %s lacks exact fence evidence", reservation.Name)
+				}
+				if snapshot != nil && (reservation.Status.SnapshotUID != snapshot.UID || reservation.Status.FencedGeneration != snapshot.Status.Generation ||
+					reservation.Status.FencedHash != snapshot.Status.Hash) {
+					return fmt.Errorf("released physical clique reservation %s does not match its snapshot evidence", reservation.Name)
+				}
+			default:
+				return fmt.Errorf("released physical clique reservation %s lacks typed fence evidence", reservation.Name)
+			}
+		case nvapi.ComputeDomainCliqueReservationPhaseActive:
+			if snapshot == nil {
+				return fmt.Errorf("activated physical clique reservation %s lost its snapshot; absence is not fence evidence", reservation.Name)
+			}
+			if reservation.Status.SnapshotUID != snapshot.UID || reservation.Status.ActivationGeneration <= 0 || len(reservation.Status.ActivationHash) != 64 {
+				return fmt.Errorf("physical clique reservation %s activation does not match its published snapshot", reservation.Name)
+			}
+			if published && reservation.Status.ActivationGeneration > snapshot.Status.Generation {
+				return fmt.Errorf("physical clique reservation %s activation is newer than its published snapshot", reservation.Name)
+			}
+			if !published && snapshot.Status.Generation != 0 {
+				return fmt.Errorf("physical clique reservation %s has inconsistent never-published snapshot state", reservation.Name)
+			}
+		case "":
+			if published {
+				return fmt.Errorf("published physical clique reservation %s lacks durable activation identity", reservation.Name)
+			}
+		default:
+			return fmt.Errorf("physical clique reservation %s has invalid phase %q", reservation.Name, reservation.Status.Phase)
+		}
+		if reservation.Status.Phase != nvapi.ComputeDomainCliqueReservationPhaseReleased {
+			updated := reservation.DeepCopy()
+			now := metav1.Now()
+			updated.Status.Phase = nvapi.ComputeDomainCliqueReservationPhaseReleased
+			updated.Status.ReleaseReason = reason
+			updated.Status.ReleasedAt = &now
+			if reason == nvapi.ComputeDomainCliqueReservationReleaseReasonVerifiedFence && snapshot != nil {
+				updated.Status.SnapshotUID = snapshot.UID
+				updated.Status.FencedGeneration = snapshot.Status.Generation
+				updated.Status.FencedHash = snapshot.Status.Hash
+			}
+			result, updateErr := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+			observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, updateErr)
+			if updateErr != nil {
+				return updateErr
+			}
+			reservations.Items[i] = *result
+		}
+	}
+	// Evidence is intentionally independent of the witness Pod. Delete it only
+	// after every physical reservation has durably reached Released above.
+	for i := range retirementEvidence {
+		evidence := &retirementEvidence[i]
+		if evidence.Labels[nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel] != cdUID {
+			return fmt.Errorf("retirement evidence %s/%s has mismatched ComputeDomain UID", evidence.Namespace, evidence.Name)
+		}
+		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(evidence.Namespace).Delete(ctx, evidence.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &evidence.UID}})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceEvidence, metrics.CliqueAPIOperationDelete, err)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	for i := range snapshots {
+		snapshot := &snapshots[i]
+		if slices.Contains(snapshot.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer) {
+			withoutFence := snapshot.DeepCopy()
+			withoutFence.Finalizers = slices.DeleteFunc(withoutFence.Finalizers, func(finalizer string) bool {
+				return finalizer == nvapi.ComputeDomainCliqueSnapshotFinalizer
+			})
+			_, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, withoutFence, metav1.UpdateOptions{})
+			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerRemove, err)
+			if err != nil {
+				return err
+			}
+		}
+		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Delete(ctx, snapshot.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &snapshot.UID}})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationDelete, err)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	for i := range reservations.Items {
+		reservation := &reservations.Items[i]
+		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Delete(ctx, reservation.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &reservation.UID}})
+		observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationDelete, err)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		if m.controllerOwnedCliqueManager != nil {
+			m.controllerOwnedCliqueManager.forgetReleasedReservation(reservation.Name)
+		}
+	}
 	return nil
 }
 
@@ -314,19 +494,71 @@ func (m *ComputeDomainManager) updateGlobalStatus(ctx context.Context, cd *nvapi
 }
 
 func (m *ComputeDomainManager) addFinalizer(ctx context.Context, cd *nvapi.ComputeDomain) error {
-	for _, f := range cd.Finalizers {
-		if f == computeDomainFinalizer {
-			return nil
+	newCD := cd.DeepCopy()
+	changed := false
+	if !slices.Contains(cd.Finalizers, computeDomainFinalizer) && cd.Annotations[computeDomainProtocolAnnotation] != "" {
+		return fmt.Errorf("persisted ComputeDomain clique protocol is controller-owned and cannot predate the controller finalizer")
+	}
+	if newCD.Annotations == nil {
+		newCD.Annotations = make(map[string]string)
+	}
+	if _, exists := newCD.Annotations[computeDomainProtocolAnnotation]; !exists {
+		protocol, err := selectComputeDomainCliqueProtocol(
+			cd,
+			featuregates.Enabled(featuregates.ControllerOwnedCDCliques),
+			m.config.controllerOwnedCDCliquesAvailable,
+		)
+		if err != nil {
+			return err
+		}
+		newCD.Annotations[computeDomainProtocolAnnotation] = string(protocol)
+		changed = true
+	}
+	if !slices.Contains(newCD.Finalizers, computeDomainFinalizer) {
+		newCD.Finalizers = append(newCD.Finalizers, computeDomainFinalizer)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	updated, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(cd.Namespace).Update(ctx, newCD, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("error updating ComputeDomain: %w", err)
+	}
+	m.mutationCache.Mutation(updated)
+
+	return nil
+}
+
+func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnabled, snapshotAPIAvailable bool) (nvapi.ComputeDomainCliqueProtocol, error) {
+	requested := nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueRequestedProtocolAnnotation])
+	if requested != "" {
+		if err := nvapi.ValidateComputeDomainCliqueProtocol(requested); err != nil {
+			return "", fmt.Errorf("invalid requested ComputeDomain clique protocol: %w", err)
 		}
 	}
 
-	newCD := cd.DeepCopy()
-	newCD.Finalizers = append(newCD.Finalizers, computeDomainFinalizer)
-	if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(cd.Namespace).Update(ctx, newCD, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("error updating ComputeDomain: %w", err)
+	// A marker-less object which already has our finalizer predates protocol
+	// selection and must remain legacy. Only a newly admitted object can opt
+	// into controller-v1.
+	if slices.Contains(cd.Finalizers, computeDomainFinalizer) || requested != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		return nvapi.ComputeDomainCliqueProtocolLegacyV1, nil
 	}
+	if cd.Spec.NumNodes <= 0 {
+		return "", fmt.Errorf("controller-v1 requires spec.numNodes to declare the complete expected Node set")
+	}
+	if !controllerEnabled || !snapshotAPIAvailable {
+		return "", fmt.Errorf("controller-v1 was requested but the ControllerOwnedCDCliques feature gate and snapshot API are not both available")
+	}
+	return nvapi.ComputeDomainCliqueProtocolControllerV1, nil
+}
 
-	return nil
+func computeDomainCliqueProtocol(cd *nvapi.ComputeDomain) (nvapi.ComputeDomainCliqueProtocol, error) {
+	protocol := nvapi.ComputeDomainCliqueProtocol(cd.Annotations[computeDomainProtocolAnnotation])
+	if err := nvapi.ValidateComputeDomainCliqueProtocol(protocol); err != nil {
+		return "", err
+	}
+	return nvapi.EffectiveComputeDomainCliqueProtocol(protocol), nil
 }
 
 func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error {
@@ -360,6 +592,33 @@ func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error
 // addition to the workload ResourceClaimTemplate.
 func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, cd *nvapi.ComputeDomain) error {
 	if cd.GetDeletionTimestamp() != nil {
+		protocol, protocolErr := computeDomainCliqueProtocol(cd)
+		if protocolErr != nil {
+			return fmt.Errorf("invalid ComputeDomain clique protocol during deletion: %w", protocolErr)
+		}
+		if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+			if m.controllerOwnedCliqueManager == nil {
+				return fmt.Errorf("controller-owned clique retirement manager is unavailable")
+			}
+			ready, err := m.controllerOwnedCliqueManager.PrepareComputeDomainRetirement(ctx, cd)
+			if err != nil {
+				if conditionErr := m.updateRetirementCondition(ctx, cd, metav1.ConditionFalse, "RetirementBlocked", err.Error()); conditionErr != nil {
+					return fmt.Errorf("prepare controller-owned clique retirement: %v; update retirement condition: %w", err, conditionErr)
+				}
+				return fmt.Errorf("prepare controller-owned clique retirement: %w", err)
+			}
+			if !ready {
+				message := "waiting for every published member to provide durable process-exit or node-reboot evidence"
+				if conditionErr := m.updateRetirementCondition(ctx, cd, metav1.ConditionFalse, "RetirementInProgress", message); conditionErr != nil {
+					return fmt.Errorf("update controller-owned clique retirement condition: %w", conditionErr)
+				}
+				return fmt.Errorf("controller-owned clique retirement is waiting for durable runtime-fence evidence")
+			}
+			if err := m.updateRetirementCondition(ctx, cd, metav1.ConditionTrue, "RuntimeFenced", "all published controller-v1 clique runtimes have durable process-exit or node-reboot evidence"); err != nil {
+				return fmt.Errorf("record controller-owned clique retirement readiness: %w", err)
+			}
+		}
+
 		if err := m.resourceClaimTemplateManager.Delete(ctx, string(cd.UID)); err != nil {
 			return fmt.Errorf("error deleting ResourceClaimTemplate: %w", err)
 		}
@@ -368,7 +627,7 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 			return fmt.Errorf("error deleting DaemonSet: %w", err)
 		}
 
-		if err := m.nodeManager.RemoveComputeDomainLabels(ctx, string(cd.UID)); err != nil {
+		if err := m.nodeManager.RemoveComputeDomainLabelsAndAttestations(ctx, string(cd.UID), protocol == nvapi.ComputeDomainCliqueProtocolControllerV1); err != nil {
 			return fmt.Errorf("error removing ComputeDomain node labels: %w", err)
 		}
 
@@ -388,6 +647,15 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 			return fmt.Errorf("error asserting removal of DaemonSet: %w", err)
 		}
 
+		if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+			if err := m.DeleteSnapshots(ctx, string(cd.UID)); err != nil {
+				// Kubernetes object disappearance is not a runtime fence. Preserve
+				// tombstones and the ComputeDomain finalizer until durable retirement
+				// evidence permits their controller-owned removal.
+				return fmt.Errorf("controller-owned clique retirement blocked: %w", err)
+			}
+		}
+
 		if err := m.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
 			return fmt.Errorf("error removing finalizer: %w", err)
 		}
@@ -399,6 +667,19 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 	// Add the finalizer.
 	if err := m.addFinalizer(ctx, cd); err != nil {
 		return fmt.Errorf("error adding finalizer: %w", err)
+	}
+	// Protocol and finalizer are persisted together. Wait for the informer
+	// round-trip before creating objects so every artifact receives exactly the
+	// same immutable marker.
+	if _, exists := cd.Annotations[computeDomainProtocolAnnotation]; !exists {
+		return nil
+	}
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err != nil {
+		return fmt.Errorf("invalid ComputeDomain clique protocol: %w", err)
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 && !m.config.controllerOwnedCDCliquesAvailable {
+		return fmt.Errorf("controller-v1 requested but ComputeDomainCliqueSnapshot API is unavailable")
 	}
 
 	// Do not wait for the next periodic label cleanup to happen.

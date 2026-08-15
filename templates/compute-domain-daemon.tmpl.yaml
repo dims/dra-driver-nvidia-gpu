@@ -8,6 +8,7 @@ metadata:
     - {{ .Finalizer }}
   labels:
     {{ .ComputeDomainLabelKey }}: {{ .ComputeDomainLabelValue }}
+    resource.nvidia.com/computeDomainCliqueProtocol: {{ .Protocol }}
 spec:
   selector:
     matchLabels:
@@ -16,8 +17,9 @@ spec:
     metadata:
       labels:
         {{ .ComputeDomainLabelKey }}: {{ .ComputeDomainLabelValue }}
+        resource.nvidia.com/computeDomainCliqueProtocol: {{ .Protocol }}
     spec:
-      serviceAccountName: compute-domain-daemon-service-account
+      serviceAccountName: {{ .ServiceAccountName }}
       {{- if .ImagePullSecretNames }}
       imagePullSecrets:
       {{- range .ImagePullSecretNames }}
@@ -38,6 +40,8 @@ spec:
           value: "{{ .LogVerbosity }}"
         - name: MAX_NODES_PER_IMEX_DOMAIN
           value: "{{ .MaxNodesPerIMEXDomain }}"
+        - name: CDC_PROTOCOL
+          value: "{{ .Protocol }}"
         - name: NODE_NAME
           valueFrom:
             fieldRef:

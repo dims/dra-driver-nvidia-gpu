@@ -14,16 +14,28 @@
 
 {{- if .Values.resources.computeDomains.enabled }}
 {{- include "dra-driver-nvidia-gpu.validateIMEXConfig" . }}
+{{- include "dra-driver-nvidia-gpu.validateControllerOwnedCDCliques" . }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "dra-driver-nvidia-gpu.name" . }}-controller
   namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+  annotations:
+    resource.nvidia.com/controller-owned-cdc-installation: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" . | quote }}
+  {{- end }}
   labels:
     {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
+    {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+    resource.nvidia.com/controller-owned-cdc-workload: controller
+    {{- end }}
 spec:
   replicas: {{ .Values.controller.replicas }}
+  {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "dra-driver-nvidia-gpu.selectorLabels" (dict "context" . "componentName" "controller") | nindent 6 }}
@@ -84,6 +96,14 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        {{- if .Values.controllerOwnedCDCliques.admissionEnabled }}
+        - name: SERVICE_ACCOUNT_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
+        - name: CONTROLLER_OWNED_CDC_INSTALLATION_ID
+          value: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" . | quote }}
+        {{- end }}
         - name: IMAGE_NAME
           value: {{ include "dra-driver-nvidia-gpu.fullimage" . }}
         {{- if .Values.imagePullSecrets }}

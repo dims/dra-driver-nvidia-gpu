@@ -47,6 +47,7 @@ type DNSNameManager struct {
 	cliqueID              string
 	maxNodesPerIMEXDomain int
 	nodesConfigPath       string
+	hostsFilePath         string
 }
 
 // NewDNSNameManager creates a new DNS name manager.
@@ -56,6 +57,7 @@ func NewDNSNameManager(cliqueID string, maxNodesPerIMEXDomain int, nodesConfigPa
 		cliqueID:              cliqueID,
 		maxNodesPerIMEXDomain: maxNodesPerIMEXDomain,
 		nodesConfigPath:       nodesConfigPath,
+		hostsFilePath:         hostsFilePath,
 	}
 }
 
@@ -94,11 +96,14 @@ func (m *DNSNameManager) UpdateDNSNameMappings(daemons []*nvapi.ComputeDomainDae
 		return false, nil
 	}
 
-	// Otherwise, update the cached ipToDNSName mapping
+	// Persist the new mapping before publishing it in memory. If the write
+	// fails, the next delivery must retry instead of being mistaken for a
+	// semantic no-op.
+	if err := m.updateHostsFile(ipToDNSName); err != nil {
+		return false, err
+	}
 	m.ipToDNSName = ipToDNSName
-
-	// And update the hosts file with the new mapping
-	return true, m.updateHostsFile()
+	return true, nil
 }
 
 // LogDNSNameMappings logs the current compute-domain-daemon mappings from memory.
@@ -142,11 +147,11 @@ func (m *DNSNameManager) constructDNSName(daemon *nvapi.ComputeDomainDaemonInfo)
 }
 
 // updateHostsFile updates the /etc/hosts file with current IP to DNS name mappings.
-func (m *DNSNameManager) updateHostsFile() error {
+func (m *DNSNameManager) updateHostsFile(ipToDNSName IPToDNSNameMap) error {
 	// Read hosts file
-	hostsContent, err := os.ReadFile(hostsFilePath)
+	hostsContent, err := os.ReadFile(m.hostsFilePath)
 	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", hostsFilePath, err)
+		return fmt.Errorf("failed to read %s: %w", m.hostsFilePath, err)
 	}
 
 	// Grab any lines to preserve, skipping existing DNS name mappings
@@ -175,13 +180,21 @@ func (m *DNSNameManager) updateHostsFile() error {
 	newHostsContent.WriteString("# Compute Domain Daemon mappings\n")
 
 	// Add new DNS name mappings
-	for ip, dnsName := range m.ipToDNSName {
+	ips := make([]string, 0, len(ipToDNSName))
+	for ip := range ipToDNSName {
+		ips = append(ips, ip)
+	}
+	slices.SortFunc(ips, func(a, b string) int {
+		return cmp.Compare(ipToDNSName[a], ipToDNSName[b])
+	})
+	for _, ip := range ips {
+		dnsName := ipToDNSName[ip]
 		_, _ = fmt.Fprintf(&newHostsContent, "%s\t%s\n", ip, dnsName)
 	}
 
 	// Write the updated hosts file
-	if err := os.WriteFile(hostsFilePath, []byte(newHostsContent.String()), 0644); err != nil {
-		return fmt.Errorf("failed to write %s: %w", hostsFilePath, err)
+	if err := os.WriteFile(m.hostsFilePath, []byte(newHostsContent.String()), 0644); err != nil {
+		return fmt.Errorf("failed to write %s: %w", m.hostsFilePath, err)
 	}
 
 	return nil

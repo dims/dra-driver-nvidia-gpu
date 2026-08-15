@@ -67,6 +67,10 @@ const (
 	// storing daemon info directly in ComputeDomainStatus.Nodes.
 	ComputeDomainCliques featuregate.Feature = "ComputeDomainCliques"
 
+	// ControllerOwnedCDCliques enables the opt-in, single-writer clique
+	// allocation protocol for newly admitted ComputeDomains.
+	ControllerOwnedCDCliques featuregate.Feature = "ControllerOwnedCDCliques"
+
 	// CrashOnNVLinkFabricErrors causes the kubelet plugin to crash instead of
 	// falling back to non-fabric mode when NVLink fabric errors are detected.
 	CrashOnNVLinkFabricErrors featuregate.Feature = "CrashOnNVLinkFabricErrors"
@@ -163,6 +167,13 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 			Version:    version.MajorMinor(0, 3),
 		},
 	},
+	ControllerOwnedCDCliques: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(0, 5),
+		},
+	},
 	CrashOnNVLinkFabricErrors: {
 		{
 			Default:    true,
@@ -253,6 +264,15 @@ func ValidateFeatureGates() error {
 	// ComputeDomainCliques requires IMEXDaemonsWithDNSNames
 	if Enabled(ComputeDomainCliques) && !Enabled(IMEXDaemonsWithDNSNames) {
 		return fmt.Errorf("feature gate %s requires %s to also be enabled", ComputeDomainCliques, IMEXDaemonsWithDNSNames)
+	}
+	if Enabled(ControllerOwnedCDCliques) && !Enabled(ComputeDomainCliques) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", ControllerOwnedCDCliques, ComputeDomainCliques)
+	}
+	if Enabled(ControllerOwnedCDCliques) && !Enabled(IMEXDaemonsWithDNSNames) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", ControllerOwnedCDCliques, IMEXDaemonsWithDNSNames)
+	}
+	if Enabled(ControllerOwnedCDCliques) && !Enabled(CrashOnNVLinkFabricErrors) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", ControllerOwnedCDCliques, CrashOnNVLinkFabricErrors)
 	}
 
 	if Enabled(DynamicMIG) && Enabled(PassthroughSupport) {

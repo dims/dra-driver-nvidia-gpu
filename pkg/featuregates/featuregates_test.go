@@ -464,6 +464,33 @@ func TestValidateFeatureGates(t *testing.T) {
 			description: "should be valid when IMEXDaemonsWithDNSNames is enabled but ComputeDomainCliques is not",
 		},
 		{
+			name:        "Controller-owned cliques with dependencies",
+			fgMap:       map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true, CrashOnNVLinkFabricErrors: true},
+			expectError: false,
+			description: "should be valid when controller-owned cliques and all dependencies are enabled",
+		},
+		{
+			name:         "Controller-owned cliques without CDCliques",
+			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: false, IMEXDaemonsWithDNSNames: true},
+			expectError:  true,
+			errorMessage: "feature gate ControllerOwnedCDCliques requires ComputeDomainCliques to also be enabled",
+			description:  "should fail without ComputeDomainCliques",
+		},
+		{
+			name:         "Controller-owned cliques without DNSNames",
+			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: false, CrashOnNVLinkFabricErrors: true},
+			expectError:  true,
+			errorMessage: "feature gate ComputeDomainCliques requires IMEXDaemonsWithDNSNames to also be enabled",
+			description:  "should fail without IMEXDaemonsWithDNSNames",
+		},
+		{
+			name:         "Controller-owned cliques without strict NVLink fabric errors",
+			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true, CrashOnNVLinkFabricErrors: false},
+			expectError:  true,
+			errorMessage: "feature gate ControllerOwnedCDCliques requires CrashOnNVLinkFabricErrors to also be enabled",
+			description:  "should fail when a controller-owned node could silently fall back to non-fabric mode",
+		},
+		{
 			name:         "DynamicMIG enabled with PassthroughSupport",
 			fgMap:        map[featuregate.Feature]bool{DynamicMIG: true, PassthroughSupport: true},
 			expectError:  true,

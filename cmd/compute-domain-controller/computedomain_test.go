@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/imex"
@@ -50,6 +51,56 @@ func TestCalculateGlobalStatusDriverManagedUnaffected(t *testing.T) {
 	cd := &nvapi.ComputeDomain{}
 	cd.Spec.NumNodes = 8
 	require.Equal(t, nvapi.ComputeDomainStatusNotReady, m.calculateGlobalStatus(cd))
+}
+
+func TestSelectComputeDomainCliqueProtocol(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		finalized bool
+		gate      bool
+		api       bool
+		want      nvapi.ComputeDomainCliqueProtocol
+		wantErr   bool
+	}{
+		{name: "markerless remains legacy", want: nvapi.ComputeDomainCliqueProtocolLegacyV1},
+		{name: "explicit legacy remains legacy", requested: string(nvapi.ComputeDomainCliqueProtocolLegacyV1), gate: true, api: true, want: nvapi.ComputeDomainCliqueProtocolLegacyV1},
+		{name: "explicit controller canary", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), gate: true, api: true, want: nvapi.ComputeDomainCliqueProtocolControllerV1},
+		{name: "controller request fails when gate is off", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), api: true, wantErr: true},
+		{name: "controller request fails when API is absent", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), gate: true, wantErr: true},
+		{name: "old finalized object cannot switch protocols", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), finalized: true, gate: true, api: true, want: nvapi.ComputeDomainCliqueProtocolLegacyV1},
+		{name: "invalid request fails", requested: "future-v9", gate: true, api: true, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cd := &nvapi.ComputeDomain{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				nvapi.ComputeDomainCliqueRequestedProtocolAnnotation: test.requested,
+			}}, Spec: nvapi.ComputeDomainSpec{NumNodes: 18}}
+			if test.finalized {
+				cd.Finalizers = []string{computeDomainFinalizer}
+			}
+			got, err := selectComputeDomainCliqueProtocol(cd, test.gate, test.api)
+			if test.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestSelectComputeDomainCliqueProtocolAllowsDomainAcrossMultipleCliques(t *testing.T) {
+	cd := &nvapi.ComputeDomain{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			nvapi.ComputeDomainCliqueRequestedProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+		}},
+		Spec: nvapi.ComputeDomainSpec{NumNodes: 144},
+	}
+	protocol, err := selectComputeDomainCliqueProtocol(cd, true, true)
+	require.NoError(t, err)
+	require.Equal(t, nvapi.ComputeDomainCliqueProtocolControllerV1, protocol)
 }
 
 // NewComputeDomainManager only stores clientsets on the informer factories it
