@@ -336,8 +336,10 @@ func (m *ControllerOwnedCliqueManager) reconcileNodeAttestation(ctx context.Cont
 		return err
 	}
 	if !isolated {
+		m.reportWholeCliqueIsolationPending(ctx, winner.computeDomain, cliqueID)
 		return m.publishNodeAttestation(ctx, node, nil)
 	}
+	m.clearWholeCliqueIsolationPending(winner.computeDomain.UID, cliqueID)
 	if err := m.reservePhysicalClique(ctx, winner.computeDomain, cliqueID, winner.protocol); err != nil {
 		// A stale or spoofed routing projection must not survive a failed
 		// singleton acquisition. Remove authorization before retrying.
@@ -347,6 +349,38 @@ func (m *ControllerOwnedCliqueManager) reconcileNodeAttestation(ctx context.Cont
 		return err
 	}
 	return m.publishNodeAttestation(ctx, node, &winner)
+}
+
+func (m *ControllerOwnedCliqueManager) clearWholeCliqueIsolationPending(cdUID types.UID, cliqueID string) {
+	m.formationWarningsMu.Lock()
+	delete(m.formationWarnings, string(cdUID)+"\x00"+cliqueID)
+	m.formationWarningsMu.Unlock()
+}
+
+func (m *ControllerOwnedCliqueManager) reportWholeCliqueIsolationPending(ctx context.Context, cd *nvapi.ComputeDomain, cliqueID string) {
+	key := string(cd.UID) + "\x00" + cliqueID
+	m.formationWarningsMu.Lock()
+	if _, reported := m.formationWarnings[key]; reported {
+		m.formationWarningsMu.Unlock()
+		return
+	}
+	m.formationWarnings[key] = struct{}{}
+	m.formationWarningsMu.Unlock()
+
+	message := fmt.Sprintf(
+		"waiting for every Node in physical clique %q to carry %s=%s, report matching startup topology, and have no bare or foreign ComputeDomain route",
+		cliqueID, controllerOwnedCliqueIsolationLabelKey, cd.UID,
+	)
+	klog.Warningf("ComputeDomain %s/%s: %s", cd.Namespace, cd.Name, message)
+	if m.formationEventSink == nil {
+		return
+	}
+	if err := m.formationEventSink(ctx, cd, "WholeCliqueIsolationPending", message); err != nil {
+		m.formationWarningsMu.Lock()
+		delete(m.formationWarnings, key)
+		m.formationWarningsMu.Unlock()
+		klog.Errorf("recording whole-clique isolation Event for ComputeDomain %s/%s: %v", cd.Namespace, cd.Name, err)
+	}
 }
 
 func (m *ControllerOwnedCliqueManager) publishedSnapshotRetainsNode(cdUID, nodeUID types.UID, cliqueID string) (bool, error) {

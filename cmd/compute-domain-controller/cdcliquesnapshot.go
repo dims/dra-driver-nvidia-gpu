@@ -122,6 +122,9 @@ type ControllerOwnedCliqueManager struct {
 	reservationLocksMu      sync.Mutex
 	reservationLocks        map[string]*sync.Mutex
 	liveAttestationCheck    func(*corev1.Node) bool
+	formationWarningsMu     sync.Mutex
+	formationWarnings       map[string]struct{}
+	formationEventSink      func(context.Context, *nvapi.ComputeDomain, string, string) error
 
 	queue            workqueue.TypedRateLimitingInterface[string]
 	attestationQueue workqueue.TypedRateLimitingInterface[string]
@@ -234,6 +237,8 @@ func NewControllerOwnedCliqueManager(config *ManagerConfig) *ControllerOwnedCliq
 		validatedReservations:   make(map[string]nvapi.ComputeDomainCliqueReservationSpec),
 		validatedActivations:    make(map[string]types.UID),
 		reservationLocks:        make(map[string]*sync.Mutex),
+		formationWarnings:       make(map[string]struct{}),
+		formationEventSink:      config.formationEventSink,
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
 			workqueue.DefaultTypedControllerRateLimiter[string](),
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: snapshotQueueName},
@@ -1097,6 +1102,11 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 	for i := range assignments {
 		assignmentByNode[assignments[i].NodeUID] = i
 	}
+	publishedBootIDs := make(map[string]string, len(snapshot.Status.Members))
+	for i := range snapshot.Status.Members {
+		member := &snapshot.Status.Members[i]
+		publishedBootIDs[string(member.NodeUID)+"\x00"+string(member.PodUID)] = member.NodeBootID
+	}
 	selectedByName := make(map[string]*corev1.Node, len(selectedNodes))
 	selectedUIDs := make(map[types.UID]struct{}, len(selectedNodes))
 	for _, node := range selectedNodes {
@@ -1157,9 +1167,23 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 			continue
 		}
 		assignment.State = nvapi.ComputeDomainCliqueAssignmentStateBound
+		activationBootID := node.Status.NodeInfo.BootID
+		if assignment.EverPublished && assignment.CurrentPodUID == pod.UID {
+			// NodeBootID is the activation epoch for the exact published Pod,
+			// not a projection of the Node's latest boot. A Node reboot may
+			// restart a container in-place while Kubernetes retains the Pod
+			// UID. Preserve the original epoch so that the restarted daemon or
+			// a later replacement can prove that the old runtime was fenced by
+			// a real reboot. Updating it here would erase the only durable
+			// distinction between NodeReboot evidence and an unsafe same-boot
+			// replacement.
+			if publishedBootID, found := publishedBootIDs[string(node.UID)+"\x00"+string(pod.UID)]; found {
+				activationBootID = publishedBootID
+			}
+		}
 		members = append(members, nvapi.ComputeDomainCliqueMember{
 			Index: assignment.Index, NodeName: node.Name, NodeUID: node.UID,
-			NodeBootID: node.Status.NodeInfo.BootID,
+			NodeBootID: activationBootID,
 			PodName:    pod.Name, PodUID: pod.UID, PodIP: pod.Status.PodIP,
 			DaemonSetUID: ds.UID,
 		})

@@ -248,6 +248,26 @@ func TestRetirementAcceptsReplacementAfterVerifiedNodeReboot(t *testing.T) {
 	require.False(t, ready)
 }
 
+func TestRetirementAcceptsSamePodUIDAfterVerifiedNodeReboot(t *testing.T) {
+	manager, cd, original, core := retirementFixture(t, corev1.PodSucceeded)
+	_, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.NoError(t, err)
+	retiring, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots("driver").Get(context.Background(), original.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	core.nodes["node"].Status.NodeInfo.BootID = "boot-new"
+	evidence := retirementEvidenceFor(retiring, nvapi.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot, "daemon-pod", types.UID("daemon-pod-uid"), "boot-new")
+	_, err = manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences("driver").Create(context.Background(), evidence, metav1.CreateOptions{})
+	require.NoError(t, err)
+	delete(core.pods, podMapKey("driver", "daemon-pod"))
+
+	ready, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)
+	require.NoError(t, err)
+	require.False(t, ready)
+	fenced, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots("driver").Get(context.Background(), original.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, nvapi.ComputeDomainCliqueSnapshotPhaseFenced, fenced.Status.Phase)
+}
+
 func TestRetirementRejectsReplacementWithoutBootEpochChange(t *testing.T) {
 	manager, cd, original, _ := retirementFixture(t, corev1.PodSucceeded)
 	_, err := manager.PrepareComputeDomainRetirement(context.Background(), cd)

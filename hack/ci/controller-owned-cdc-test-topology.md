@@ -45,6 +45,33 @@ NVML. The value persists across Pod replacement and Node reboot. Every use logs
 a `TEST-ONLY synthetic GPU clique provider is active` warning with the Node and
 value. Treat absence of that warning as a failed test setup.
 
+## Form a controller-v1 fixture
+
+Persistent topology is only the hardware-discovery input. Controller-v1 also
+requires an explicit operator isolation boundary before it will attest a
+workload Node or create a snapshot. Use this order:
+
+1. Create the controller-v1 `ComputeDomain` without its workload Pod.
+2. Read the server-assigned ComputeDomain UID.
+3. Label **every Node reporting the synthetic clique ID** with that exact UID:
+
+   ```bash
+   cd_uid=$(kubectl get computedomain -n test-namespace test-domain \
+     -o jsonpath='{.metadata.uid}')
+   kubectl label node node001 node002 \
+     resource.nvidia.com/controllerOwnedComputeDomain="${cd_uid}" --overwrite
+   ```
+
+4. Create the workload Pod with a `nodeSelector`; do not set `spec.nodeName`
+   directly because that bypasses scheduler-driven DRA claim allocation.
+
+Until step 3 is complete, the controller deliberately publishes no route,
+reservation, or snapshot. If a candidate workload is created before isolation
+is complete, it emits a `WholeCliqueIsolationPending` warning Event on the
+ComputeDomain explaining the required label. The correct ordering above may
+complete isolation before there is a candidate and therefore need not emit the
+Event. Never bypass the isolation boundary to make a fixture advance.
+
 Two sentinel values support negative tests:
 
 - `<empty>` reports a successful discovery with no fabric clique;
@@ -60,7 +87,11 @@ kubectl annotate node node001 \
 
 Changing or removing the annotation while controller-v1 state is Active is a
 deliberate topology-failure injection. It is expected to fail closed and may
-quarantine the assignment. Do not use an Active fixture for a setup check.
+quarantine the assignment. `Quarantined` is the current observation state, not
+a terminal latch: the exact published Pod may return to `Bound` if the same
+topology and authorization become observable again. The published slot and
+index remain non-reusable until evidence-bearing retirement. Do not use an
+Active fixture for a setup check.
 
 ## What this proves
 

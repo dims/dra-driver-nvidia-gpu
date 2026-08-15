@@ -86,6 +86,8 @@ kubectl apply -f "${TMP_DIR}/controller-rbac.yaml"
 INSTALLATION_NAME="controller-owned-cdc-installation.dra-driver-nvidia-gpu"
 CONTROLLER_SUBJECT="$(kubectl get clusterrole "${INSTALLATION_NAME}" \
   -o jsonpath='{.metadata.annotations.resource\.nvidia\.com/controller-owned-cdc-controller-subject}')"
+test "$(kubectl auth can-i create events -n "${TEST_NAMESPACE}" --as="${CONTROLLER_SUBJECT}")" = "yes"
+echo "PASS: controller can create operator-action Events"
 
 # JSON Patch avoids resource-version races with the Node lifecycle controller.
 # The production controller uses Update; its exact object construction remains

@@ -156,17 +156,28 @@ Leave `ControllerOwnedCDCliques=false` until the CRD is Established and the
 dual-capable kubelet plugin has rolled out to every eligible node. Then opt in
 only a canary ComputeDomain by creating it with
 `resource.nvidia.com/requestedComputeDomainCliqueProtocol: controller-v1` and
-a positive `spec.numNodes` equal to the complete expected Node count. Before
-that creation, reserve the **entire physical clique** for the canary and use
+a positive `spec.numNodes` equal to the complete expected Node count. Use
 hardware that is either new or has been externally quiesced and reset. Prevent
 every legacy workload from beginning Prepare on that clique throughout
-controller-mode formation. The legacy path can check whether a reservation
-already exists, but only the later controller reconciliation atomically creates
-the reservation; those operations do not form one cross-protocol transaction.
-Deleting a legacy Kubernetes object is not proof that its old IMEX runtime
-stopped, so strict v1 does not treat ordinary legacy deletion as migration
-fence evidence. Enable leader election and topology publication and explicitly
-allowlist an operator-controlled canary namespace:
+controller-mode formation. After the ComputeDomain exists but before creating
+its workload Pods, read its server-assigned UID and label **every Node in the
+physical clique** with
+`resource.nvidia.com/controllerOwnedComputeDomain=<ComputeDomain UID>`. This is
+the explicit operator isolation boundary; the controller does not infer or
+write it. Until the whole clique is labeled, no Node route, reservation, or
+snapshot is created. If a candidate workload arrives before isolation is
+complete, the ComputeDomain receives a `WholeCliqueIsolationPending` warning
+Event. Use a scheduler-compatible
+`nodeSelector` for the workload rather than setting `spec.nodeName`, which
+bypasses DRA claim allocation.
+
+The legacy path can check whether a reservation already exists, but only the
+later controller reconciliation atomically creates the reservation; those
+operations do not form one cross-protocol transaction. Deleting a legacy
+Kubernetes object is not proof that its old IMEX runtime stopped, so strict v1
+does not treat ordinary legacy deletion as migration fence evidence. Enable
+leader election and topology publication and explicitly allowlist an
+operator-controlled canary namespace:
 
 ```yaml
 featureGates:
@@ -310,6 +321,14 @@ later Pod deletion cannot erase a verified fence. The controller then records
 `Fenced`, durably marks the reservation `Released`, removes the evidence,
 snapshot, and runtime objects, and clears the ComputeDomain finalizer. Watch
 `status.conditions[type=CliqueRetirementReady]` while deletion is in progress.
+
+`Quarantined` describes an assignment whose exact authorized Pod or topology is
+not currently observable; it is not itself a terminal one-way latch. The same
+published Pod may return to `Bound` when the exact topology and authorization
+become observable again. The safety ratchet is the durable published slot and
+index: neither can be handed to a different Pod or Node without verified fence
+evidence. A Node reboot retains the member's original activation boot ID so a
+restarted or replacement daemon can prove the distinct boot epoch.
 
 Do not force-delete daemon Pods, remove Node routing labels, or strip snapshot,
 reservation, evidence, or ComputeDomain finalizers during this sequence.

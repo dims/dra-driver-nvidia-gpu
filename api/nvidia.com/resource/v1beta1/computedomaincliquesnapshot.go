@@ -170,9 +170,12 @@ type ComputeDomainCliqueMember struct {
 	NodeName string `json:"nodeName"`
 	// +kubebuilder:validation:XValidation:rule="self != ''",message="nodeUID must not be empty"
 	NodeUID types.UID `json:"nodeUID"`
-	// NodeBootID is the kernel boot epoch observed when this member was
-	// published. Empty is accepted only for snapshots created before reboot
-	// evidence was introduced; those snapshots cannot use NodeReboot evidence.
+	// NodeBootID is the kernel boot epoch observed when this exact member Pod was
+	// first published. It remains the activation epoch if that Pod becomes
+	// temporarily unobservable and later returns, including when Kubernetes
+	// retains the Pod UID across a Node reboot. Empty is accepted only for
+	// snapshots created before reboot evidence was introduced; those snapshots
+	// cannot use NodeReboot evidence.
 	NodeBootID string `json:"nodeBootID,omitempty"`
 	// +kubebuilder:validation:MinLength=1
 	PodName string `json:"podName"`

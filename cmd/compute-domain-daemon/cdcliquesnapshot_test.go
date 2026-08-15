@@ -240,6 +240,27 @@ func TestSnapshotConsumerAcceptsReplacementOnlyAfterNodeReboot(t *testing.T) {
 	require.Equal(t, "boot-after-reboot", desired.RetirementEvidence.WitnessBootID)
 }
 
+func TestSnapshotConsumerUsesNodeRebootWhenPodUIDSurvivesReboot(t *testing.T) {
+	m := newTestSnapshotManager()
+	active := newTestSnapshot(t)
+	require.NoError(t, m.consume(active))
+	installed := <-m.desiredStateChan
+	m.MarkApplied(installed)
+
+	// Some node managers restart the container in-place after a machine reboot,
+	// retaining the Kubernetes Pod UID. The durable activation boot ID still
+	// proves that the previously authorized process epoch ended.
+	m.config.bootID = "boot-after-reboot"
+	retiring := active.DeepCopy()
+	retiring.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
+	require.NoError(t, m.consume(retiring))
+	desired := <-m.desiredStateChan
+	require.Equal(t, nvapi.ComputeDomainCliqueRetirementEvidenceReasonNodeReboot, desired.RetirementEvidence.Reason)
+	require.Equal(t, desired.RetirementEvidence.OriginalPodUID, desired.RetirementEvidence.WitnessPodUID)
+	require.Equal(t, "boot-a", desired.RetirementEvidence.ActivationBootID)
+	require.Equal(t, "boot-after-reboot", desired.RetirementEvidence.WitnessBootID)
+}
+
 func TestSnapshotConsumerRejectsInvalidSnapshots(t *testing.T) {
 	tests := map[string]func(*nvapi.ComputeDomainCliqueSnapshot){
 		"protocol mismatch": func(s *nvapi.ComputeDomainCliqueSnapshot) {

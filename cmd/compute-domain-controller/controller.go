@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
@@ -78,6 +79,11 @@ type ManagerConfig struct {
 	// controllerOwnedCDCliquesAvailable is set only after the cluster-scoped
 	// API preflight and the primary driver-namespace snapshot preflight pass.
 	controllerOwnedCDCliquesAvailable bool
+
+	// formationEventSink records low-frequency operator-action Events. It is
+	// injected here rather than constructed by tests' deliberately narrow Core
+	// clients, many of which implement only the Node and Pod APIs under test.
+	formationEventSink func(context.Context, *nvapi.ComputeDomain, string, string) error
 }
 
 // Controller manages the lifecycle of the DRA driver and its components.
@@ -180,6 +186,20 @@ func (c *Controller) Run(ctx context.Context) error {
 		metricsPath:                       c.config.flags.metricsPath,
 		imagePullSecretNames:              c.config.imagePullSecretNames,
 		controllerOwnedCDCliquesAvailable: controllerOwnedAvailable,
+	}
+	managerConfig.formationEventSink = func(ctx context.Context, cd *nvapi.ComputeDomain, reason, message string) error {
+		now := metav1.Now()
+		_, err := c.config.clientsets.Core.CoreV1().Events(cd.Namespace).Create(ctx, &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "computedomain-isolation-", Namespace: cd.Namespace},
+			InvolvedObject: corev1.ObjectReference{
+				APIVersion: nvapi.SchemeGroupVersion.String(), Kind: nvapi.ComputeDomainKind,
+				Namespace: cd.Namespace, Name: cd.Name, UID: cd.UID,
+			},
+			Reason: reason, Message: message, Type: corev1.EventTypeWarning,
+			Source:         corev1.EventSource{Component: "compute-domain-controller"},
+			FirstTimestamp: now, LastTimestamp: now, Count: 1,
+		}, metav1.CreateOptions{})
+		return err
 	}
 
 	// TODO: log full, nested cliFlags structure.

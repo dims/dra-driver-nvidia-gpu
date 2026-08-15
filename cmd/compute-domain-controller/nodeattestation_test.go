@@ -164,6 +164,34 @@ func TestNodeAttestationAcquiresReservationBeforePublishingControllerV1(t *testi
 	require.Equal(t, nvapi.ComputeDomainCliqueProtocolControllerV1, reservation.Spec.Protocol)
 }
 
+func TestNodeAttestationReportsMissingWholeCliqueIsolationOnce(t *testing.T) {
+	f := newNodeAttestationFixture(t, "isolation-event", nvapi.ComputeDomainCliqueProtocolControllerV1)
+	node := f.node.DeepCopy()
+	delete(node.Labels, controllerOwnedCliqueIsolationLabelKey)
+	f.core.putNode(node)
+	require.NoError(t, f.manager.attestationNodeInformer.GetStore().Update(node.DeepCopy()))
+
+	var reasons, messages []string
+	f.manager.formationEventSink = func(_ context.Context, cd *nvapi.ComputeDomain, reason, message string) error {
+		require.Equal(t, f.cd.UID, cd.UID)
+		reasons = append(reasons, reason)
+		messages = append(messages, message)
+		return nil
+	}
+	require.NoError(t, f.manager.reconcileNodeAttestation(context.Background(), node.Name))
+	require.NoError(t, f.manager.reconcileNodeAttestation(context.Background(), node.Name))
+	require.Equal(t, []string{"WholeCliqueIsolationPending"}, reasons)
+	require.Len(t, messages, 1)
+	require.Contains(t, messages[0], controllerOwnedCliqueIsolationLabelKey+"="+string(f.cd.UID))
+	require.Contains(t, messages[0], "physical-clique")
+
+	current, err := f.core.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, current.Labels[computeDomainLabelKey])
+	_, err = f.nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(context.Background(), physicalCliqueReservationName("physical-clique"), metav1.GetOptions{})
+	require.True(t, apierrors.IsNotFound(err), "missing operator isolation must not reserve or route the clique")
+}
+
 func TestLiveNodeAttestationRejectsStaleClaimAfterRestart(t *testing.T) {
 	f := newNodeAttestationFixture(t, "stale-claim", nvapi.ComputeDomainCliqueProtocolControllerV1)
 	require.NoError(t, f.manager.reconcileNodeAttestation(context.Background(), f.node.Name))

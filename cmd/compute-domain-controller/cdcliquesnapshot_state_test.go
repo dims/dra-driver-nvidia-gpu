@@ -180,7 +180,7 @@ func (h *controllerOwnedCliqueHarness) addNodeAndPod(t *testing.T, ordinal int) 
 			computeDomainCliqueStartupAnnotationKey:    h.cliqueID,
 			computeDomainCliqueCapabilityAnnotationKey: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
 		},
-	}}
+	}, Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{BootID: fmt.Sprintf("boot-%02d", ordinal)}}}
 	setTestNodeAttestation(t, node, string(h.cd.UID), fmt.Sprintf("pod-uid-%02d", ordinal))
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -448,4 +448,62 @@ func TestControllerOwnedCliqueExpectedSetFormationActionSequence(t *testing.T) {
 	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
 	require.Equal(t, writesBeforeNoop, countFakeMutations(h.observed, "computedomaincliquesnapshots")+countFakeMutations(h.observed, "computedomaincliquereservations"))
 	require.Empty(t, h.observed[6:])
+}
+
+func TestPublishedMemberPreservesActivationBootIDAcrossQuarantineRecovery(t *testing.T) {
+	h := newControllerOwnedCliqueHarness(t, 1)
+	h.addNodeAndPod(t, 0)
+
+	// Create the reservation and snapshot, add the fence finalizer, then
+	// publish the first complete Active generation.
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	h.syncSnapshotInformer(t)
+	h.manager.batchStarted[h.key] = time.Now().Add(-snapshotHardDeadline)
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	h.syncSnapshotInformer(t)
+	h.manager.batchStarted[h.key] = time.Now().Add(-snapshotHardDeadline)
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	active := h.syncSnapshotInformer(t)
+	require.Equal(t, nvapi.ComputeDomainCliqueSnapshotPhaseActive, active.Status.Phase)
+	require.EqualValues(t, 1, active.Status.Generation)
+	require.Len(t, active.Status.Members, 1)
+	require.Equal(t, "boot-00", active.Status.Members[0].NodeBootID)
+	originalHash := active.Status.Hash
+	originalPodUID := active.Status.Members[0].PodUID
+
+	// Model the observation gap seen during a real reboot. The published Pod is
+	// temporarily absent, so the assignment quarantines and the last authorized
+	// member map remains frozen.
+	podObjects := h.manager.podInformer.GetStore().List()
+	require.Len(t, podObjects, 1)
+	publishedPod, ok := podObjects[0].(*corev1.Pod)
+	require.True(t, ok)
+	pod := publishedPod.DeepCopy()
+	require.NoError(t, h.manager.podInformer.GetStore().Delete(pod))
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	quarantined := h.syncSnapshotInformer(t)
+	require.Equal(t, nvapi.ComputeDomainCliqueAssignmentStateQuarantined, quarantined.Status.Assignments[0].State)
+	require.Equal(t, "boot-00", quarantined.Status.Members[0].NodeBootID)
+	require.Equal(t, originalHash, quarantined.Status.Hash)
+
+	// Kubernetes may preserve the Pod UID while restarting its container after
+	// the Node boots. Recovery to Bound is safe for the exact incumbent, but it
+	// must not rewrite the activation epoch or roll the authorized generation.
+	nodeObject, exists, err := h.manager.nodeInformer.GetStore().GetByKey("node-00")
+	require.NoError(t, err)
+	require.True(t, exists)
+	publishedNode, ok := nodeObject.(*corev1.Node)
+	require.True(t, ok)
+	rebootedNode := publishedNode.DeepCopy()
+	rebootedNode.Status.NodeInfo.BootID = "boot-after-reboot"
+	require.NoError(t, h.manager.nodeInformer.GetStore().Update(rebootedNode))
+	require.NoError(t, h.manager.podInformer.GetStore().Add(pod))
+	h.manager.rebuildSelectedNodeState()
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	recovered := h.syncSnapshotInformer(t)
+	require.Equal(t, nvapi.ComputeDomainCliqueAssignmentStateBound, recovered.Status.Assignments[0].State)
+	require.Equal(t, originalPodUID, recovered.Status.Members[0].PodUID)
+	require.Equal(t, "boot-00", recovered.Status.Members[0].NodeBootID)
+	require.Equal(t, originalHash, recovered.Status.Hash)
+	require.EqualValues(t, 1, recovered.Status.Generation)
 }
