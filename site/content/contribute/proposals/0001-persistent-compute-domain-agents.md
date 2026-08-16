@@ -635,6 +635,8 @@ speculative APIs.
 - Applied annotation is written only after durable receipt and READY.
 - Ready -> NotReady -> Ready and unrelated-reconcile stability.
 - Zero/one/multiple snapshot behavior in the persistent agent.
+- Exact Helm `run --persistent-agent` and `check --persistent-agent` argv parse
+  through the real CLI application.
 - Two sequential ComputeDomains reuse the same agent Pod safely.
 - Active -> Retiring -> Fenced -> Released with ProcessExit evidence.
 - NodeReboot recovery and same-boot replacement quarantine.

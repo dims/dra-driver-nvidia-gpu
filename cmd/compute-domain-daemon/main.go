@@ -176,12 +176,6 @@ func newApp() *cli.App {
 			Destination: &flags.protocol,
 		},
 		&cli.BoolFlag{
-			Name:        "persistent-agent",
-			Usage:       "Run as the installation-scoped persistent ComputeDomain agent.",
-			EnvVars:     []string{"PERSISTENT_AGENT"},
-			Destination: &flags.persistentAgent,
-		},
-		&cli.BoolFlag{
 			Name:        "persistent-agent-cdi",
 			Usage:       "Internal proof that persistent-agent CDI edits were applied.",
 			EnvVars:     []string{"PERSISTENT_AGENT_CDI"},
@@ -211,6 +205,7 @@ func newApp() *cli.App {
 			{
 				Name:  "run",
 				Usage: "Run the compute domain daemon",
+				Flags: []cli.Flag{persistentAgentCLIFlag(flags)},
 				Before: func(c *cli.Context) error {
 					// `check` (e.g. startupProbe) does not use this hook — avoid noisy logs on every probe.
 					pkgflags.LogStartupConfig(flags, loggingConfig)
@@ -223,6 +218,7 @@ func newApp() *cli.App {
 			{
 				Name:  "check",
 				Usage: "Check if the node is IMEX capable and if the IMEX daemon is ready",
+				Flags: []cli.Flag{persistentAgentCLIFlag(flags)},
 				Action: func(c *cli.Context) error {
 					return wrapper(c.Context, check)
 				},
@@ -231,6 +227,15 @@ func newApp() *cli.App {
 	}
 
 	return app
+}
+
+func persistentAgentCLIFlag(flags *Flags) cli.Flag {
+	return &cli.BoolFlag{
+		Name:        "persistent-agent",
+		Usage:       "Run as the installation-scoped persistent ComputeDomain agent.",
+		EnvVars:     []string{"PERSISTENT_AGENT"},
+		Destination: &flags.persistentAgent,
+	}
 }
 
 // Run invokes the IMEX daemon and manages its lifecycle.
