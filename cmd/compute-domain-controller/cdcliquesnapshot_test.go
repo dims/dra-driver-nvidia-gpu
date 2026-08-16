@@ -213,7 +213,8 @@ func TestValidateExistingSnapshotRejectsNonCanonicalScope(t *testing.T) {
 		},
 	}
 	config := &ManagerConfig{driverNamespace: "driver", maxNodesPerIMEXDomain: 18}
-	require.NoError(t, validateExistingSnapshot(snapshot, cd, ds, config))
+	provider := snapshotDaemonProvider{protocol: nvapi.ComputeDomainCliqueProtocolControllerV1, daemonSet: ds}
+	require.NoError(t, validateExistingSnapshot(snapshot, cd, provider, config))
 
 	tests := map[string]func(*nvapi.ComputeDomainCliqueSnapshot){
 		"wrong capacity": func(candidate *nvapi.ComputeDomainCliqueSnapshot) { candidate.Spec.Capacity = 17 },
@@ -229,7 +230,7 @@ func TestValidateExistingSnapshotRejectsNonCanonicalScope(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			candidate := snapshot.DeepCopy()
 			mutate(candidate)
-			require.Error(t, validateExistingSnapshot(candidate, cd, ds, config))
+			require.Error(t, validateExistingSnapshot(candidate, cd, provider, config))
 		})
 	}
 }

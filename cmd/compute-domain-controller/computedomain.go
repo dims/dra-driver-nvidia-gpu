@@ -469,7 +469,7 @@ func (m *ComputeDomainManager) calculateGlobalStatus(cd *nvapi.ComputeDomain) st
 	// process. Preserve that value across unrelated ComputeDomain and condition
 	// updates instead of overwriting it with legacy node aggregation.
 	protocol, err := computeDomainCliqueProtocol(cd)
-	if err == nil && protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+	if err == nil && controllerOwnedProtocol(protocol) {
 		if cd.Status.Status == nvapi.ComputeDomainStatusReady {
 			return nvapi.ComputeDomainStatusReady
 		}
@@ -575,6 +575,14 @@ func computeDomainCliqueProtocol(cd *nvapi.ComputeDomain) (nvapi.ComputeDomainCl
 	return nvapi.EffectiveComputeDomainCliqueProtocol(protocol), nil
 }
 
+func controllerOwnedProtocol(protocol nvapi.ComputeDomainCliqueProtocol) bool {
+	return protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 || protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1
+}
+
+func usesPerDomainDaemon(protocol nvapi.ComputeDomainCliqueProtocol) bool {
+	return protocol != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1
+}
+
 func (m *ComputeDomainManager) onAddOrUpdate(ctx context.Context, obj any) error {
 	cd, ok := obj.(*nvapi.ComputeDomain)
 	if !ok {
@@ -610,7 +618,7 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 		if protocolErr != nil {
 			return fmt.Errorf("invalid ComputeDomain clique protocol during deletion: %w", protocolErr)
 		}
-		if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		if controllerOwnedProtocol(protocol) {
 			if m.controllerOwnedCliqueManager == nil {
 				return fmt.Errorf("controller-owned clique retirement manager is unavailable")
 			}
@@ -628,7 +636,7 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 				}
 				return fmt.Errorf("controller-owned clique retirement is waiting for durable runtime-fence evidence")
 			}
-			if err := m.updateRetirementCondition(ctx, cd, metav1.ConditionTrue, "RuntimeFenced", "all published controller-v1 clique runtimes have durable process-exit or node-reboot evidence"); err != nil {
+			if err := m.updateRetirementCondition(ctx, cd, metav1.ConditionTrue, "RuntimeFenced", "all published controller-owned clique runtimes have durable process-exit or node-reboot evidence"); err != nil {
 				return fmt.Errorf("record controller-owned clique retirement readiness: %w", err)
 			}
 		}
@@ -637,11 +645,13 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 			return fmt.Errorf("error deleting ResourceClaimTemplate: %w", err)
 		}
 
-		if err := m.daemonSetManager.Delete(ctx, string(cd.UID)); err != nil {
-			return fmt.Errorf("error deleting DaemonSet: %w", err)
+		if usesPerDomainDaemon(protocol) {
+			if err := m.daemonSetManager.Delete(ctx, string(cd.UID)); err != nil {
+				return fmt.Errorf("error deleting DaemonSet: %w", err)
+			}
 		}
 
-		if err := m.nodeManager.RemoveComputeDomainLabelsAndAttestations(ctx, string(cd.UID), protocol == nvapi.ComputeDomainCliqueProtocolControllerV1); err != nil {
+		if err := m.nodeManager.RemoveComputeDomainLabelsAndAttestations(ctx, string(cd.UID), controllerOwnedProtocol(protocol)); err != nil {
 			return fmt.Errorf("error removing ComputeDomain node labels: %w", err)
 		}
 
@@ -653,15 +663,17 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 			return fmt.Errorf("error asserting removal of ResourceClaimTemplate: %w", err)
 		}
 
-		if err := m.daemonSetManager.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
-			return fmt.Errorf("error removing finalizer on DaemonSet: %w", err)
+		if usesPerDomainDaemon(protocol) {
+			if err := m.daemonSetManager.RemoveFinalizer(ctx, string(cd.UID)); err != nil {
+				return fmt.Errorf("error removing finalizer on DaemonSet: %w", err)
+			}
+
+			if err := m.daemonSetManager.AssertRemoved(ctx, string(cd.UID)); err != nil {
+				return fmt.Errorf("error asserting removal of DaemonSet: %w", err)
+			}
 		}
 
-		if err := m.daemonSetManager.AssertRemoved(ctx, string(cd.UID)); err != nil {
-			return fmt.Errorf("error asserting removal of DaemonSet: %w", err)
-		}
-
-		if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		if controllerOwnedProtocol(protocol) {
 			if err := m.DeleteSnapshots(ctx, string(cd.UID)); err != nil {
 				// Kubernetes object disappearance is not a runtime fence. Preserve
 				// tombstones and the ComputeDomain finalizer until durable retirement
@@ -692,16 +704,18 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 	if err != nil {
 		return fmt.Errorf("invalid ComputeDomain clique protocol: %w", err)
 	}
-	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 && !m.config.controllerOwnedCDCliquesAvailable {
-		return fmt.Errorf("controller-v1 requested but ComputeDomainCliqueSnapshot API is unavailable")
+	if controllerOwnedProtocol(protocol) && !m.config.controllerOwnedCDCliquesAvailable {
+		return fmt.Errorf("%s requested but ComputeDomainCliqueSnapshot API is unavailable", protocol)
 	}
 
 	// Do not wait for the next periodic label cleanup to happen.
 	m.nodeManager.RemoveStaleComputeDomainLabelsAsync(ctx)
 
 	// Create the DaemonsetManager.
-	if _, err := m.daemonSetManager.Create(ctx, cd); err != nil {
-		return fmt.Errorf("error creating DaemonSet: %w", err)
+	if usesPerDomainDaemon(protocol) {
+		if _, err := m.daemonSetManager.Create(ctx, cd); err != nil {
+			return fmt.Errorf("error creating DaemonSet: %w", err)
+		}
 	}
 
 	// Create the ResourceClaimTemplateManager.

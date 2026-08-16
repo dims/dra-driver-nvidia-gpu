@@ -164,6 +164,34 @@ func newControllerOwnedCliqueHarness(t *testing.T, expectedNodes int) *controlle
 	return h
 }
 
+func newPersistentAgentCliqueHarness(t *testing.T, expectedNodes int) *controllerOwnedCliqueHarness {
+	t.Helper()
+	h := newControllerOwnedCliqueHarness(t, expectedNodes)
+	h.cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation] = string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
+	require.NoError(t, h.manager.computeDomainInformer.GetStore().Update(h.cd.DeepCopy()))
+	require.NoError(t, h.manager.daemonSetInformer.GetStore().Delete(h.daemonSet))
+	h.daemonSet = &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      persistentAgentDaemonSetName,
+			Namespace: "driver",
+			UID:       types.UID("persistent-agent-ds-uid"),
+			Labels:    map[string]string{persistentAgentLabelKey: "true"},
+		},
+		Spec: appsv1.DaemonSetSpec{
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{Type: appsv1.OnDeleteDaemonSetStrategyType},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{persistentAgentLabelKey: "true"}},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: persistentAgentServiceAccountName,
+					Containers:         []corev1.Container{{Name: "compute-domain-daemon", Command: []string{"compute-domain-daemon", "run", "--persistent-agent"}}},
+				},
+			},
+		},
+	}
+	require.NoError(t, h.manager.daemonSetInformer.GetStore().Add(h.daemonSet.DeepCopy()))
+	return h
+}
+
 func (h *controllerOwnedCliqueHarness) addNodeAndPod(t *testing.T, ordinal int) {
 	t.Helper()
 	controller := true
@@ -182,12 +210,16 @@ func (h *controllerOwnedCliqueHarness) addNodeAndPod(t *testing.T, ordinal int) 
 		},
 	}, Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{BootID: fmt.Sprintf("boot-%02d", ordinal)}}}
 	setTestNodeAttestation(t, node, string(h.cd.UID), fmt.Sprintf("pod-uid-%02d", ordinal))
+	podLabels := map[string]string{computeDomainLabelKey: string(h.cd.UID)}
+	if h.cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation] == string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1) {
+		podLabels = map[string]string{persistentAgentLabelKey: "true"}
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "daemon-" + nodeName,
 			Namespace: "driver",
 			UID:       types.UID(fmt.Sprintf("pod-uid-%02d", ordinal)),
-			Labels:    map[string]string{computeDomainLabelKey: string(h.cd.UID)},
+			Labels:    podLabels,
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: appsv1.SchemeGroupVersion.String(),
 				Kind:       "DaemonSet",
@@ -448,6 +480,32 @@ func TestControllerOwnedCliqueExpectedSetFormationActionSequence(t *testing.T) {
 	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
 	require.Equal(t, writesBeforeNoop, countFakeMutations(h.observed, "computedomaincliquesnapshots")+countFakeMutations(h.observed, "computedomaincliquereservations"))
 	require.Empty(t, h.observed[6:])
+}
+
+func TestPersistentAgentExpectedSetUsesSharedStateMachine(t *testing.T) {
+	h := newPersistentAgentCliqueHarness(t, 2)
+	h.addNodeAndPod(t, 0)
+	h.addNodeAndPod(t, 1)
+
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	snapshot := h.syncSnapshotInformer(t)
+	require.Equal(t, nvapi.ComputeDomainCliqueProtocolPersistentAgentV1, snapshot.Spec.Protocol)
+	require.Empty(t, snapshot.OwnerReferences, "installation-scoped agent deletion must not garbage-collect a published snapshot")
+	h.manager.batchStarted[h.key] = time.Now().Add(-snapshotHardDeadline)
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	h.syncSnapshotInformer(t)
+	h.manager.batchStarted[h.key] = time.Now().Add(-snapshotHardDeadline)
+	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
+	snapshot = h.syncSnapshotInformer(t)
+
+	require.Equal(t, nvapi.ComputeDomainCliqueSnapshotPhaseActive, snapshot.Status.Phase)
+	require.Len(t, snapshot.Status.Members, 2)
+	require.Equal(t, 3, countFakeMutations(h.observed, "computedomaincliquesnapshots"))
+	require.Equal(t, 2, countFakeMutations(h.observed, "computedomaincliquereservations"))
+	for _, action := range h.observed {
+		require.NotEqual(t, "daemonsets", action.resource)
+		require.NotEqual(t, "resourceclaimtemplates", action.resource)
+	}
 }
 
 func TestPublishedMemberPreservesActivationBootIDAcrossQuarantineRecovery(t *testing.T) {

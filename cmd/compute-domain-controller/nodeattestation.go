@@ -543,8 +543,8 @@ func (m *ControllerOwnedCliqueManager) validateAttestationCandidate(pod *corev1.
 			continue
 		}
 		// Legacy routing remains kubelet-owned for brownfield compatibility.
-		// Only controller-v1 accepts this controller-issued attestation.
-		if protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		// Controller-owned protocols share this claim-backed attestation.
+		if !controllerOwnedProtocol(protocol) {
 			continue
 		}
 		if err := validateExistingResourceClaimTemplate(rct, cd.Namespace, cd.Spec.Channel.ResourceClaimTemplate.Name, cd.UID,
@@ -648,6 +648,12 @@ func (m *ControllerOwnedCliqueManager) publishNodeAttestation(ctx context.Contex
 		return nil
 	}
 	_, err := m.config.clientsets.Core.CoreV1().Nodes().Update(ctx, updated, metav1.UpdateOptions{})
-	observeCliqueAPIAction(metrics.CliqueAPIResourceNode, metrics.CliqueAPIOperationAttestationUpdate, err)
+	protocol := nvapi.ComputeDomainCliqueProtocolControllerV1
+	if candidate.computeDomain != nil {
+		if candidateProtocol, protocolErr := computeDomainCliqueProtocol(candidate.computeDomain); protocolErr == nil {
+			protocol = candidateProtocol
+		}
+	}
+	observeCliqueAPIAction(metrics.CliqueAPIResourceNode, metrics.CliqueAPIOperationAttestationUpdate, err, protocol)
 	return err
 }

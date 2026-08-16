@@ -196,7 +196,7 @@ func (m *ComputeDomainStatusManager) sync(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, cd := range cds {
 		protocol, protocolErr := computeDomainCliqueProtocol(cd)
-		if protocolErr != nil || protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		if protocolErr != nil || controllerOwnedProtocol(protocol) {
 			// Controller-v1 identity and readiness come from the snapshot and Pod
 			// condition. Do not overwrite it with legacy CDC aggregation.
 			continue

@@ -28,11 +28,14 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/informers"
 	appslisters "k8s.io/client-go/listers/apps/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -59,6 +62,7 @@ const (
 	computeDomainUIDIndex                      = "computeDomainUID"
 	computeDomainCliqueIndex                   = "computeDomainClique"
 	podComputeDomainNodeIndex                  = "computeDomainNode"
+	persistentAgentPodNodeIndex                = "persistentAgentNode"
 	workloadPodNodeIndex                       = "workloadNode"
 	workloadPodClaimIndex                      = "workloadClaim"
 	workloadPodTemplateIndex                   = "workloadClaimTemplate"
@@ -66,6 +70,10 @@ const (
 	computeDomainAttestationAnnotationKey      = "resource.nvidia.com/computeDomainAttestation"
 	controllerOwnedCliqueIsolationLabelKey     = "resource.nvidia.com/controllerOwnedComputeDomain"
 	physicalCliqueIndex                        = "physicalClique"
+	persistentAgentLabelKey                    = "resource.nvidia.com/persistentComputeDomainAgent"
+	snapshotProtocolLabelKey                   = "resource.nvidia.com/computeDomainCliqueProtocol"
+	persistentAgentDaemonSetName               = "dra-driver-nvidia-gpu-persistent-agent"
+	persistentAgentServiceAccountName          = "compute-domain-daemon-reader-service-account"
 )
 
 type snapshotWriteBarrier struct {
@@ -146,7 +154,7 @@ type selectedNodeSummary struct {
 	topologyReady int
 }
 
-func observeCliqueAPIAction(resource, operation string, err error) {
+func observeCliqueAPIAction(resource, operation string, err error, protocols ...nvapi.ComputeDomainCliqueProtocol) {
 	result := metrics.CliqueAPIResultSuccess
 	switch {
 	case apierrors.IsAlreadyExists(err):
@@ -165,8 +173,12 @@ func observeCliqueAPIAction(resource, operation string, err error) {
 		result = metrics.CliqueAPIResultError
 	}
 	mutated := err == nil && operation != metrics.CliqueAPIOperationGet && operation != metrics.CliqueAPIOperationWriteBarrierGet
+	protocol := nvapi.ComputeDomainCliqueProtocolControllerV1
+	if len(protocols) != 0 {
+		protocol = protocols[0]
+	}
 	metrics.ObserveCliqueAPIAction(
-		string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+		string(protocol),
 		resource,
 		operation,
 		result,
@@ -175,9 +187,6 @@ func observeCliqueAPIAction(resource, operation string, err error) {
 }
 
 func NewControllerOwnedCliqueManager(config *ManagerConfig) *ControllerOwnedCliqueManager {
-	selector := &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
-		Key: computeDomainLabelKey, Operator: metav1.LabelSelectorOpExists,
-	}}}
 	// Workload Pods and their claims cannot be filtered by the routing label:
 	// those are the facts from which the controller derives authorization.
 	workloadCoreFactory := informers.NewSharedInformerFactory(config.clientsets.Core, 0)
@@ -186,9 +195,6 @@ func NewControllerOwnedCliqueManager(config *ManagerConfig) *ControllerOwnedCliq
 		config.clientsets.Core,
 		informerResyncPeriod,
 		informers.WithNamespace(config.driverNamespace),
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = metav1.FormatLabelSelector(selector)
-		}),
 	)
 	nvidiaFactory := nvinformers.NewSharedInformerFactoryWithOptions(
 		config.clientsets.Nvidia,
@@ -196,8 +202,32 @@ func NewControllerOwnedCliqueManager(config *ManagerConfig) *ControllerOwnedCliq
 		nvinformers.WithNamespace(config.driverNamespace),
 	)
 	computeDomainFactory := nvinformers.NewSharedInformerFactory(config.clientsets.Nvidia, informerResyncPeriod)
-	resourceClaimInformer := workloadCoreFactory.Resource().V1().ResourceClaims().Informer()
-	claimTemplateInformer := workloadCoreFactory.Resource().V1().ResourceClaimTemplates().Informer()
+	resourceClaimInformer := cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+				return config.clientsets.Resource.ResourceClaims(metav1.NamespaceAll).List(ctx, options)
+			},
+			WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+				return config.clientsets.Resource.ResourceClaims(metav1.NamespaceAll).Watch(ctx, options)
+			},
+		},
+		&resourceapi.ResourceClaim{},
+		0,
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+	)
+	claimTemplateInformer := cache.NewSharedIndexInformer(
+		&cache.ListWatch{
+			ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+				return config.clientsets.Resource.ResourceClaimTemplates(metav1.NamespaceAll).List(ctx, options)
+			},
+			WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+				return config.clientsets.Resource.ResourceClaimTemplates(metav1.NamespaceAll).Watch(ctx, options)
+			},
+		},
+		&resourceapi.ResourceClaimTemplate{},
+		0,
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+	)
 	reservationInformer := computeDomainFactory.Resource().V1beta1().ComputeDomainCliqueReservations().Informer()
 
 	m := &ControllerOwnedCliqueManager{
@@ -280,7 +310,8 @@ func (m *ControllerOwnedCliqueManager) addInformerIndexes() error {
 		return fmt.Errorf("adding Node clique indexes: %w", err)
 	}
 	if err := m.podInformer.AddIndexers(cache.Indexers{
-		podComputeDomainNodeIndex: podComputeDomainNodeIndexKeys,
+		podComputeDomainNodeIndex:   podComputeDomainNodeIndexKeys,
+		persistentAgentPodNodeIndex: persistentAgentPodNodeIndexKeys,
 	}); err != nil {
 		return fmt.Errorf("adding Pod ComputeDomain/Node index: %w", err)
 	}
@@ -383,6 +414,8 @@ func (m *ControllerOwnedCliqueManager) Start(ctx context.Context) error {
 	}
 
 	m.workloadCoreFactory.Start(ctx.Done())
+	go m.resourceClaimInformer.Run(ctx.Done())
+	go m.claimTemplateInformer.Run(ctx.Done())
 	m.namespacedCoreFactory.Start(ctx.Done())
 	m.computeDomainFactory.Start(ctx.Done())
 	m.nvidiaFactory.Start(ctx.Done())
@@ -434,6 +467,13 @@ func (m *ControllerOwnedCliqueManager) enqueueObject(obj any) {
 		if cdUID != "" {
 			m.enqueueExistingForComputeDomain(cdUID)
 		}
+		if object.Labels[persistentAgentLabelKey] == "true" {
+			for _, cached := range m.snapshotInformer.GetStore().List() {
+				if snapshot, ok := cached.(*nvapi.ComputeDomainCliqueSnapshot); ok && nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol) == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+					m.queue.Add(snapshot.Namespace + "/" + snapshot.Name)
+				}
+			}
+		}
 	case *nvapi.ComputeDomainCliqueSnapshot:
 		m.queue.Add(object.Namespace + "/" + object.Name)
 	}
@@ -461,6 +501,17 @@ func podComputeDomainNodeIndexKeys(obj any) ([]string, error) {
 		return nil, nil
 	}
 	return []string{uid + "\x00" + pod.Spec.NodeName}, nil
+}
+
+func persistentAgentPodNodeIndexKeys(obj any) ([]string, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return nil, fmt.Errorf("expected Pod, got %T", obj)
+	}
+	if pod.Labels[persistentAgentLabelKey] != "true" || pod.Spec.NodeName == "" {
+		return nil, nil
+	}
+	return []string{pod.Spec.NodeName}, nil
 }
 
 func selectedNodeStateFor(node *corev1.Node) (selectedNodeState, bool) {
@@ -622,6 +673,13 @@ func (m *ControllerOwnedCliqueManager) expectedSetReady(cdUID string, expected i
 
 func (m *ControllerOwnedCliqueManager) enqueuePod(pod *corev1.Pod) {
 	cdUID := pod.Labels[computeDomainLabelKey]
+	if pod.Labels[persistentAgentLabelKey] == "true" && pod.Spec.NodeName != "" {
+		if node, err := m.nodeLister.Get(pod.Spec.NodeName); err == nil {
+			if state, selected := selectedNodeStateFor(node); selected {
+				m.enqueueNodeState(state)
+			}
+		}
+	}
 	if cdUID == "" || pod.Spec.NodeName == "" {
 		return
 	}
@@ -661,17 +719,39 @@ func (m *ControllerOwnedCliqueManager) runWorker(ctx context.Context) {
 			return
 		}
 		started := time.Now()
+		protocol := m.protocolForKey(key)
 		err := m.reconcile(ctx, key)
 		if err != nil {
-			metrics.ObserveCliqueReconcile(string(nvapi.ComputeDomainCliqueProtocolControllerV1), "error", time.Since(started))
+			metrics.ObserveCliqueReconcile(string(protocol), "error", time.Since(started))
 			klog.Errorf("reconciling controller-owned clique %s: %v", key, err)
 			m.queue.AddRateLimited(key)
 		} else {
-			metrics.ObserveCliqueReconcile(string(nvapi.ComputeDomainCliqueProtocolControllerV1), "success", time.Since(started))
+			metrics.ObserveCliqueReconcile(string(protocol), "success", time.Since(started))
 			m.queue.Forget(key)
 		}
 		m.queue.Done(key)
 	}
+}
+
+func (m *ControllerOwnedCliqueManager) protocolForKey(key string) nvapi.ComputeDomainCliqueProtocol {
+	if obj, exists, _ := m.snapshotInformer.GetIndexer().GetByKey(key); exists {
+		if snapshot, ok := obj.(*nvapi.ComputeDomainCliqueSnapshot); ok {
+			return nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol)
+		}
+	}
+	m.pendingMu.Lock()
+	scope, found := m.pendingScopes[key]
+	m.pendingMu.Unlock()
+	if found {
+		if objects, err := m.computeDomainInformer.GetIndexer().ByIndex("uid", scope.computeDomainUID); err == nil && len(objects) == 1 {
+			if cd, ok := objects[0].(*nvapi.ComputeDomain); ok {
+				if protocol, err := computeDomainCliqueProtocol(cd); err == nil {
+					return protocol
+				}
+			}
+		}
+	}
+	return nvapi.ComputeDomainCliqueProtocolControllerV1
 }
 
 func (m *ControllerOwnedCliqueManager) recordWrite(key, rv string) {
@@ -704,7 +784,7 @@ func (m *ControllerOwnedCliqueManager) informerObservedLastWrite(ctx context.Con
 			return false, nil, splitErr
 		}
 		current, getErr := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).Get(ctx, name, metav1.GetOptions{})
-		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationWriteBarrierGet, getErr)
+		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationWriteBarrierGet, getErr, m.protocolForKey(key))
 		if getErr != nil {
 			return false, nil, fmt.Errorf("verify stalled snapshot write barrier: %w", getErr)
 		}
@@ -809,14 +889,14 @@ func (m *ControllerOwnedCliqueManager) createSnapshotForPodSet(ctx context.Conte
 		return nil
 	}
 	protocol, err := computeDomainCliqueProtocol(owner)
-	if err != nil || protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+	if err != nil || !controllerOwnedProtocol(protocol) {
 		return err
 	}
-	ds, err := m.daemonSetFor(namespace, owner)
+	provider, err := m.daemonProviderFor(namespace, owner, protocol)
 	if err != nil {
 		return err
 	}
-	if ds == nil || ds.DeletionTimestamp != nil {
+	if provider.daemonSet == nil || provider.daemonSet.DeletionTimestamp != nil {
 		return nil
 	}
 	// Reserve the physical clique before the namespaced snapshot exists. The
@@ -829,24 +909,21 @@ func (m *ControllerOwnedCliqueManager) createSnapshotForPodSet(ctx context.Conte
 	if err := m.reservePhysicalClique(ctx, owner, cliqueID); err != nil {
 		return err
 	}
-	controller := true
 	snapshot := &nvapi.ComputeDomainCliqueSnapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name, Namespace: namespace,
-			Labels: map[string]string{computeDomainLabelKey: cdUID, computeDomainCliqueLabelKey: cliqueID},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "DaemonSet",
-				Name: ds.Name, UID: ds.UID, Controller: &controller,
-			}},
+			Labels:          map[string]string{computeDomainLabelKey: cdUID, computeDomainCliqueLabelKey: cliqueID, snapshotProtocolLabelKey: string(protocol)},
+			OwnerReferences: provider.ownerReferences(),
 		},
 		Spec: nvapi.ComputeDomainCliqueSnapshotSpec{
 			ComputeDomainUID: owner.UID,
 			CliqueID:         cliqueID,
 			Capacity:         m.config.maxNodesPerIMEXDomain,
+			Protocol:         protocol,
 		},
 	}
 	created, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).Create(ctx, snapshot, metav1.CreateOptions{})
-	observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationCreate, err)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationCreate, err, protocol)
 	if apierrors.IsAlreadyExists(err) {
 		return nil
 	}
@@ -860,6 +937,10 @@ func (m *ControllerOwnedCliqueManager) createSnapshotForPodSet(ctx context.Conte
 }
 
 func (m *ControllerOwnedCliqueManager) reservePhysicalClique(ctx context.Context, owner *nvapi.ComputeDomain, cliqueID string) error {
+	protocol, protocolErr := computeDomainCliqueProtocol(owner)
+	if protocolErr != nil {
+		return protocolErr
+	}
 	reservation := &nvapi.ComputeDomainCliqueReservation{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   cdclique.ReservationName(cliqueID),
@@ -889,7 +970,7 @@ func (m *ControllerOwnedCliqueManager) reservePhysicalClique(ctx context.Context
 		}
 	}
 	created, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Create(ctx, reservation, metav1.CreateOptions{})
-	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationCreate, err)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationCreate, err, protocol)
 	if err == nil {
 		return m.validateAndRememberReservation(created, reservation.Spec)
 	}
@@ -897,7 +978,7 @@ func (m *ControllerOwnedCliqueManager) reservePhysicalClique(ctx context.Context
 		return fmt.Errorf("reserve physical clique %q: %w", cliqueID, err)
 	}
 	existing, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, reservation.Name, metav1.GetOptions{})
-	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err, protocol)
 	if err != nil {
 		return fmt.Errorf("read existing physical clique reservation %q: %w", reservation.Name, err)
 	}
@@ -980,7 +1061,45 @@ func candidatePodsForNodes(indexer cache.Indexer, cdUID string, nodes []*corev1.
 	return pods, nil
 }
 
+type snapshotDaemonProvider struct {
+	protocol  nvapi.ComputeDomainCliqueProtocol
+	daemonSet *appsv1.DaemonSet
+}
+
+func (p snapshotDaemonProvider) candidatePods(indexer cache.Indexer, cdUID string, nodes []*corev1.Node) ([]*corev1.Pod, error) {
+	if p.protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		return candidatePodsForNodes(indexer, cdUID, nodes)
+	}
+	pods := make([]*corev1.Pod, 0, len(nodes))
+	for _, node := range nodes {
+		objects, err := indexer.ByIndex(persistentAgentPodNodeIndex, node.Name)
+		if err != nil {
+			return nil, err
+		}
+		for _, object := range objects {
+			pod, ok := object.(*corev1.Pod)
+			if !ok {
+				return nil, fmt.Errorf("unexpected persistent agent Pod cache object %T", object)
+			}
+			pods = append(pods, pod)
+		}
+	}
+	return pods, nil
+}
+
+func (p snapshotDaemonProvider) ownerReferences() []metav1.OwnerReference {
+	if p.protocol != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		return nil
+	}
+	controller := true
+	return []metav1.OwnerReference{{
+		APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "DaemonSet",
+		Name: p.daemonSet.Name, UID: p.daemonSet.UID, Controller: &controller,
+	}}
+}
+
 func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snapshot *nvapi.ComputeDomainCliqueSnapshot) error {
+	snapshotProtocol := nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol)
 	if snapshot.DeletionTimestamp != nil {
 		if snapshot.Status.Generation == 0 && !snapshotEverPublished(snapshot) && slices.Contains(snapshot.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer) {
 			updated := snapshot.DeepCopy()
@@ -988,7 +1107,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 				return finalizer == nvapi.ComputeDomainCliqueSnapshotFinalizer
 			})
 			result, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, updated, metav1.UpdateOptions{})
-			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerRemove, err)
+			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerRemove, err, snapshotProtocol)
 			if err == nil {
 				m.recordWrite(snapshot.Namespace+"/"+snapshot.Name, result.ResourceVersion)
 			}
@@ -1024,21 +1143,28 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 	if !ok {
 		return fmt.Errorf("unexpected ComputeDomain cache object %T", owners[0])
 	}
+	protocol, err := computeDomainCliqueProtocol(owner)
+	if err != nil {
+		return fmt.Errorf("snapshot owner has invalid protocol: %w", err)
+	}
+	if !controllerOwnedProtocol(protocol) {
+		return fmt.Errorf("snapshot owner protocol %q is not controller-owned", protocol)
+	}
 	if owner.DeletionTimestamp != nil || owner.Spec.NumNodes <= 0 {
 		return fmt.Errorf("controller-v1 ComputeDomain is deleting or lacks a positive expected Node count")
 	}
 	expectedSetReady := m.expectedSetReady(string(snapshot.Spec.ComputeDomainUID), owner.Spec.NumNodes)
-	ds, err := m.daemonSetFor(snapshot.Namespace, owner)
+	provider, err := m.daemonProviderFor(snapshot.Namespace, owner, protocol)
 	if err != nil {
 		return err
 	}
-	if ds == nil {
+	if provider.daemonSet == nil {
 		return nil
 	}
-	if ds.DeletionTimestamp != nil {
+	if provider.daemonSet.DeletionTimestamp != nil {
 		return fmt.Errorf("snapshot DaemonSet identity is absent, deleting, or changed")
 	}
-	if err := validateExistingSnapshot(snapshot, owner, ds, m.config); err != nil {
+	if err := validateExistingSnapshot(snapshot, owner, provider, m.config); err != nil {
 		return err
 	}
 
@@ -1047,7 +1173,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 	if err != nil {
 		return err
 	}
-	pods, err := candidatePodsForNodes(m.podInformer.GetIndexer(), string(snapshot.Spec.ComputeDomainUID), selectedNodes)
+	pods, err := provider.candidatePods(m.podInformer.GetIndexer(), string(snapshot.Spec.ComputeDomainUID), selectedNodes)
 	if err != nil {
 		return err
 	}
@@ -1084,7 +1210,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 	// self-assert a handoff and instead quarantine the slot.
 	podsByNode := make(map[string][]*corev1.Pod, len(pods))
 	for _, pod := range pods {
-		if !eligibleSnapshotPod(pod, ds) {
+		if !eligibleSnapshotPod(pod, provider.daemonSet) {
 			continue
 		}
 		node, selected := selectedByName[pod.Spec.NodeName]
@@ -1216,7 +1342,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		withFinalizer := snapshot.DeepCopy()
 		withFinalizer.Finalizers = append(withFinalizer.Finalizers, nvapi.ComputeDomainCliqueSnapshotFinalizer)
 		result, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, withFinalizer, metav1.UpdateOptions{})
-		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerAdd, err)
+		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerAdd, err, protocol)
 		if err == nil {
 			m.recordWrite(key, result.ResourceVersion)
 		}
@@ -1262,7 +1388,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 	if snapshot.Status.Generation == 0 && updated.Status.Generation > 0 {
 		reservationName := cdclique.ReservationName(snapshot.Spec.CliqueID)
 		reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, reservationName, metav1.GetOptions{})
-		observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err)
+		observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err, protocol)
 		if err != nil {
 			return fmt.Errorf("read physical clique reservation before first publication: %w", err)
 		}
@@ -1277,7 +1403,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 			activated := reservation.DeepCopy()
 			activated.Status = expectedStatus
 			_, err = m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().UpdateStatus(ctx, activated, metav1.UpdateOptions{})
-			observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, err)
+			observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, err, protocol)
 			if err != nil {
 				return fmt.Errorf("activate physical clique reservation before first publication: %w", err)
 			}
@@ -1326,7 +1452,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 		return nil
 	}
 	result, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-	observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, err)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, err, protocol)
 	if err == nil {
 		m.recordWrite(snapshot.Namespace+"/"+snapshot.Name, result.ResourceVersion)
 	}
@@ -1334,6 +1460,7 @@ func (m *ControllerOwnedCliqueManager) updateSnapshot(ctx context.Context, snaps
 }
 
 func (m *ControllerOwnedCliqueManager) ensureReservationActivation(ctx context.Context, snapshot *nvapi.ComputeDomainCliqueSnapshot) (bool, error) {
+	protocol := nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol)
 	reservationName := cdclique.ReservationName(snapshot.Spec.CliqueID)
 	m.reservationMu.RLock()
 	remembered := m.validatedActivations[reservationName]
@@ -1342,7 +1469,7 @@ func (m *ControllerOwnedCliqueManager) ensureReservationActivation(ctx context.C
 		return true, nil
 	}
 	reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, reservationName, metav1.GetOptions{})
-	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, err, protocol)
 	if err != nil {
 		return false, fmt.Errorf("read physical clique reservation activation: %w", err)
 	}
@@ -1367,7 +1494,7 @@ func (m *ControllerOwnedCliqueManager) ensureReservationActivation(ctx context.C
 		ActivationGeneration: snapshot.Status.Generation, ActivationHash: snapshot.Status.Hash,
 	}
 	_, err = m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, err)
+	observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, err, protocol)
 	if err != nil {
 		return false, fmt.Errorf("backfill physical clique reservation activation: %w", err)
 	}
@@ -1411,8 +1538,47 @@ func (m *ControllerOwnedCliqueManager) daemonSetFor(namespace string, owner *nva
 	return ds, nil
 }
 
-func validateExistingSnapshot(snapshot *nvapi.ComputeDomainCliqueSnapshot, owner *nvapi.ComputeDomain, daemonSet *appsv1.DaemonSet, config *ManagerConfig) error {
-	if snapshot == nil || owner == nil || daemonSet == nil {
+func (m *ControllerOwnedCliqueManager) daemonProviderFor(namespace string, owner *nvapi.ComputeDomain, protocol nvapi.ComputeDomainCliqueProtocol) (snapshotDaemonProvider, error) {
+	provider := snapshotDaemonProvider{protocol: protocol}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		ds, err := m.daemonSetFor(namespace, owner)
+		provider.daemonSet = ds
+		return provider, err
+	}
+	if protocol != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		return provider, fmt.Errorf("unsupported snapshot daemon protocol %q", protocol)
+	}
+	ds, err := m.daemonSetLister.DaemonSets(namespace).Get(persistentAgentDaemonSetName)
+	if apierrors.IsNotFound(err) {
+		return provider, nil
+	}
+	if err != nil {
+		return provider, err
+	}
+	if err := validatePersistentAgentDaemonSet(ds, m.config); err != nil {
+		return provider, err
+	}
+	provider.daemonSet = ds
+	return provider, nil
+}
+
+func validatePersistentAgentDaemonSet(ds *appsv1.DaemonSet, config *ManagerConfig) error {
+	if ds == nil || ds.Namespace != config.driverNamespace || ds.Name != persistentAgentDaemonSetName || ds.Labels[persistentAgentLabelKey] != "true" {
+		return fmt.Errorf("persistent agent DaemonSet has unexpected identity")
+	}
+	if ds.Spec.UpdateStrategy.Type != appsv1.OnDeleteDaemonSetStrategyType || ds.Spec.Template.Spec.ServiceAccountName != persistentAgentServiceAccountName ||
+		ds.Spec.Template.Labels[persistentAgentLabelKey] != "true" {
+		return fmt.Errorf("persistent agent DaemonSet has unexpected update, Pod, or ServiceAccount identity")
+	}
+	if len(ds.Spec.Template.Spec.Containers) != 1 || ds.Spec.Template.Spec.Containers[0].Name != "compute-domain-daemon" ||
+		!slices.Contains(ds.Spec.Template.Spec.Containers[0].Command, "--persistent-agent") {
+		return fmt.Errorf("persistent agent DaemonSet has unexpected daemon command")
+	}
+	return nil
+}
+
+func validateExistingSnapshot(snapshot *nvapi.ComputeDomainCliqueSnapshot, owner *nvapi.ComputeDomain, provider snapshotDaemonProvider, config *ManagerConfig) error {
+	if snapshot == nil || owner == nil || provider.daemonSet == nil {
 		return fmt.Errorf("snapshot, ComputeDomain, and DaemonSet identities are required")
 	}
 	expectedName := cdclique.SnapshotName(string(owner.UID), snapshot.Spec.CliqueID)
@@ -1422,13 +1588,21 @@ func validateExistingSnapshot(snapshot *nvapi.ComputeDomainCliqueSnapshot, owner
 	if snapshot.Labels[computeDomainLabelKey] != string(owner.UID) || snapshot.Labels[computeDomainCliqueLabelKey] != snapshot.Spec.CliqueID {
 		return fmt.Errorf("snapshot has unexpected scope labels")
 	}
+	if nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol) != provider.protocol ||
+		(snapshot.Spec.Protocol != "" && snapshot.Labels[snapshotProtocolLabelKey] != string(provider.protocol)) {
+		return fmt.Errorf("snapshot protocol does not match the ComputeDomain daemon provider")
+	}
 	if snapshot.Spec.ComputeDomainUID != owner.UID || snapshot.Spec.Capacity != config.maxNodesPerIMEXDomain {
 		return fmt.Errorf("snapshot immutable scope does not match the live ComputeDomain, DaemonSet, or controller configuration")
 	}
 	controllerRef := metav1.GetControllerOf(snapshot)
-	if controllerRef == nil || controllerRef.APIVersion != appsv1.SchemeGroupVersion.String() || controllerRef.Kind != "DaemonSet" ||
-		controllerRef.Name != daemonSet.Name || controllerRef.UID != daemonSet.UID {
-		return fmt.Errorf("snapshot does not have the expected DaemonSet controller reference")
+	if provider.protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		if controllerRef == nil || controllerRef.APIVersion != appsv1.SchemeGroupVersion.String() || controllerRef.Kind != "DaemonSet" ||
+			controllerRef.Name != provider.daemonSet.Name || controllerRef.UID != provider.daemonSet.UID {
+			return fmt.Errorf("snapshot does not have the expected DaemonSet controller reference")
+		}
+	} else if controllerRef != nil {
+		return fmt.Errorf("persistent-agent snapshot must not be garbage-collected with the installation DaemonSet")
 	}
 	return nil
 }

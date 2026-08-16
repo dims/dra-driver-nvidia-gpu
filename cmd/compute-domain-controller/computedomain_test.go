@@ -131,6 +131,12 @@ func TestSelectComputeDomainCliqueProtocolAllowsDomainAcrossMultipleCliques(t *t
 	require.Equal(t, nvapi.ComputeDomainCliqueProtocolControllerV1, protocol)
 }
 
+func TestPersistentAgentProtocolRemovesPerDomainDaemonArtifacts(t *testing.T) {
+	require.True(t, usesPerDomainDaemon(nvapi.ComputeDomainCliqueProtocolLegacyV1))
+	require.True(t, usesPerDomainDaemon(nvapi.ComputeDomainCliqueProtocolControllerV1))
+	require.False(t, usesPerDomainDaemon(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1))
+}
+
 // NewComputeDomainManager only stores clientsets on the informer factories it
 // builds (it never calls them synchronously), so a zero-value ClientSets is
 // sufficient here: these tests only assert on which sub-managers get

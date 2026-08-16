@@ -164,6 +164,18 @@ func TestNodeAttestationAcquiresReservationBeforePublishingControllerV1(t *testi
 	require.Equal(t, f.cd.UID, reservation.Spec.ComputeDomainUID)
 }
 
+func TestNodeAttestationAcquiresReservationBeforePublishingPersistentAgentV1(t *testing.T) {
+	f := newNodeAttestationFixture(t, "persistent-agent", nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
+	require.NoError(t, f.manager.reconcileNodeAttestation(context.Background(), f.node.Name))
+	node, err := f.core.CoreV1().Nodes().Get(context.Background(), f.node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, string(f.cd.UID), node.Labels[computeDomainLabelKey])
+	require.True(t, validNodeAttestation(node))
+	reservation, err := f.nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(context.Background(), cdclique.ReservationName("physical-clique"), metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, f.cd.UID, reservation.Spec.ComputeDomainUID)
+}
+
 func TestNodeAttestationReportsMissingWholeCliqueIsolationOnce(t *testing.T) {
 	f := newNodeAttestationFixture(t, "isolation-event", nvapi.ComputeDomainCliqueProtocolControllerV1)
 	node := f.node.DeepCopy()
