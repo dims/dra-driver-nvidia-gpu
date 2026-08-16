@@ -470,6 +470,26 @@ func TestValidateFeatureGates(t *testing.T) {
 			description: "should be valid when controller-owned cliques and all dependencies are enabled",
 		},
 		{
+			name:        "Persistent agents with dependencies",
+			fgMap:       map[featuregate.Feature]bool{PersistentComputeDomainAgents: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true, CrashOnNVLinkFabricErrors: true},
+			expectError: false,
+			description: "should be valid when persistent agents and all dependencies are enabled",
+		},
+		{
+			name:         "Persistent agents without CDCliques",
+			fgMap:        map[featuregate.Feature]bool{PersistentComputeDomainAgents: true, ComputeDomainCliques: false, IMEXDaemonsWithDNSNames: true, CrashOnNVLinkFabricErrors: true},
+			expectError:  true,
+			errorMessage: "feature gate PersistentComputeDomainAgents requires ComputeDomainCliques to also be enabled",
+			description:  "should fail without ComputeDomainCliques",
+		},
+		{
+			name:         "Persistent agents without strict fabric errors",
+			fgMap:        map[featuregate.Feature]bool{PersistentComputeDomainAgents: true, ComputeDomainCliques: true, IMEXDaemonsWithDNSNames: true, CrashOnNVLinkFabricErrors: false},
+			expectError:  true,
+			errorMessage: "feature gate PersistentComputeDomainAgents requires CrashOnNVLinkFabricErrors to also be enabled",
+			description:  "should fail when persistent-agent topology could silently degrade",
+		},
+		{
 			name:         "Controller-owned cliques without CDCliques",
 			fgMap:        map[featuregate.Feature]bool{ControllerOwnedCDCliques: true, ComputeDomainCliques: false, IMEXDaemonsWithDNSNames: true},
 			expectError:  true,

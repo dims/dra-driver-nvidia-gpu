@@ -45,3 +45,23 @@ func TestProcessManagerStopKillsAndReapsAfterGracePeriod(t *testing.T) {
 	require.NoError(t, manager.stop())
 	require.Nil(t, manager.handle)
 }
+
+func TestProcessManagerReusableChildLifecycle(t *testing.T) {
+	manager := NewProcessManager([]string{"/bin/sh", "-c", "while :; do sleep 1; done"})
+	manager.stopTimeout = time.Second
+
+	started, err := manager.EnsureStarted()
+	require.NoError(t, err)
+	require.True(t, started)
+	started, err = manager.EnsureStarted()
+	require.NoError(t, err)
+	require.False(t, started, "one manager must not start a second concurrent child")
+	require.Error(t, manager.SetCommand([]string{"/bin/true"}))
+	require.NoError(t, manager.Stop())
+
+	require.NoError(t, manager.SetCommand([]string{"/bin/sh", "-c", "while :; do sleep 1; done"}))
+	started, err = manager.EnsureStarted()
+	require.NoError(t, err)
+	require.True(t, started)
+	require.NoError(t, manager.Stop())
+}

@@ -70,6 +70,10 @@ const (
 	// ControllerOwnedCDCliques enables the opt-in, single-writer clique
 	// allocation protocol for newly admitted ComputeDomains.
 	ControllerOwnedCDCliques featuregate.Feature = "ControllerOwnedCDCliques"
+	// PersistentComputeDomainAgents bootstraps one reusable compute-domain
+	// daemon agent per capable Node. New ComputeDomains cannot select the
+	// persistent-agent protocol until its later protocol plumbing is enabled.
+	PersistentComputeDomainAgents featuregate.Feature = "PersistentComputeDomainAgents"
 
 	// CrashOnNVLinkFabricErrors causes the kubelet plugin to crash instead of
 	// falling back to non-fabric mode when NVLink fabric errors are detected.
@@ -174,6 +178,13 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 			Version:    version.MajorMinor(0, 5),
 		},
 	},
+	PersistentComputeDomainAgents: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(0, 6),
+		},
+	},
 	CrashOnNVLinkFabricErrors: {
 		{
 			Default:    true,
@@ -273,6 +284,15 @@ func ValidateFeatureGates() error {
 	}
 	if Enabled(ControllerOwnedCDCliques) && !Enabled(CrashOnNVLinkFabricErrors) {
 		return fmt.Errorf("feature gate %s requires %s to also be enabled", ControllerOwnedCDCliques, CrashOnNVLinkFabricErrors)
+	}
+	if Enabled(PersistentComputeDomainAgents) && !Enabled(ComputeDomainCliques) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", PersistentComputeDomainAgents, ComputeDomainCliques)
+	}
+	if Enabled(PersistentComputeDomainAgents) && !Enabled(IMEXDaemonsWithDNSNames) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", PersistentComputeDomainAgents, IMEXDaemonsWithDNSNames)
+	}
+	if Enabled(PersistentComputeDomainAgents) && !Enabled(CrashOnNVLinkFabricErrors) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", PersistentComputeDomainAgents, CrashOnNVLinkFabricErrors)
 	}
 
 	if Enabled(DynamicMIG) && Enabled(PassthroughSupport) {

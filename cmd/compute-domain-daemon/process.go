@@ -69,6 +69,23 @@ func (m *ProcessManager) EnsureStarted() (bool, error) {
 	return true, m.start()
 }
 
+// Stop terminates and reaps the managed child. The manager may be reused by a
+// later assignment after Stop returns.
+func (m *ProcessManager) Stop() error {
+	return m.stop()
+}
+
+// SetCommand changes the child command while the manager is idle.
+func (m *ProcessManager) SetCommand(cmd []string) error {
+	m.Lock()
+	defer m.Unlock()
+	if m.handle != nil {
+		return fmt.Errorf("pm: set command failed: child is running")
+	}
+	m.cmd = append(m.cmd[:0], cmd...)
+	return nil
+}
+
 // Signal() attempts to send the provided signal to the managed child process.
 // Any error is emitted to the caller and must be handled there.
 func (m *ProcessManager) Signal(s os.Signal) error {

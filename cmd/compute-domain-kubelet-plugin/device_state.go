@@ -601,6 +601,9 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, cs *resourceapi.Reso
 		case *configapi.ComputeDomainDaemonConfig:
 			// If a daemon type, unprepare the new ComputeDomain daemon.
 			computeDomainDaemonSettings := s.computeDomainManager.NewSettings(config.DomainID)
+			if configapi.EffectiveComputeDomainDaemonMode(config.Mode) == configapi.ComputeDomainDaemonModePersistentAgent {
+				computeDomainDaemonSettings = s.computeDomainManager.NewPersistentAgentSettings()
+			}
 			if err := computeDomainDaemonSettings.Unprepare(ctx); err != nil {
 				return fmt.Errorf("error unpreparing ComputeDomain daemon settings: %w", err)
 			}
@@ -739,6 +742,9 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 	if s.config.imexConfig.EffectiveHostManaged() {
 		return nil, permanentError{fmt.Errorf("ComputeDomain daemon claims are not supported when imex.mode=hostManaged")}
 	}
+	if configapi.EffectiveComputeDomainDaemonMode(config.Mode) == configapi.ComputeDomainDaemonModePersistentAgent {
+		return s.applyPersistentAgentDaemonConfig(ctx, claim, results)
+	}
 
 	cd, err := s.computeDomainManager.GetComputeDomain(ctx, config.DomainID)
 	if err != nil {
@@ -822,6 +828,44 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 	}
 
 	return &configState, nil
+}
+
+func (s *DeviceState) applyPersistentAgentDaemonConfig(ctx context.Context, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
+	if !featuregates.Enabled(featuregates.PersistentComputeDomainAgents) {
+		return nil, permanentError{fmt.Errorf("persistent agent claim requires feature gate %s", featuregates.PersistentComputeDomainAgents)}
+	}
+	if claim.Namespace != s.config.flags.namespace {
+		return nil, permanentError{fmt.Errorf("persistent agent claim namespace %q does not match driver namespace %q", claim.Namespace, s.config.flags.namespace)}
+	}
+	if len(results) != 1 {
+		return nil, fmt.Errorf("persistent agent claim requires exactly one allocated daemon device, got %d", len(results))
+	}
+	device, ok := s.allocatable[results[0].Device]
+	if !ok || device.Type() != ComputeDomainDaemonType {
+		return nil, fmt.Errorf("persistent agent claim result %q is not a compute-domain daemon device", results[0].Device)
+	}
+
+	settings := s.computeDomainManager.NewPersistentAgentSettings()
+	if err := settings.Prepare(ctx); err != nil {
+		return nil, fmt.Errorf("prepare persistent agent settings: %w", err)
+	}
+	edits, err := settings.GetCDIContainerEditsCommon(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get persistent agent container edits: %w", err)
+	}
+	if s.computeDomainManager.CliqueID() != "" {
+		nvcapPath := nvidiaCapFabricImexMgmtPath
+		if common.UsingAltProcDevices() {
+			nvcapPath = filepath.Join(s.config.flags.containerDriverRoot, "proc/driver/nvidia/capabilities/fabric-imex-mgmt")
+		}
+		nvcapDeviceInfo, err := common.ParseNVCapDeviceInfo(nvcapPath)
+		if err != nil {
+			return nil, fmt.Errorf("parse persistent agent fabric-imex-mgmt device: %w", err)
+		}
+		edits = edits.Append(settings.GetCDIContainerEditsForImex(ctx, s.cdi.devRoot, nvcapDeviceInfo))
+	}
+
+	return &DeviceConfigState{Type: ComputeDomainDaemonType, containerEdits: edits}, nil
 }
 
 func (s *DeviceState) getConfigResultsMap(rcs *resourceapi.ResourceClaimStatus, decoder runtime.Decoder) (map[runtime.Object][]*resourceapi.DeviceRequestAllocationResult, error) {

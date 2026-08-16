@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	configapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/imex"
 	nvfake "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/clientset/versioned/fake"
 	nvinformers "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/informers/externalversions"
@@ -615,6 +617,57 @@ func TestApplyComputeDomainDaemonConfigHostManagedRejected(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, isPermanentError(err), "daemon claims must be a permanent error under host-managed IMEX")
+}
+
+func TestApplyPersistentAgentDaemonConfig(t *testing.T) {
+	old := featuregates.Enabled(featuregates.PersistentComputeDomainAgents)
+	require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{string(featuregates.PersistentComputeDomainAgents): true}))
+	t.Cleanup(func() {
+		require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{string(featuregates.PersistentComputeDomainAgents): old}))
+	})
+
+	root := t.TempDir()
+	state := testDeviceState()
+	state.config = &Config{flags: &Flags{namespace: "default"}}
+	state.computeDomainManager = &ComputeDomainManager{configFilesRoot: root}
+	config := configapi.DefaultComputeDomainDaemonConfig()
+	config.Mode = configapi.ComputeDomainDaemonModePersistentAgent
+	result := allocationResult("daemon", DriverName, "daemon-0", nil)
+
+	got, err := state.applyComputeDomainDaemonConfig(
+		context.Background(),
+		config,
+		claimWithResults("agent-claim", result),
+		[]*resourceapi.DeviceRequestAllocationResult{&result},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, ComputeDomainDaemonType, got.Type)
+	require.Empty(t, got.ComputeDomain)
+	require.DirExists(t, root)
+	require.Contains(t, got.containerEdits.ContainerEdits.Env, "PERSISTENT_AGENT_CDI=true")
+	require.Contains(t, got.containerEdits.ContainerEdits.Env, "CLIQUE_ID=")
+	require.Len(t, got.containerEdits.ContainerEdits.Mounts, 1)
+	require.Equal(t, root, got.containerEdits.ContainerEdits.Mounts[0].HostPath)
+	require.NoFileExists(t, filepath.Join(root, "imexd.cfg.tmpl"))
+}
+
+func TestApplyPersistentAgentDaemonConfigRejectsOtherNamespace(t *testing.T) {
+	old := featuregates.Enabled(featuregates.PersistentComputeDomainAgents)
+	require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{string(featuregates.PersistentComputeDomainAgents): true}))
+	t.Cleanup(func() {
+		require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{string(featuregates.PersistentComputeDomainAgents): old}))
+	})
+
+	state := testDeviceState()
+	state.config = &Config{flags: &Flags{namespace: "driver"}}
+	config := configapi.DefaultComputeDomainDaemonConfig()
+	config.Mode = configapi.ComputeDomainDaemonModePersistentAgent
+	result := allocationResult("daemon", DriverName, "daemon-0", nil)
+
+	_, err := state.applyComputeDomainDaemonConfig(context.Background(), config, claimWithResults("agent-claim", result), []*resourceapi.DeviceRequestAllocationResult{&result})
+	require.Error(t, err)
+	require.True(t, isPermanentError(err))
 }
 
 func TestApplyComputeDomainChannelConfigHostManagedNoCliqueSkipsInjection(t *testing.T) {

@@ -64,6 +64,8 @@ type Flags struct {
 	podNamespace           string
 	maxNodesPerIMEXDomain  int
 	protocol               string
+	persistentAgent        bool
+	persistentAgentCDI     bool
 	httpEndpoint           string
 	metricsPath            string
 	klogVerbosity          int
@@ -173,6 +175,19 @@ func newApp() *cli.App {
 			EnvVars:     []string{"CDC_PROTOCOL"},
 			Destination: &flags.protocol,
 		},
+		&cli.BoolFlag{
+			Name:        "persistent-agent",
+			Usage:       "Run as the installation-scoped persistent ComputeDomain agent.",
+			EnvVars:     []string{"PERSISTENT_AGENT"},
+			Destination: &flags.persistentAgent,
+		},
+		&cli.BoolFlag{
+			Name:        "persistent-agent-cdi",
+			Usage:       "Internal proof that persistent-agent CDI edits were applied.",
+			EnvVars:     []string{"PERSISTENT_AGENT_CDI"},
+			Destination: &flags.persistentAgentCDI,
+			Hidden:      true,
+		},
 	}
 	cliFlags = append(cliFlags, featureGateConfig.Flags()...)
 	cliFlags = append(cliFlags, loggingConfig.Flags()...)
@@ -224,8 +239,14 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	// checking for COMPUTE_DOMAIN_UUID, which is always injected as part of the
 	// CDI edits. If it is missing, CDI is likely disabled and the daemon cannot
 	// function correctly (e.g. the /imexd mount will be missing).
-	if flags.computeDomainUUID == "" {
+	if flags.computeDomainUUID == "" && !flags.persistentAgent {
 		return fmt.Errorf("CDI container edits did not apply -- is CDI enabled in your container runtime?")
+	}
+	if flags.computeDomainUUID != "" && flags.persistentAgent {
+		return fmt.Errorf("persistent agent CDI configuration must not contain a ComputeDomain UUID")
+	}
+	if flags.persistentAgent && !flags.persistentAgentCDI {
+		return fmt.Errorf("persistent agent CDI container edits did not apply -- is CDI enabled in your container runtime?")
 	}
 
 	common.StartDebugSignalHandlers()
@@ -233,6 +254,14 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	// Validate feature gate dependencies
 	if err := featuregates.ValidateFeatureGates(); err != nil {
 		return fmt.Errorf("feature gate validation failed: %w", err)
+	}
+	if flags.persistentAgent {
+		if !featuregates.Enabled(featuregates.PersistentComputeDomainAgents) {
+			return fmt.Errorf("persistent agent requires feature gate %s", featuregates.PersistentComputeDomainAgents)
+		}
+		klog.Infof("persistent ComputeDomain agent is idle and ready for assignments")
+		<-ctx.Done()
+		return nil
 	}
 	protocol := nvapi.ComputeDomainCliqueProtocol(flags.protocol)
 	if err := nvapi.ValidateComputeDomainCliqueProtocol(protocol); err != nil {
@@ -659,6 +688,13 @@ func writeSnapshotReceipt(receipt *nvapi.ComputeDomainCliqueSnapshotReceipt) err
 // check verifies if the node is IMEX capable and if so, checks if the IMEX daemon is ready.
 // It returns an error if any step fails.
 func check(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
+	if flags.persistentAgent {
+		if !flags.persistentAgentCDI {
+			return fmt.Errorf("persistent agent CDI container edits did not apply")
+		}
+		fmt.Println("check succeeded (persistent agent supervisor is idle)")
+		return nil
+	}
 	if flags.cliqueID == "" {
 		fmt.Println("check succeeded (noop, clique ID is empty)")
 		return nil

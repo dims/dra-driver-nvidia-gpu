@@ -109,6 +109,7 @@ type ComputeDomainDaemonSettings struct {
 	configTmplPath  string
 	nodesConfigPath string
 	recoveryOnly    bool
+	persistentAgent bool
 }
 
 func NewComputeDomainManager(config *Config, getCliqueIDFunc func() (string, error)) (*ComputeDomainManager, error) {
@@ -362,6 +363,14 @@ func (m *ComputeDomainManager) NewSettings(domainID string) *ComputeDomainDaemon
 	}
 }
 
+func (m *ComputeDomainManager) NewPersistentAgentSettings() *ComputeDomainDaemonSettings {
+	return &ComputeDomainDaemonSettings{
+		manager:         m,
+		rootDir:         m.configFilesRoot,
+		persistentAgent: true,
+	}
+}
+
 func (m *ComputeDomainManager) GetComputeDomainChannelContainerEdits(devRoot string, info *common.NVcapDeviceInfo) *cdiapi.ContainerEdits {
 	return &cdiapi.ContainerEdits{
 		ContainerEdits: &cdispec.ContainerEdits{
@@ -374,28 +383,32 @@ func (m *ComputeDomainManager) GetComputeDomainChannelContainerEdits(devRoot str
 // launching the CD Daemon (whether or not it tries to launch an IMEX daemon
 // internally).
 func (s *ComputeDomainDaemonSettings) GetCDIContainerEditsCommon(ctx context.Context) (*cdiapi.ContainerEdits, error) {
-	cd, err := s.manager.GetComputeDomain(ctx, s.domainID)
-	if err != nil {
-		return nil, fmt.Errorf("error getting compute domain %s: %w", s.domainID, err)
-	}
-	if cd == nil {
-		return nil, fmt.Errorf("compute domain not found: %s", s.domainID)
-	}
-
 	cliqueID := s.manager.CliqueID()
 	if s.recoveryOnly {
 		// A recovery daemon must not join either the old or newly discovered
 		// fabric. The empty scope starts only the retirement snapshot reader.
 		cliqueID = ""
 	}
+	env := []string{fmt.Sprintf("CLIQUE_ID=%s", cliqueID)}
+	if s.persistentAgent {
+		env = append(env, "PERSISTENT_AGENT_CDI=true")
+	} else {
+		cd, err := s.manager.GetComputeDomain(ctx, s.domainID)
+		if err != nil {
+			return nil, fmt.Errorf("error getting compute domain %s: %w", s.domainID, err)
+		}
+		if cd == nil {
+			return nil, fmt.Errorf("compute domain not found: %s", s.domainID)
+		}
+		env = append(env,
+			fmt.Sprintf("COMPUTE_DOMAIN_UUID=%s", cd.UID),
+			fmt.Sprintf("COMPUTE_DOMAIN_NAME=%s", cd.Name),
+			fmt.Sprintf("COMPUTE_DOMAIN_NAMESPACE=%s", cd.Namespace),
+		)
+	}
 	edits := &cdiapi.ContainerEdits{
 		ContainerEdits: &cdispec.ContainerEdits{
-			Env: []string{
-				fmt.Sprintf("CLIQUE_ID=%s", cliqueID),
-				fmt.Sprintf("COMPUTE_DOMAIN_UUID=%s", cd.UID),
-				fmt.Sprintf("COMPUTE_DOMAIN_NAME=%s", cd.Name),
-				fmt.Sprintf("COMPUTE_DOMAIN_NAMESPACE=%s", cd.Namespace),
-			},
+			Env: env,
 			Mounts: []*cdispec.Mount{
 				{
 					// imexDaemonConfigDirPath   = "/imexd"
@@ -429,8 +442,10 @@ func (s *ComputeDomainDaemonSettings) Prepare(ctx context.Context) error {
 		return fmt.Errorf("error creating directory %v: %w", s.rootDir, err)
 	}
 
-	if err := s.WriteConfigFile(ctx); err != nil {
-		return fmt.Errorf("error writing config file %v: %w", s.configTmplPath, err)
+	if !s.persistentAgent {
+		if err := s.WriteConfigFile(ctx); err != nil {
+			return fmt.Errorf("error writing config file %v: %w", s.configTmplPath, err)
+		}
 	}
 
 	return nil

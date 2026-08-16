@@ -28,9 +28,16 @@ import (
 // state or from whether a particular API object happens to exist.
 type ComputeDomainCliqueProtocol string
 
+// ComputeDomainDaemonMode identifies whether a daemon claim belongs to one
+// ComputeDomain or bootstraps an installation-scoped persistent agent.
+type ComputeDomainDaemonMode string
+
 const (
 	ComputeDomainCliqueProtocolLegacyV1     ComputeDomainCliqueProtocol = "legacy-v1"
 	ComputeDomainCliqueProtocolControllerV1 ComputeDomainCliqueProtocol = "controller-v1"
+
+	ComputeDomainDaemonModePerDomain       ComputeDomainDaemonMode = "PerDomain"
+	ComputeDomainDaemonModePersistentAgent ComputeDomainDaemonMode = "PersistentAgent"
 
 	// ComputeDomainCliqueProtocolAnnotation is set by the controller before it
 	// creates any per-ComputeDomain objects. Existing marker-less domains are
@@ -53,6 +60,15 @@ func ValidateComputeDomainCliqueProtocol(protocol ComputeDomainCliqueProtocol) e
 	default:
 		return fmt.Errorf("unknown compute domain clique protocol %q", protocol)
 	}
+}
+
+// EffectiveComputeDomainDaemonMode preserves the historical per-domain
+// behavior for configurations written before mode was introduced.
+func EffectiveComputeDomainDaemonMode(mode ComputeDomainDaemonMode) ComputeDomainDaemonMode {
+	if mode == "" {
+		return ComputeDomainDaemonModePerDomain
+	}
+	return mode
 }
 
 // EffectiveComputeDomainCliqueProtocol normalizes configuration created by an
@@ -103,8 +119,9 @@ func (c *ComputeDomainChannelConfig) Validate() error {
 // ComputeDomainDaemonConfig holds the set of parameters for configuring an ComputeDomainDaemon.
 type ComputeDomainDaemonConfig struct {
 	metav1.TypeMeta `json:",inline"`
-	DomainID        string                      `json:"domainID"`
+	DomainID        string                      `json:"domainID,omitempty"`
 	Protocol        ComputeDomainCliqueProtocol `json:"protocol,omitempty"`
+	Mode            ComputeDomainDaemonMode     `json:"mode,omitempty"`
 }
 
 // DefaultComputeDomainDaemonConfig provides the default ComputeDomainDaemon configuration.
@@ -120,13 +137,23 @@ func DefaultComputeDomainDaemonConfig() *ComputeDomainDaemonConfig {
 // Normalize updates a ComputeDomainDaemonConfig config with implied default values based on other settings.
 func (c *ComputeDomainDaemonConfig) Normalize() error {
 	c.Protocol = EffectiveComputeDomainCliqueProtocol(c.Protocol)
+	c.Mode = EffectiveComputeDomainDaemonMode(c.Mode)
 	return nil
 }
 
 // Validate ensures that ComputeDomainDaemonConfig has a valid set of values.
 func (c *ComputeDomainDaemonConfig) Validate() error {
-	if c.DomainID == "" {
-		return fmt.Errorf("domainID cannot be empty")
+	switch EffectiveComputeDomainDaemonMode(c.Mode) {
+	case ComputeDomainDaemonModePerDomain:
+		if c.DomainID == "" {
+			return fmt.Errorf("domainID cannot be empty in PerDomain mode")
+		}
+	case ComputeDomainDaemonModePersistentAgent:
+		if c.DomainID != "" {
+			return fmt.Errorf("domainID must be empty in PersistentAgent mode")
+		}
+	default:
+		return fmt.Errorf("unknown compute domain daemon mode %q", c.Mode)
 	}
 	return ValidateComputeDomainCliqueProtocol(c.Protocol)
 }

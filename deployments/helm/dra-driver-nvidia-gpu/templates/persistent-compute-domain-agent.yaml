@@ -1,0 +1,140 @@
+{{- $enabled := and .Values.featureGates (and (hasKey .Values.featureGates "PersistentComputeDomainAgents") .Values.featureGates.PersistentComputeDomainAgents) -}}
+{{- if and .Values.resources.computeDomains.enabled $enabled }}
+{{- include "dra-driver-nvidia-gpu.validateIMEXConfig" . }}
+{{- include "dra-driver-nvidia-gpu.validatePersistentComputeDomainAgents" . }}
+{{- $resourceAPI := include "dra-driver-nvidia-gpu.resourceApiVersion" . | trim -}}
+---
+apiVersion: {{ $resourceAPI }}
+kind: ResourceClaimTemplate
+metadata:
+  name: dra-driver-nvidia-gpu-persistent-agent
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
+    resource.nvidia.com/persistentComputeDomainAgent: "true"
+spec:
+  spec:
+    devices:
+      requests:
+      - name: daemon
+        {{- if eq $resourceAPI "resource.k8s.io/v1" }}
+        exactly:
+          deviceClassName: compute-domain-daemon.nvidia.com
+          allocationMode: ExactCount
+          count: 1
+        {{- else }}
+        deviceClassName: compute-domain-daemon.nvidia.com
+        allocationMode: ExactCount
+        count: 1
+        {{- end }}
+      config:
+      - requests: ["daemon"]
+        opaque:
+          driver: compute-domain.nvidia.com
+          parameters:
+            apiVersion: resource.nvidia.com/v1beta1
+            kind: ComputeDomainDaemonConfig
+            mode: PersistentAgent
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dra-driver-nvidia-gpu-persistent-agent
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  annotations:
+    resource.nvidia.com/controller-owned-cdc-installation: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" . | quote }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
+    resource.nvidia.com/persistentComputeDomainAgent: "true"
+spec:
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      resource.nvidia.com/persistentComputeDomainAgent: "true"
+  template:
+    metadata:
+      labels:
+        resource.nvidia.com/persistentComputeDomainAgent: "true"
+    spec:
+      serviceAccountName: compute-domain-daemon-reader-service-account
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: compute-domain-daemon
+        image: {{ include "dra-driver-nvidia-gpu.fullimage" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["compute-domain-daemon", "-v", "$(LOG_VERBOSITY)", "run", "--persistent-agent"]
+        env:
+        - name: LOG_VERBOSITY
+          value: {{ .Values.logVerbosity | quote }}
+        - name: MAX_NODES_PER_IMEX_DOMAIN
+          value: {{ .Values.persistentComputeDomainAgent.maxNodesPerIMEXDomain | quote }}
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: void
+        {{- if .Values.featureGates }}
+        - name: FEATURE_GATES
+          value: "{{ range $key, $value := .Values.featureGates }}{{ $key }}={{ $value }},{{ end }}"
+        {{- end }}
+        resources:
+          claims:
+          - name: compute-domain-daemon
+          {{- with .Values.persistentComputeDomainAgent.resources }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+        startupProbe:
+          exec:
+            command: ["compute-domain-daemon", "-v", "$(LOG_VERBOSITY)", "check", "--persistent-agent"]
+          periodSeconds: 1
+          timeoutSeconds: 10
+          failureThreshold: 1200
+        livenessProbe:
+          exec:
+            command: ["compute-domain-daemon", "-v", "$(LOG_VERBOSITY)", "check", "--persistent-agent"]
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 20
+        readinessProbe:
+          exec:
+            command: ["compute-domain-daemon", "-v", "$(LOG_VERBOSITY)", "check", "--persistent-agent"]
+          periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 1
+      {{- with .Values.kubeletPlugin.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kubeletPlugin.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kubeletPlugin.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      resourceClaims:
+      - name: compute-domain-daemon
+        resourceClaimTemplateName: dra-driver-nvidia-gpu-persistent-agent
+{{- end }}

@@ -414,6 +414,7 @@ implementation.
 {{- if and $enabled (not .Values.controllerOwnedCDCliques.admissionEnabled) -}}
   {{- fail "featureGates.ControllerOwnedCDCliques=true requires controllerOwnedCDCliques.admissionEnabled=true" -}}
 {{- end -}}
+
 {{- if and $enabled (include "dra-driver-nvidia-gpu.hostManagedIMEX" .) -}}
   {{- fail "featureGates.ControllerOwnedCDCliques=true is incompatible with resources.computeDomains.imex.mode=hostManaged" -}}
 {{- end -}}
@@ -431,5 +432,16 @@ implementation.
 {{- end -}}
 {{- if and $enabled (and (hasKey .Values.featureGates "CrashOnNVLinkFabricErrors") (not .Values.featureGates.CrashOnNVLinkFabricErrors)) -}}
   {{- fail "featureGates.ControllerOwnedCDCliques=true requires featureGates.CrashOnNVLinkFabricErrors=true; controller-owned topology must fail closed instead of falling back to non-fabric mode" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Validate the installation-scoped persistent ComputeDomain agent spike. */}}
+{{- define "dra-driver-nvidia-gpu.validatePersistentComputeDomainAgents" -}}
+{{- $enabled := and .Values.featureGates (and (hasKey .Values.featureGates "PersistentComputeDomainAgents") .Values.featureGates.PersistentComputeDomainAgents) -}}
+{{- if and $enabled (not .Values.controllerOwnedCDCliques.admissionEnabled) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires controllerOwnedCDCliques.admissionEnabled=true" -}}
+{{- end -}}
+{{- if and $enabled (include "dra-driver-nvidia-gpu.hostManagedIMEX" .) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true is incompatible with resources.computeDomains.imex.mode=hostManaged" -}}
 {{- end -}}
 {{- end -}}

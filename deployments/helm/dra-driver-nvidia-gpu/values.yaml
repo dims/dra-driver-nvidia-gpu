@@ -119,7 +119,12 @@ resources:
 #   DRAListTypeAttributes: false       # Publish list-valued DRA device attributes
 #   ConsumableShares: false            # Publish consumable capacity and multi-allocation support for devices
 #   ControllerOwnedCDCliques: false    # Opt in new ComputeDomains to controller-owned clique snapshots
+#   PersistentComputeDomainAgents: false # Keep one reusable ComputeDomain agent on each capable Node
 featureGates: {}
+
+persistentComputeDomainAgent:
+  maxNodesPerIMEXDomain: 18
+  resources: {}
 
 # Namespaces in which an operator may create the explicitly annotated
 # controller-v1 ComputeDomain canary. Keep empty to deny all canaries even when

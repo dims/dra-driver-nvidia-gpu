@@ -16,6 +16,7 @@
 {{- if .Values.resources.computeDomains.enabled }}
 {{- include "dra-driver-nvidia-gpu.validateIMEXConfig" . }}
 {{- include "dra-driver-nvidia-gpu.validateControllerOwnedCDCliques" . }}
+{{- include "dra-driver-nvidia-gpu.validatePersistentComputeDomainAgents" . }}
 {{- end }}
 ---
 apiVersion: apps/v1

@@ -38,3 +38,37 @@ func TestComputeDomainCliqueProtocolCompatibility(t *testing.T) {
 	daemon.Protocol = ComputeDomainCliqueProtocolControllerV1
 	require.NoError(t, daemon.Validate())
 }
+
+func TestComputeDomainDaemonModeCompatibility(t *testing.T) {
+	t.Run("old config defaults to per-domain", func(t *testing.T) {
+		config := DefaultComputeDomainDaemonConfig()
+		config.DomainID = "domain-uid"
+		require.NoError(t, config.Normalize())
+		require.Equal(t, ComputeDomainDaemonModePerDomain, config.Mode)
+		require.NoError(t, config.Validate())
+	})
+
+	t.Run("persistent agent has no synthetic domain", func(t *testing.T) {
+		config := DefaultComputeDomainDaemonConfig()
+		config.Mode = ComputeDomainDaemonModePersistentAgent
+		require.NoError(t, config.Normalize())
+		require.NoError(t, config.Validate())
+	})
+
+	for name, config := range map[string]*ComputeDomainDaemonConfig{
+		"per-domain without domain": {
+			Mode: ComputeDomainDaemonModePerDomain,
+		},
+		"persistent agent with domain": {
+			Mode:     ComputeDomainDaemonModePersistentAgent,
+			DomainID: "synthetic-domain",
+		},
+		"unknown mode": {
+			Mode: "Other",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, config.Validate())
+		})
+	}
+}
