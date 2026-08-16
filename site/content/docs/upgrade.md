@@ -353,6 +353,62 @@ the protocol, retirement evidence, or reservation fence. Likewise, do not switch
 domain has gone through the verified whole-fabric recovery procedure; current
 binaries refuse that transition while controller-owned state remains.
 
+#### Persistent ComputeDomain agent experiment
+
+`persistent-agent-v1` is an experimental alternative provider for the same
+controller-owned reservation, snapshot, attestation, receipt, quarantine, and
+retirement state machine. It removes the per-ComputeDomain daemon DaemonSet,
+daemon ResourceClaimTemplate, daemon Pods, and daemon claims. It does not relax
+whole-clique isolation or any release/fence check.
+
+Complete the admission-first bootstrap above, then stage one idle agent on each
+capable Node with these values before creating a canary:
+
+```yaml
+featureGates:
+  PersistentComputeDomainAgents: true
+  ComputeDomainCliques: true
+  IMEXDaemonsWithDNSNames: true
+  CrashOnNVLinkFabricErrors: true
+kubeletPlugin:
+  containers:
+    computeDomains:
+      gpuCliqueLabelEnabled: true
+controller:
+  leaderElection:
+    enabled: true
+controllerOwnedCDCliques:
+  admissionEnabled: true
+  canaryNamespaces:
+  - my-canary-namespace
+```
+
+Wait until the `dra-driver-nvidia-gpu-persistent-agent` DaemonSet is available
+on every Node in the intended physical clique. Then apply the same whole-clique
+isolation procedure described above and request
+`resource.nvidia.com/requestedComputeDomainCliqueProtocol: persistent-agent-v1`
+on the ComputeDomain. Do not set `ControllerOwnedCDCliques=true` merely to use
+the persistent protocol; the two admission gates are independent, although
+both protocols share the same safety APIs.
+
+An active persistent-agent ComputeDomain has one snapshot and reservation per
+clique, one controller-written Node attestation per member, and one exact
+applied-state annotation on each selected persistent-agent Pod. It must not
+create a ComputeDomain-specific daemon DaemonSet, daemon ResourceClaimTemplate,
+daemon Pod, or daemon ResourceClaim. The kubelet releases a workload only when
+its local per-ComputeDomain receipt matches the Active snapshot; the Pod
+annotation is aggregate status and debugging evidence, not authorization.
+
+Disabling `PersistentComputeDomainAgents` rejects new requests but is not a
+rollback of existing state. The installation-scoped ResourceClaimTemplate and
+OnDelete DaemonSet are retained, and kubelet continues honoring already
+allocated persistent-agent claims. Keep leader election, topology publication,
+the supporting gates, admission policies, and the agent workload intact until
+every persistent-agent ComputeDomain is cleanly `Fenced` and `Released`. A
+rollback to binaries which do not recognize `persistent-agent-v1` is
+unsupported while any persistent snapshot, reservation, evidence, applied
+annotation, receipt, or possibly-live child exists.
+
 2. Upgrade the Helm chart by using the `helm upgrade -i` command to upgrade the chart in place. 
 
 Two flags are required to upgrade to v0.4.0:

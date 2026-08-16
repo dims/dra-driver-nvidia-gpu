@@ -7,7 +7,7 @@ description: Reuse the controller-owned clique state machine while removing per-
 
 | Field          | Value |
 |----------------|-------|
-| Status         | provisional |
+| Status         | experimental implementation; hardware and scale validation pending |
 | Authors        | @dims |
 | Created        | 2026-08-16 |
 | Related issues | [#920](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/issues/920), [#1107](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/issues/1107), [#1152](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/issues/1152) |
@@ -466,8 +466,27 @@ from claiming that all controller writes disappeared.
 
 ## Implementation plan
 
-Each phase is a separate reviewable commit or PR. Do not begin the next phase
-until the previous phase's exit criteria pass.
+The code is split into reviewable signed commits, but the exit criteria below
+remain promotion gates rather than claims implied by code completion.
+
+Implementation status on 2026-08-16:
+
+- Phases 0 and 1 are implemented. Feature-off and feature-on Helm renders pass
+  for `resource.k8s.io/v1beta1`, `v1beta2`, and `v1`; live DRA preparation on
+  every supported minor still needs QA.
+- Phase 2 is implemented by selecting one of two daemon providers inside the
+  existing controller state machine. Focused fake-API, race, and no-per-domain
+  workload-object tests pass; the complete lost-response/429/failover matrix
+  remains a QA gate.
+- Phase 3 is implemented with one reusable child supervisor, per-domain local
+  directories, durable receipts, applied-state publication, and the existing
+  retirement evidence. An unexpected child exit restarts the agent container
+  so startup invalidates its receipt before the snapshot can be applied again.
+- Phase 4 accepts the new protocol through the existing reservation, snapshot,
+  Pod identity, and local receipt checks. More specific kubelet Events remain
+  follow-up observability work.
+- Phase 5 has not started. No convergence improvement is claimed until the
+  comparative measurements and genuine-fabric matrix pass.
 
 ### Phase 0 — prove the one new primitive
 
@@ -497,8 +516,9 @@ the design.
 - Add the protocol enum and snapshot protocol field.
 - Add `PersistentAgent` mode to the existing daemon opaque config.
 - Add the feature gate and explicit request validation.
-- Render the persistent-agent ResourceClaimTemplate and OnDelete DaemonSet only
-  when the gate or persisted persistent-agent state requires them.
+- Render the persistent-agent ResourceClaimTemplate and OnDelete DaemonSet when
+  the gate is enabled, and retain those objects across gate disable while
+  persisted state may still need them.
 - Extend existing RBAC/VAP identities and preflight.
 - Generate clients/CRDs and inspect generated diff for unrelated churn.
 
@@ -538,12 +558,15 @@ Exit criteria:
 - Write existing receipts under the selected ComputeDomain directory.
 - Patch applied state only after receipt durability and READY.
 - Reuse retirement evidence creation and child reaping.
-- Clear disposable local state only after durable release.
+- Clear the receipt and applied annotation after local retirement evidence is
+  durable; retain the old domain directory until `Fenced` or exact released
+  reservation evidence authorizes reuse.
 
 Exit criteria:
 
 - unit tests cover idle -> Active -> Retiring -> idle twice;
-- same-Pod process restart recovers safely;
+- unexpected child exit forces an agent-container restart, invalidates the
+  receipt, and reapplies the same snapshot safely;
 - same-boot Pod replacement remains blocked;
 - real reboot evidence succeeds;
 - two visible active snapshots start no second child; and
@@ -779,9 +802,9 @@ lifecycle cost and cannot be a prerequisite for supported current releases.
   unrecoverable without stronger process-fence evidence.
 - The first persistent-agent protocol does not solve the ordinary workload-claim scheduler tail.
 
-## Approval requested
+## Accepted design boundaries
 
-Approve these boundaries before implementation:
+The implementation follows these approved boundaries:
 
 1. `persistent-agent-v1` is `controller-v1` plus an installation-scoped persistent-agent
    provider, not a new control plane.
@@ -790,13 +813,13 @@ Approve these boundaries before implementation:
 4. One Pod annotation per activation is acceptable for aggregate status but is
    never an authorization input.
 5. Persistent-agent rollout is OnDelete and requires retirement before replacement.
-6. Phase 0 may terminate the work if the generic persistent-agent claim is not portable.
+6. The experiment must be removed if the generic persistent-agent claim is not portable.
 7. Measured scale improvement, not architectural completion, decides whether
    the protocol advances.
 
-## Smallest implementation slice after approval
+## Implementation history
 
-The first code PR contains only Phase 0:
+The first signed commit contained only Phase 0:
 
 - the existing daemon config's `PersistentAgent` mode;
 - one gated installation-scoped ResourceClaimTemplate and DaemonSet;
@@ -804,6 +827,7 @@ The first code PR contains only Phase 0:
 - start/READY/stop of one test child; and
 - supported-version tests.
 
-It does not add the `persistent-agent-v1` protocol or change any ComputeDomain
-reconcile path. That keeps the riskiest assumption independently reviewable and
-revertible before the feature acquires persistent API state.
+Later signed commits add the protocol/API plumbing, the shared daemon-provider
+boundary, and the reusable daemon plus kubelet release path. Keeping those
+boundaries as separate commits preserves the independently reviewable Phase 0
+assumption even though this branch now contains the full experimental path.
