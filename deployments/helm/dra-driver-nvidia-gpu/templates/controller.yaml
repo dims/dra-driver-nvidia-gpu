@@ -14,16 +14,28 @@
 
 {{- if .Values.resources.computeDomains.enabled }}
 {{- include "dra-driver-nvidia-gpu.validateIMEXConfig" . }}
+{{- include "dra-driver-nvidia-gpu.validatePersistentComputeDomainAgents" . }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "dra-driver-nvidia-gpu.name" . }}-controller
   namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  {{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+  annotations:
+    resource.nvidia.com/persistent-agent-installation: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationID" . | quote }}
+  {{- end }}
   labels:
     {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
+    {{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+    resource.nvidia.com/persistent-agent-workload: controller
+    {{- end }}
 spec:
   replicas: {{ .Values.controller.replicas }}
+  {{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "dra-driver-nvidia-gpu.selectorLabels" (dict "context" . "componentName" "controller") | nindent 6 }}
@@ -84,6 +96,14 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        {{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+        - name: SERVICE_ACCOUNT_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
+        - name: PERSISTENT_AGENT_INSTALLATION_ID
+          value: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationID" . | quote }}
+        {{- end }}
         - name: IMAGE_NAME
           value: {{ include "dra-driver-nvidia-gpu.fullimage" . }}
         {{- if .Values.imagePullSecrets }}

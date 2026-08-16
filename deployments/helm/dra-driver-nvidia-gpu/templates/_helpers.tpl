@@ -109,6 +109,183 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Persistent-agent admission is cluster-scoped. Its names and authenticated
+subjects must not vary with nameOverride/fullnameOverride: doing so would make
+two releases either overwrite one another or install conjunctive policies.
+*/}}
+{{- define "dra-driver-nvidia-gpu.persistentAgentInstallationName" -}}
+persistent-agent-installation.dra-driver-nvidia-gpu
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentInstallationID" -}}
+{{- printf "%s/%s" (include "dra-driver-nvidia-gpu.namespace" . | trim) .Release.Name -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentControllerRoleName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-controller
+{{- else -}}
+{{- printf "%s-clusterrole-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentKubeletRoleName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-kubeletplugin
+{{- else -}}
+{{- printf "%s-clusterrole-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentControllerBindingName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-binding-controller
+{{- else -}}
+{{- printf "%s-clusterrole-binding-controller-%s" (include "dra-driver-nvidia-gpu.name" .) (include "dra-driver-nvidia-gpu.namespace" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentKubeletBindingName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}
+dra-driver-nvidia-gpu-clusterrole-binding-kubeletplugin
+{{- else -}}
+{{- printf "%s-clusterrole-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentDaemonReaderRoleName" -}}
+dra-driver-nvidia-gpu-clusterrole-daemon-reader
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentDaemonReaderBindingName" -}}
+dra-driver-nvidia-gpu-clusterrole-binding-daemon-reader
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentControllerWorkloadName" -}}
+{{- printf "%s-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentKubeletWorkloadName" -}}
+{{- printf "%s-kubelet-plugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceRoleName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}dra-driver-nvidia-gpu-role-controller{{- else -}}{{- printf "%s-role-controller" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceBindingName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}dra-driver-nvidia-gpu-role-binding-controller{{- else -}}{{- printf "%s-role-binding-controller" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceRoleName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}dra-driver-nvidia-gpu-role-kubeletplugin{{- else -}}{{- printf "%s-role-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceBindingName" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled -}}dra-driver-nvidia-gpu-role-binding-kubeletplugin{{- else -}}{{- printf "%s-role-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}{{- end -}}
+{{- end -}}
+
+{{/*
+Names emitted by charts which predate persistent-agent CDC admission. The
+immutable installation marker records these aliases so a verified zero-state
+rollback can restore the old workloads and RBAC without opening the binding
+policies to a second release or control namespace.
+*/}}
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyControllerRoleName" -}}
+{{- printf "%s-clusterrole-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletRoleName" -}}
+{{- printf "%s-clusterrole-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyControllerBindingName" -}}
+{{- printf "%s-clusterrole-binding-controller-%s" (include "dra-driver-nvidia-gpu.name" .) (include "dra-driver-nvidia-gpu.namespace" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletBindingName" -}}
+{{- printf "%s-clusterrole-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceRoleName" -}}
+{{- printf "%s-role-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceBindingName" -}}
+{{- printf "%s-role-binding-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceRoleName" -}}
+{{- printf "%s-role-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceBindingName" -}}
+{{- printf "%s-role-binding-kubeletplugin" (include "dra-driver-nvidia-gpu.name" .) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerServiceAccountUsername" -}}
+{{- printf "system:serviceaccount:%s:%s-controller" (include "dra-driver-nvidia-gpu.namespace" . | trim) (include "dra-driver-nvidia-gpu.serviceAccountName" . | trim) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.kubeletPluginServiceAccountUsername" -}}
+{{- printf "system:serviceaccount:%s:%s-kubeletplugin" (include "dra-driver-nvidia-gpu.namespace" . | trim) (include "dra-driver-nvidia-gpu.serviceAccountName" . | trim) -}}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentMarkerAnnotations" -}}
+helm.sh/resource-policy: keep
+meta.helm.sh/release-name: {{ .Release.Name | quote }}
+meta.helm.sh/release-namespace: {{ .Release.Namespace | quote }}
+resource.nvidia.com/persistent-agent-installation: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationID" . | quote }}
+resource.nvidia.com/persistent-agent-control-namespace: {{ include "dra-driver-nvidia-gpu.namespace" . | trim | quote }}
+resource.nvidia.com/persistent-agent-controller-subject: {{ include "dra-driver-nvidia-gpu.controllerServiceAccountUsername" . | quote }}
+resource.nvidia.com/persistent-agent-kubelet-subject: {{ include "dra-driver-nvidia-gpu.kubeletPluginServiceAccountUsername" . | quote }}
+resource.nvidia.com/persistent-agent-controller-role: {{ include "dra-driver-nvidia-gpu.persistentAgentControllerRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-kubelet-role: {{ include "dra-driver-nvidia-gpu.persistentAgentKubeletRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-controller-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentControllerBindingName" . | quote }}
+resource.nvidia.com/persistent-agent-kubelet-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentKubeletBindingName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-daemon-role: "compute-domain-daemon-role"
+resource.nvidia.com/persistent-agent-legacy-daemon-binding: "compute-domain-daemon-role-binding"
+resource.nvidia.com/persistent-agent-controller-workload: {{ include "dra-driver-nvidia-gpu.persistentAgentControllerWorkloadName" . | quote }}
+resource.nvidia.com/persistent-agent-kubelet-workload: {{ include "dra-driver-nvidia-gpu.persistentAgentKubeletWorkloadName" . | quote }}
+resource.nvidia.com/persistent-agent-controller-namespace-role: {{ include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-controller-namespace-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceBindingName" . | quote }}
+resource.nvidia.com/persistent-agent-kubelet-namespace-role: {{ include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-kubelet-namespace-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceBindingName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-controller-role: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-kubelet-role: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-controller-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerBindingName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-kubelet-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletBindingName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-controller-namespace-role: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-controller-namespace-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceBindingName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-role: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceRoleName" . | quote }}
+resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-binding: {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceBindingName" . | quote }}
+{{- end -}}
+
+{{/*
+Safety policies and bindings are deliberately release-neutral objects. Helm's
+live install adds its ownership metadata after the admission-first bootstrap;
+an offline render must not contain metadata with which another release could
+claim those retained objects.
+*/}}
+{{- define "dra-driver-nvidia-gpu.persistentAgentAnnotations" -}}
+helm.sh/resource-policy: keep
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentObjectIdentity" -}}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+resource.nvidia.com/persistent-agent-installation: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationID" . | quote }}
+{{- end }}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentLabels" -}}
+app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.persistentAgentPolicyName" -}}
+{{- printf "%s-dra-driver-nvidia-gpu" . -}}
+{{- end -}}
+
+{{/*
 Create the name of the webhook service account to use
 */}}
 {{- define "dra-driver-nvidia-gpu.webhookServiceAccountName" -}}
@@ -232,5 +409,36 @@ on an invalid combination. Produces no output on success.
   {{- else -}}
     {{- fail (printf "unknown resources.computeDomains.imex.isolation %q: must be \"domain\" or \"channel\"" $isolation) -}}
   {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Persistent-agent snapshots need an expected Node set before they may become
+Active. The kubelet plugin's topology label is that set in the initial
+implementation.
+*/}}
+{{- define "dra-driver-nvidia-gpu.validatePersistentComputeDomainAgents" -}}
+{{- $enabled := and .Values.featureGates (and (hasKey .Values.featureGates "PersistentComputeDomainAgents") .Values.featureGates.PersistentComputeDomainAgents) -}}
+{{- if and $enabled (not .Values.persistentComputeDomainAgents.admissionEnabled) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires persistentComputeDomainAgents.admissionEnabled=true" -}}
+{{- end -}}
+
+{{- if and $enabled (include "dra-driver-nvidia-gpu.hostManagedIMEX" .) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true is incompatible with resources.computeDomains.imex.mode=hostManaged" -}}
+{{- end -}}
+{{- if and $enabled (.Capabilities.APIVersions.Has "security.openshift.io/v1/SecurityContextConstraints") -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true is not supported on OpenShift in this alpha; SCC bindings are not yet covered by the immutable single-install admission boundary" -}}
+{{- end -}}
+{{- if and $enabled (ne (include "dra-driver-nvidia-gpu.resourceApiVersion" . | trim) "resource.k8s.io/v1") -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires the served resource.k8s.io/v1 API; Kubernetes v1.32/v1.33 beta DRA APIs remain supported only by legacy-v1" -}}
+{{- end -}}
+{{- if and $enabled (not .Values.kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled=true" -}}
+{{- end -}}
+{{- if and $enabled (not .Values.controller.leaderElection.enabled) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires controller.leaderElection.enabled=true; clique allocation requires one active writer" -}}
+{{- end -}}
+{{- if and $enabled (and (hasKey .Values.featureGates "CrashOnNVLinkFabricErrors") (not .Values.featureGates.CrashOnNVLinkFabricErrors)) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires featureGates.CrashOnNVLinkFabricErrors=true; persistent-agent topology must fail closed instead of falling back to non-fabric mode" -}}
 {{- end -}}
 {{- end -}}

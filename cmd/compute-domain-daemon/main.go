@@ -28,6 +28,7 @@ import (
 	"sync"
 	"syscall"
 	"text/template"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +38,7 @@ import (
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/internal/common"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/bootid"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 	pkgflags "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
 )
@@ -61,6 +63,8 @@ type Flags struct {
 	podName                string
 	podNamespace           string
 	maxNodesPerIMEXDomain  int
+	persistentAgent        bool
+	persistentAgentCDI     bool
 	httpEndpoint           string
 	metricsPath            string
 	klogVerbosity          int
@@ -163,6 +167,13 @@ func newApp() *cli.App {
 			EnvVars:     []string{"MAX_NODES_PER_IMEX_DOMAIN"},
 			Destination: &flags.maxNodesPerIMEXDomain,
 		},
+		&cli.BoolFlag{
+			Name:        "persistent-agent-cdi",
+			Usage:       "Internal proof that persistent-agent CDI edits were applied.",
+			EnvVars:     []string{"PERSISTENT_AGENT_CDI"},
+			Destination: &flags.persistentAgentCDI,
+			Hidden:      true,
+		},
 	}
 	cliFlags = append(cliFlags, featureGateConfig.Flags()...)
 	cliFlags = append(cliFlags, loggingConfig.Flags()...)
@@ -186,6 +197,7 @@ func newApp() *cli.App {
 			{
 				Name:  "run",
 				Usage: "Run the compute domain daemon",
+				Flags: []cli.Flag{persistentAgentCLIFlag(flags)},
 				Before: func(c *cli.Context) error {
 					// `check` (e.g. startupProbe) does not use this hook — avoid noisy logs on every probe.
 					pkgflags.LogStartupConfig(flags, loggingConfig)
@@ -198,6 +210,7 @@ func newApp() *cli.App {
 			{
 				Name:  "check",
 				Usage: "Check if the node is IMEX capable and if the IMEX daemon is ready",
+				Flags: []cli.Flag{persistentAgentCLIFlag(flags)},
 				Action: func(c *cli.Context) error {
 					return wrapper(c.Context, check)
 				},
@@ -208,14 +221,29 @@ func newApp() *cli.App {
 	return app
 }
 
+func persistentAgentCLIFlag(flags *Flags) cli.Flag {
+	return &cli.BoolFlag{
+		Name:        "persistent-agent",
+		Usage:       "Run as the installation-scoped persistent ComputeDomain agent.",
+		EnvVars:     []string{"PERSISTENT_AGENT"},
+		Destination: &flags.persistentAgent,
+	}
+}
+
 // Run invokes the IMEX daemon and manages its lifecycle.
 func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	// Verify that CDI container edits were applied by the container runtime by
 	// checking for COMPUTE_DOMAIN_UUID, which is always injected as part of the
 	// CDI edits. If it is missing, CDI is likely disabled and the daemon cannot
 	// function correctly (e.g. the /imexd mount will be missing).
-	if flags.computeDomainUUID == "" {
+	if flags.computeDomainUUID == "" && !flags.persistentAgent {
 		return fmt.Errorf("CDI container edits did not apply -- is CDI enabled in your container runtime?")
+	}
+	if flags.computeDomainUUID != "" && flags.persistentAgent {
+		return fmt.Errorf("persistent agent CDI configuration must not contain a ComputeDomain UUID")
+	}
+	if flags.persistentAgent && !flags.persistentAgentCDI {
+		return fmt.Errorf("persistent agent CDI container edits did not apply -- is CDI enabled in your container runtime?")
 	}
 
 	common.StartDebugSignalHandlers()
@@ -224,6 +252,11 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	if err := featuregates.ValidateFeatureGates(); err != nil {
 		return fmt.Errorf("feature gate validation failed: %w", err)
 	}
+	if flags.persistentAgent {
+		if err := writePersistentAgentState("starting"); err != nil {
+			return fmt.Errorf("initialize persistent-agent supervisor state: %w", err)
+		}
+	}
 
 	// Create clientsets for Kubernetes API access
 	kubeConfig := &pkgflags.KubeClientConfig{}
@@ -231,16 +264,23 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 	if err != nil {
 		return fmt.Errorf("failed to create client sets: %w", err)
 	}
+	if flags.persistentAgent {
+		bootID, err := bootid.GetCurrentBootID()
+		if err != nil {
+			return fmt.Errorf("read persistent-agent kernel boot ID: %w", err)
+		}
+		if bootID == "" {
+			return fmt.Errorf("persistent agent requires a nonempty kernel boot ID")
+		}
+		return runPersistentAgent(ctx, cancel, flags, clientsets, bootID)
+	}
 
-	// Add compute domain clique label to this pod
+	// Historical per-ComputeDomain daemons publish their discovered clique on
+	// their own Pod. Persistent agents use the separate path above.
 	if err := addComputeDomainCliqueLabel(ctx, clientsets, flags); err != nil {
 		return fmt.Errorf("failed to add compute domain clique label to pod: %w", err)
 	}
 
-	// When cliqueID is empty, skip starting the controller and IMEX daemon management entirely.
-	// The compute-domain-controller will watch this pod's label and sync its node info to the
-	// ComputeDomain status. There's no clique to manage, no DNS indices to determine, and no
-	// IMEX daemon to run.
 	if flags.cliqueID == "" {
 		klog.Infof("no cliqueID: skipping controller and IMEX daemon management")
 		// Just wait for shutdown signal
@@ -248,7 +288,6 @@ func run(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 		klog.Infof("Exiting")
 		return nil
 	}
-
 	config := &ControllerConfig{
 		httpEndpoint:           flags.httpEndpoint,
 		metricsPath:            flags.metricsPath,
@@ -404,7 +443,6 @@ func IMEXDaemonUpdateLoopWithDNSNames(ctx context.Context, controller *Controlle
 			if err != nil {
 				return fmt.Errorf("failed to ensure IMEX daemon is started: %w", err)
 			}
-
 			dnsNameManager.LogDNSNameMappings()
 
 			// Skip sending SIGUSR1 when the process is fresh (has newly been
@@ -425,24 +463,212 @@ func IMEXDaemonUpdateLoopWithDNSNames(ctx context.Context, controller *Controlle
 				// other error resulted in bad signal delivery, we may get away
 				// with it).
 				klog.Errorf("failed to send SIGUSR1 to child process: %s", err)
+				break
 			}
 		}
 	}
 }
 
+type persistentAgentApplyState struct {
+	desired         *PersistentAgentDesiredState
+	restartRequired bool
+}
+
+type persistentAgentApplyOperations struct {
+	selectRuntime           func(*PersistentAgentDesiredState) error
+	updateHosts             func([]*nvapi.ComputeDomainDaemonInfo) (bool, error)
+	ensureIMEX              func() (bool, error)
+	restartIMEX             func() error
+	checkIMEX               func() error
+	writeReceipt            func(*nvapi.ComputeDomainCliqueSnapshotReceipt) error
+	writeAppliedState       func(*PersistentAgentDesiredState) error
+	retireIMEX              func() error
+	writeRetirementEvidence func(*PersistentAgentDesiredState) error
+	clearAppliedState       func(*PersistentAgentDesiredState) error
+}
+
+// runPersistentAgentApplyLoop retries local installation without waiting for
+// another API event. A newer desired snapshot supersedes the one being retried.
+func runPersistentAgentApplyLoop(ctx context.Context, controller *Controller, ops persistentAgentApplyOperations) error {
+	desiredStateChan := controller.GetSnapshotDesiredStateChan()
+	if desiredStateChan == nil {
+		return fmt.Errorf("persistent-agent snapshot manager is unavailable")
+	}
+	var pending persistentAgentApplyState
+	for {
+		if pending.desired == nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			case pending.desired = <-desiredStateChan:
+			}
+		}
+
+		// Collapse any burst to the latest committed desired snapshot before
+		// starting local I/O. restartRequired is retained because a previous
+		// hosts write may still require an existing process to be restarted.
+		for draining := true; draining; {
+			select {
+			case pending.desired = <-desiredStateChan:
+			default:
+				draining = false
+			}
+		}
+
+		if err := applyPersistentAgentSnapshot(&pending, ops); err == nil {
+			if pending.desired.RetirementEvidence != nil {
+				controller.MarkSnapshotRetired(pending.desired)
+			} else {
+				controller.MarkSnapshotApplied(pending.desired)
+			}
+			pending.desired = nil
+			continue
+		} else {
+			identity := pending.desired.identity()
+			klog.Errorf("failed to apply persistent-agent snapshot %s/%d: %v; retrying", identity.uid, identity.generation, err)
+		}
+
+		retry := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			retry.Stop()
+			return nil
+		case pending.desired = <-desiredStateChan:
+			retry.Stop()
+		case <-retry.C:
+		}
+	}
+}
+
+func applyPersistentAgentSnapshot(state *persistentAgentApplyState, ops persistentAgentApplyOperations) error {
+	if ops.selectRuntime != nil {
+		if err := ops.selectRuntime(state.desired); err != nil {
+			return fmt.Errorf("failed to select snapshot runtime: %w", err)
+		}
+	}
+	if state.desired.RetirementEvidence != nil {
+		if ops.retireIMEX == nil || ops.writeRetirementEvidence == nil {
+			return fmt.Errorf("retirement operations are unavailable")
+		}
+		if err := ops.retireIMEX(); err != nil {
+			return fmt.Errorf("failed to stop and reap IMEX daemon: %w", err)
+		}
+		if err := ops.writeRetirementEvidence(state.desired); err != nil {
+			return fmt.Errorf("failed to publish durable retirement evidence: %w", err)
+		}
+		if ops.clearAppliedState != nil {
+			if err := ops.clearAppliedState(state.desired); err != nil {
+				return fmt.Errorf("failed to clear applied snapshot state: %w", err)
+			}
+		}
+		state.restartRequired = false
+		return nil
+	}
+	updated, err := ops.updateHosts(state.desired.Members)
+	if err != nil {
+		return fmt.Errorf("failed to update DNS name mappings: %w", err)
+	}
+	state.restartRequired = state.restartRequired || updated
+
+	fresh, err := ops.ensureIMEX()
+	if err != nil {
+		return fmt.Errorf("failed to ensure IMEX daemon is started: %w", err)
+	}
+	if fresh {
+		// A newly started process reads the already-installed mapping. Starting
+		// a fresh process, rather than merely delivering a reload signal, is the
+		// causal boundary used before a persistent agent acknowledges a map.
+		state.restartRequired = false
+	} else if state.restartRequired {
+		if err := ops.restartIMEX(); err != nil {
+			return fmt.Errorf("failed to restart IMEX daemon with new mapping: %w", err)
+		}
+		state.restartRequired = false
+	}
+
+	// Do not publish a receipt merely because a signal was delivered or a
+	// process was spawned. The new process must answer READY after the mapping
+	// was installed. A future IMEX generation/digest acknowledgement can make
+	// this proof stronger without changing the snapshot protocol.
+	if err := ops.checkIMEX(); err != nil {
+		return fmt.Errorf("IMEX daemon did not become ready after applying snapshot: %w", err)
+	}
+
+	if err := ops.writeReceipt(state.desired.Receipt); err != nil {
+		return fmt.Errorf("failed to write installed snapshot receipt: %w", err)
+	}
+	if ops.writeAppliedState != nil {
+		if err := ops.writeAppliedState(state.desired); err != nil {
+			return fmt.Errorf("failed to publish applied snapshot state: %w", err)
+		}
+	}
+	return nil
+}
+
+func writeSnapshotReceipt(receipt *nvapi.ComputeDomainCliqueSnapshotReceipt) error {
+	return writeSnapshotReceiptAt(imexDaemonConfigDirPath, receipt)
+}
+
+func writeSnapshotReceiptAt(directory string, receipt *nvapi.ComputeDomainCliqueSnapshotReceipt) error {
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".snapshot-receipt-*")
+	if err != nil {
+		return err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryName, filepath.Join(directory, "snapshot-receipt.json"))
+}
+
 // check verifies if the node is IMEX capable and if so, checks if the IMEX daemon is ready.
 // It returns an error if any step fails.
 func check(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
+	if flags.persistentAgent {
+		if !flags.persistentAgentCDI {
+			return fmt.Errorf("persistent agent CDI container edits did not apply")
+		}
+		if err := checkPersistentAgentState(); err != nil {
+			return err
+		}
+		fmt.Println("check succeeded (persistent agent supervisor is healthy)")
+		return nil
+	}
 	if flags.cliqueID == "" {
 		fmt.Println("check succeeded (noop, clique ID is empty)")
 		return nil
 	}
 
+	return checkIMEXReady(ctx)
+}
+
+// checkIMEXReady probes the local daemon process. It intentionally does not
+// claim that IMEX exposes a configuration-generation acknowledgement: the
+// persistent-agent apply path pairs this check with a process start/restart
+// that happens strictly after the new peer map is installed.
+func checkIMEXReady(ctx context.Context) error {
+	return checkIMEXReadyAt(ctx, imexDaemonConfigPath)
+}
+
+func checkIMEXReadyAt(ctx context.Context, configPath string) error {
 	// -q is documented with "Query the status of the IMEX daemon once and
 	// return". This probes if the local IMEX daemon is ready (not the entire
 	// domain). Reference:
 	// https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/cmdservice.html
-	cmd := exec.CommandContext(ctx, imexCtlBinaryName, "-c", imexDaemonConfigPath, "-q")
+	cmd := exec.CommandContext(ctx, imexCtlBinaryName, "-c", configPath, "-q")
 
 	// Spawn child, collect standard streams.
 	outerr, err := cmd.CombinedOutput()
@@ -460,12 +686,16 @@ func check(ctx context.Context, cancel context.CancelFunc, flags *Flags) error {
 
 // writeIMEXConfig renders the config template with the pod IP and writes it to the final config file.
 func writeIMEXConfig(podIP string) error {
+	return writeIMEXConfigAt(imexDaemonConfigTmplPath, imexDaemonConfigPath, imexDaemonNodesConfigPath, podIP)
+}
+
+func writeIMEXConfigAt(templatePath, configPath, nodesConfigPath, podIP string) error {
 	configTemplateData := IMEXConfigTemplateData{
 		IMEXCmdBindInterfaceIP:    podIP,
-		IMEXDaemonNodesConfigPath: imexDaemonNodesConfigPath,
+		IMEXDaemonNodesConfigPath: nodesConfigPath,
 	}
 
-	tmpl, err := template.ParseFiles(imexDaemonConfigTmplPath)
+	tmpl, err := template.ParseFiles(templatePath)
 	if err != nil {
 		return fmt.Errorf("error parsing template file: %w", err)
 	}
@@ -476,13 +706,13 @@ func writeIMEXConfig(podIP string) error {
 	}
 
 	// Ensure the directory exists
-	dir := filepath.Dir(imexDaemonConfigPath)
+	dir := filepath.Dir(configPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	if err := os.WriteFile(imexDaemonConfigPath, configFile.Bytes(), 0644); err != nil {
-		return fmt.Errorf("error writing config file %v: %w", imexDaemonConfigPath, err)
+	if err := os.WriteFile(configPath, configFile.Bytes(), 0644); err != nil {
+		return fmt.Errorf("error writing config file %v: %w", configPath, err)
 	}
 
 	klog.Infof("Rendered IMEX daemon config file with: %v", configTemplateData)

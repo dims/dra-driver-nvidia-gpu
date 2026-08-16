@@ -118,7 +118,16 @@ resources:
 #   HostManagedIMEXDaemon: false       # Gate allowing resources.computeDomains.imex.mode=hostManaged
 #   DRAListTypeAttributes: false       # Publish list-valued DRA device attributes
 #   ConsumableShares: false            # Publish consumable capacity and multi-allocation support for devices
+#   PersistentComputeDomainAgents: false # Replace per-domain daemons with one reusable agent per capable Node
 featureGates: {}
+
+# Installation-wide daemon-provider configuration. Enabling the feature gate
+# requires a drained installation: no historical per-ComputeDomain daemon may
+# overlap the persistent fleet on the same Nodes.
+persistentComputeDomainAgents:
+  admissionEnabled: false
+  maxNodesPerIMEXDomain: 18
+  resources: {}
 
 # Log verbosity for all components. Zero or greater, higher number means higher
 # verbosity. Regardless of this setting, messages of type Error, Warning, and

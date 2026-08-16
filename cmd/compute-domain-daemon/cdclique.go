@@ -17,9 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -279,6 +280,9 @@ func (m *ComputeDomainCliqueManager) syncDaemonInfoToClique(ctx context.Context,
 
 	// Create a deep copy of the CDClique to avoid modifying the original
 	newClique := clique.DeepCopy()
+	ownerCount := len(newClique.OwnerReferences)
+	m.ensureOwnerReference(newClique)
+	ownerAdded := len(newClique.OwnerReferences) != ownerCount
 
 	// Try to find an existing entry for the current k8s node
 	for _, d := range newClique.Daemons {
@@ -289,7 +293,7 @@ func (m *ComputeDomainCliqueManager) syncDaemonInfoToClique(ctx context.Context,
 	}
 
 	// If there is one and its IP is the same as this one, we are done
-	if myDaemon != nil && myDaemon.IPAddress == m.config.podIP {
+	if myDaemon != nil && myDaemon.IPAddress == m.config.podIP && !ownerAdded {
 		klog.V(6).Infof("syncDaemonInfoToClique noop: pod IP unchanged (%s)", m.config.podIP)
 		return newClique, nil
 	}
@@ -318,9 +322,6 @@ func (m *ComputeDomainCliqueManager) syncDaemonInfoToClique(ctx context.Context,
 	// as of now translates into a pod IP address and may therefore change
 	// across pod restarts.
 	myDaemon.IPAddress = m.config.podIP
-
-	// Ensure this pod is an owner of the clique
-	m.ensureOwnerReference(newClique)
 
 	// Update the clique and (upon success) store the latest version of the object
 	// (as returned by the API server) in the mutation cache.
@@ -406,22 +407,26 @@ func (m *ComputeDomainCliqueManager) removeDaemonInfoFromClique(ctx context.Cont
 // If there was actually a change compared to the previously known set of
 // daemons: pass info to IMEX daemon controller.
 func (m *ComputeDomainCliqueManager) maybePushDaemonsUpdate(clique *nvapi.ComputeDomainClique) {
-	newIPs := m.getIPSet(clique.Daemons)
-	previousIPs := m.getIPSet(m.previousDaemons)
-
-	// Compare sets (i.e., without paying attention to order). Note: the order
-	// of IP addresses written to the IMEX daemon's config file might matter (in
-	// the sense that if across config files the set is equal but the order is
-	// not: that may lead to an IMEX daemon startup error). Maybe we should
-	// perform a stable sort of IP addresses before writing them to the nodes
-	// config file.
-	if !maps.Equal(newIPs, previousIPs) {
-		added, removed := previousIPs.Diff(newIPs)
-		klog.V(2).Infof("IP set for clique changed.\nAdded: %v\nRemoved: %v", added, removed)
-		m.previousDaemons = clique.Daemons
-		m.updatedDaemonsChan <- clique.Daemons
+	current := slices.Clone(clique.Daemons)
+	previous := slices.Clone(m.previousDaemons)
+	sortDaemons := func(daemons []*nvapi.ComputeDomainDaemonInfo) {
+		slices.SortFunc(daemons, func(a, b *nvapi.ComputeDomainDaemonInfo) int {
+			if byIndex := cmp.Compare(a.Index, b.Index); byIndex != 0 {
+				return byIndex
+			}
+			return cmp.Compare(a.NodeName, b.NodeName)
+		})
+	}
+	sortDaemons(current)
+	sortDaemons(previous)
+	if !slices.EqualFunc(current, previous, func(a, b *nvapi.ComputeDomainDaemonInfo) bool {
+		return a.NodeName == b.NodeName && a.IPAddress == b.IPAddress && a.CliqueID == b.CliqueID && a.Index == b.Index
+	}) {
+		klog.V(2).Infof("index-to-IP mapping for clique changed")
+		m.previousDaemons = current
+		m.updatedDaemonsChan <- current
 	} else {
-		klog.V(6).Infof("IP set for clique did not change")
+		klog.V(6).Infof("index-to-IP mapping for clique did not change")
 	}
 }
 
@@ -489,12 +494,4 @@ func (m *ComputeDomainCliqueManager) ensureOwnerReference(clique *nvapi.ComputeD
 		Name:       m.config.podName,
 		UID:        types.UID(m.config.podUID),
 	})
-}
-
-func (m *ComputeDomainCliqueManager) getIPSet(daemons []*nvapi.ComputeDomainDaemonInfo) IPSet {
-	set := make(IPSet)
-	for _, d := range daemons {
-		set[d.IPAddress] = struct{}{}
-	}
-	return set
 }

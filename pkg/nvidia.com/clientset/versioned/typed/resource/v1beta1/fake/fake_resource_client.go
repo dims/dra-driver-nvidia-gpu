@@ -36,6 +36,18 @@ func (c *FakeResourceV1beta1) ComputeDomainCliques(namespace string) v1beta1.Com
 	return &FakeComputeDomainCliques{c, namespace}
 }
 
+func (c *FakeResourceV1beta1) ComputeDomainCliqueReservations() v1beta1.ComputeDomainCliqueReservationInterface {
+	return &FakeComputeDomainCliqueReservations{c}
+}
+
+func (c *FakeResourceV1beta1) ComputeDomainCliqueRetirementEvidences(namespace string) v1beta1.ComputeDomainCliqueRetirementEvidenceInterface {
+	return &FakeComputeDomainCliqueRetirementEvidences{c, namespace}
+}
+
+func (c *FakeResourceV1beta1) ComputeDomainCliqueSnapshots(namespace string) v1beta1.ComputeDomainCliqueSnapshotInterface {
+	return &FakeComputeDomainCliqueSnapshots{c, namespace}
+}
+
 // RESTClient returns a RESTClient that is used to communicate
 // with API server by this client implementation.
 func (c *FakeResourceV1beta1) RESTClient() rest.Interface {

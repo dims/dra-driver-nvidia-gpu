@@ -67,6 +67,10 @@ const (
 	// storing daemon info directly in ComputeDomainStatus.Nodes.
 	ComputeDomainCliques featuregate.Feature = "ComputeDomainCliques"
 
+	// PersistentComputeDomainAgents replaces per-ComputeDomain daemons with one
+	// reusable agent per capable Node for the entire driver installation.
+	PersistentComputeDomainAgents featuregate.Feature = "PersistentComputeDomainAgents"
+
 	// CrashOnNVLinkFabricErrors causes the kubelet plugin to crash instead of
 	// falling back to non-fabric mode when NVLink fabric errors are detected.
 	CrashOnNVLinkFabricErrors featuregate.Feature = "CrashOnNVLinkFabricErrors"
@@ -163,6 +167,13 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 			Version:    version.MajorMinor(0, 3),
 		},
 	},
+	PersistentComputeDomainAgents: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(0, 6),
+		},
+	},
 	CrashOnNVLinkFabricErrors: {
 		{
 			Default:    true,
@@ -253,6 +264,15 @@ func ValidateFeatureGates() error {
 	// ComputeDomainCliques requires IMEXDaemonsWithDNSNames
 	if Enabled(ComputeDomainCliques) && !Enabled(IMEXDaemonsWithDNSNames) {
 		return fmt.Errorf("feature gate %s requires %s to also be enabled", ComputeDomainCliques, IMEXDaemonsWithDNSNames)
+	}
+	if Enabled(PersistentComputeDomainAgents) && !Enabled(ComputeDomainCliques) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", PersistentComputeDomainAgents, ComputeDomainCliques)
+	}
+	if Enabled(PersistentComputeDomainAgents) && !Enabled(IMEXDaemonsWithDNSNames) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", PersistentComputeDomainAgents, IMEXDaemonsWithDNSNames)
+	}
+	if Enabled(PersistentComputeDomainAgents) && !Enabled(CrashOnNVLinkFabricErrors) {
+		return fmt.Errorf("feature gate %s requires %s to also be enabled", PersistentComputeDomainAgents, CrashOnNVLinkFabricErrors)
 	}
 
 	if Enabled(DynamicMIG) && Enabled(PassthroughSupport) {

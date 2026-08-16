@@ -159,3 +159,83 @@ kubectl logs -n nvidia-dra-driver-gpu <kubelet-plugin-pod>
 ```
 
 If you see `checkpoint is corrupted` errors, the v0.4.0 kubelet plugin now logs a diff between the on-disk and re-marshaled checkpoint contents to make this easier to debug. Include that log output when filing an [issue](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu/issues).
+
+
+## Switching to persistent ComputeDomain agents
+
+`PersistentComputeDomainAgents` is an alpha, installation-wide replacement for the historical per-ComputeDomain IMEX daemon. It is not a per-ComputeDomain canary and it does not run beside the old daemon on the same Node. Kubernetes versions which do not serve `resource.k8s.io/v1` remain supported by the default legacy path; the persistent-agent mode requires Kubernetes v1.34 or newer.
+
+Before enabling it:
+
+1. Retire and delete every ComputeDomain managed by this installation.
+2. Verify that no per-ComputeDomain daemon DaemonSet, Pod, ResourceClaimTemplate, or ResourceClaim remains.
+3. Use one admin-controlled driver namespace and one installation. OpenShift is not supported by this alpha.
+4. Keep controller leader election enabled and publish the GPU clique label from the kubelet plugin.
+5. Use only whole physical cliques which are new or have been externally quiesced and reset. Set `resource.nvidia.com/persistentAgentComputeDomain=<ComputeDomain UID>` on every Node in a target clique before creating its workload Pod.
+
+Helm does not update CRDs during an upgrade. From the exact release source, first render and apply the installation marker, policies, and bindings, then apply and wait for the three new CRDs:
+
+```bash
+helm template nvidia-dra-driver-gpu ./deployments/helm/dra-driver-nvidia-gpu \
+  --namespace nvidia-dra-driver-gpu \
+  --api-versions resource.k8s.io/v1 \
+  --set resources.gpus.enabled=false \
+  --set persistentComputeDomainAgents.admissionEnabled=true \
+  --show-only templates/persistent-agent-installation.yaml \
+  > persistent-agent-installation.yaml
+
+helm template nvidia-dra-driver-gpu ./deployments/helm/dra-driver-nvidia-gpu \
+  --namespace nvidia-dra-driver-gpu \
+  --api-versions resource.k8s.io/v1 \
+  --set resources.gpus.enabled=false \
+  --set persistentComputeDomainAgents.admissionEnabled=true \
+  --show-only templates/validatingadmissionpolicy.yaml \
+  > persistent-agent-policies.yaml
+
+helm template nvidia-dra-driver-gpu ./deployments/helm/dra-driver-nvidia-gpu \
+  --namespace nvidia-dra-driver-gpu \
+  --api-versions resource.k8s.io/v1 \
+  --set resources.gpus.enabled=false \
+  --set persistentComputeDomainAgents.admissionEnabled=true \
+  --show-only templates/validatingadmissionpolicybinding.yaml \
+  > persistent-agent-bindings.yaml
+
+kubectl apply -f persistent-agent-installation.yaml
+kubectl apply -f persistent-agent-policies.yaml
+kubectl apply -f persistent-agent-bindings.yaml
+kubectl apply -f deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquesnapshots.yaml
+kubectl apply -f deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquereservations.yaml
+kubectl apply -f deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliqueretirementevidences.yaml
+kubectl wait --for=condition=Established crd/computedomaincliquesnapshots.resource.nvidia.com
+kubectl wait --for=condition=Established crd/computedomaincliquereservations.resource.nvidia.com
+kubectl wait --for=condition=Established crd/computedomaincliqueretirementevidences.resource.nvidia.com
+```
+
+Use Helm 3.17 or newer with `--take-ownership` when the release first adopts these pre-applied objects. Preserve all other values used by the installation:
+
+```yaml
+featureGates:
+  PersistentComputeDomainAgents: true
+  ComputeDomainCliques: true
+  IMEXDaemonsWithDNSNames: true
+  CrashOnNVLinkFabricErrors: true
+
+persistentComputeDomainAgents:
+  admissionEnabled: true
+  maxNodesPerIMEXDomain: 18
+
+controller:
+  leaderElection:
+    enabled: true
+
+kubeletPlugin:
+  containers:
+    computeDomains:
+      gpuCliqueLabelEnabled: true
+```
+
+The controller chooses the provider for new ComputeDomains and records `resource.nvidia.com/computeDomainCliqueProtocol: persistent-agent-v1`. Users must not set that annotation. A persistent ComputeDomain uses the installation DaemonSet and must not create a per-ComputeDomain daemon DaemonSet or daemon claim.
+
+Disabling the feature gate does not stop or replace existing agents. Existing snapshots, reservations, receipts, and retirement work continue to require the new binaries, APIs, admission policies, leader election, topology publication, and retained agent DaemonSet. Cleanly retire every persistent ComputeDomain, verify every reservation is `Released`, and remove the retained fleet only as an explicit decommission step. Rolling back to older binaries, deleting the policies, or starting legacy ComputeDomains while persistent state remains is unsupported.
+
+The persistent DaemonSet uses `OnDelete` because a Pod UID is part of the fencing identity. Do not bounce an agent which serves an Active ComputeDomain as an ordinary rollout. Retire its ComputeDomains first. An unexpected same-boot replacement is quarantined intentionally; a verified Node reboot may provide the distinct boot evidence needed by retirement.

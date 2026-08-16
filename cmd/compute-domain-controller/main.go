@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/google/uuid"
@@ -50,7 +51,11 @@ import (
 )
 
 const (
-	DriverName = "compute-domain.nvidia.com"
+	DriverName                                 = "compute-domain.nvidia.com"
+	persistentAgentInstallationPolicyName      = "persistent-compute-domain-agents.dra-driver-nvidia-gpu"
+	persistentAgentInstallationAnnotation      = "resource.nvidia.com/persistent-agent-installation"
+	persistentAgentControlNamespaceAnnotation  = "resource.nvidia.com/persistent-agent-control-namespace"
+	persistentAgentControllerSubjectAnnotation = "resource.nvidia.com/persistent-agent-controller-subject"
 
 	// This constant provides a reasonable default for the maximum size of
 	// a given IMEX Domain. On GB200 and GB300 the limit is 18, so we pick
@@ -65,6 +70,8 @@ type Flags struct {
 
 	podName               string
 	namespace             string
+	serviceAccountName    string
+	installationID        string
 	imageName             string
 	maxNodesPerIMEXDomain int
 	logVerbosityCDDaemon  int
@@ -79,6 +86,34 @@ type Flags struct {
 	additionalNamespaces cli.StringSlice
 	imagePullSecretsCSV  string
 	klogVerbosity        int
+}
+
+// trackingResourceLock records local acquisition history independently of the
+// LeaderElector's current observed holder. After this process observes a
+// successor, IsLeader/GetLeader are false even though its leader callback may
+// still be draining. Update/Create are the atomic points at which this
+// identity actually acquires or renews the lock.
+type trackingResourceLock struct {
+	resourcelock.Interface
+	identity string
+	acquired chan struct{}
+	once     sync.Once
+}
+
+func (l *trackingResourceLock) Create(ctx context.Context, record resourcelock.LeaderElectionRecord) error {
+	err := l.Interface.Create(ctx, record)
+	if err == nil && record.HolderIdentity == l.identity {
+		l.once.Do(func() { close(l.acquired) })
+	}
+	return err
+}
+
+func (l *trackingResourceLock) Update(ctx context.Context, record resourcelock.LeaderElectionRecord) error {
+	err := l.Interface.Update(ctx, record)
+	if err == nil && record.HolderIdentity == l.identity {
+		l.once.Do(func() { close(l.acquired) })
+	}
+	return err
 }
 
 type Config struct {
@@ -109,6 +144,18 @@ func newApp() *cli.App {
 			Required:    true,
 			Destination: &flags.podName,
 			EnvVars:     []string{"POD_NAME"},
+		},
+		&cli.StringFlag{
+			Name:        "service-account-name",
+			Usage:       "The ServiceAccount name used by this controller Pod.",
+			Destination: &flags.serviceAccountName,
+			EnvVars:     []string{"SERVICE_ACCOUNT_NAME"},
+		},
+		&cli.StringFlag{
+			Name:        "persistent-agent-installation-id",
+			Usage:       "Immutable Helm release identity which owns persistent-agent admission.",
+			Destination: &flags.installationID,
+			EnvVars:     []string{"PERSISTENT_AGENT_INSTALLATION_ID"},
 		},
 		&cli.StringFlag{
 			Name:        "namespace",
@@ -203,6 +250,9 @@ func newApp() *cli.App {
 			if c.Args().Len() > 0 {
 				return fmt.Errorf("arguments not supported: %v", c.Args().Slice())
 			}
+			if flags.maxNodesPerIMEXDomain < 1 || flags.maxNodesPerIMEXDomain > 1024 {
+				return fmt.Errorf("max-nodes-per-imex-domain must be between 1 and 1024")
+			}
 			// `loggingConfig` must be applied before doing any logging
 			err := loggingConfig.Apply()
 
@@ -216,11 +266,6 @@ func newApp() *cli.App {
 		Action: func(c *cli.Context) error {
 			common.StartDebugSignalHandlers()
 
-			// Validate feature gate dependencies
-			if err := featuregates.ValidateFeatureGates(); err != nil {
-				return fmt.Errorf("feature gate validation failed: %w", err)
-			}
-
 			imexConfig := imex.Config{Mode: imex.Mode(flags.imexMode), Isolation: imex.Isolation(flags.imexIsolation)}
 			if err := imexConfig.Validate(featuregates.Enabled(featuregates.HostManagedIMEXDaemon)); err != nil {
 				return fmt.Errorf("imex configuration validation failed: %w", err)
@@ -230,20 +275,24 @@ func newApp() *cli.App {
 				// ComputeDomainClique objects in host-managed mode, so these gates
 				// are meaningless (and their defaults would otherwise conflict).
 				if err := featuregates.FeatureGates().SetFromMap(map[string]bool{
-					string(featuregates.IMEXDaemonsWithDNSNames): false,
-					string(featuregates.ComputeDomainCliques):    false,
+					string(featuregates.IMEXDaemonsWithDNSNames):       false,
+					string(featuregates.ComputeDomainCliques):          false,
+					string(featuregates.PersistentComputeDomainAgents): false,
 				}); err != nil {
 					return fmt.Errorf("error forcing feature gates for hostManaged IMEX: %w", err)
 				}
 			}
-
+			// Validate after host-managed normalization so an explicitly enabled
+			// persistent-agent gate is safely forced off with its dependencies.
+			if err := featuregates.ValidateFeatureGates(); err != nil {
+				return fmt.Errorf("feature gate validation failed: %w", err)
+			}
 			mux := http.NewServeMux()
 
 			clientsets, err := flags.kubeClientConfig.NewClientSets()
 			if err != nil {
 				return fmt.Errorf("create client: %w", err)
 			}
-
 			config := &Config{
 				mux:                  mux,
 				flags:                flags,
@@ -251,6 +300,16 @@ func newApp() *cli.App {
 				driverName:           DriverName,
 				imagePullSecretNames: strings.Fields(strings.ReplaceAll(strings.TrimSpace(flags.imagePullSecretsCSV), ",", " ")),
 				imexConfig:           imexConfig,
+			}
+			persistentStateRequired, err := persistentAgentStateRequired(c.Context, config)
+			if err != nil {
+				return err
+			}
+			if imexConfig.EffectiveHostManaged() && persistentStateRequired {
+				return fmt.Errorf("imex.mode=hostManaged is unsafe while persistent-agent state exists; retire it first")
+			}
+			if !flags.leaderElectionConfig.Enabled && persistentStateRequired {
+				return fmt.Errorf("leader election is required while persistent-agent state exists")
 			}
 
 			if flags.httpEndpoint != "" {
@@ -324,7 +383,7 @@ func runWithLeaderElection(ctx context.Context, config *Config, controller *Cont
 	// Standard defer to ensure resources are cleaned up on function exit
 	defer cancelElector()
 
-	lock := &resourcelock.LeaseLock{
+	leaseLock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      config.flags.leaderElectionConfig.LeaseLockName,
 			Namespace: config.flags.leaderElectionConfig.LeaseLockNamespace,
@@ -334,17 +393,26 @@ func runWithLeaderElection(ctx context.Context, config *Config, controller *Cont
 			Identity: lockID,
 		},
 	}
+	lock := &trackingResourceLock{
+		Interface: leaseLock,
+		identity:  lockID,
+		acquired:  make(chan struct{}),
+	}
 
 	controllerErrCh := make(chan error, 1)
+	controllerStartedCh := make(chan struct{})
+	controllerDoneCh := make(chan struct{})
 	callbacks := leaderelection.LeaderCallbacks{
 		OnStartedLeading: func(leaderCtx context.Context) {
+			close(controllerStartedCh)
+			defer close(controllerDoneCh)
 			klog.InfoS("Became leader, starting controller", "lockID", lockID)
 
 			// ARCHITECTURE NOTE:
 			// We use cancelElector() to ensure that if the controller logic exits
 			// (either gracefully or with an error), the entire leader election loop
-			// terminates. This triggers ReleaseOnCancel, clearing the lease holder
-			// identity and allowing standby replicas to take over immediately.
+			// terminates. The Lease then expires conservatively after this callback's
+			// guarded workers have drained.
 			//
 			// By returning from run() after elector.Run() finishes, we rely on
 			// Kubernetes to restart the Pod, ensuring a clean in-memory state
@@ -384,13 +452,18 @@ func runWithLeaderElection(ctx context.Context, config *Config, controller *Cont
 	}
 
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:            lock,
-		LeaseDuration:   config.flags.leaderElectionConfig.LeaseDuration,
-		RenewDeadline:   config.flags.leaderElectionConfig.RenewDeadline,
-		RetryPeriod:     config.flags.leaderElectionConfig.RetryPeriod,
-		Name:            config.flags.leaderElectionConfig.LeaseLockName,
-		Callbacks:       callbacks,
-		ReleaseOnCancel: true, // Steps down immediately by clearing the Lease holder
+		Lock:          lock,
+		LeaseDuration: config.flags.leaderElectionConfig.LeaseDuration,
+		RenewDeadline: config.flags.leaderElectionConfig.RenewDeadline,
+		RetryPeriod:   config.flags.leaderElectionConfig.RetryPeriod,
+		Name:          config.flags.leaderElectionConfig.LeaseLockName,
+		Callbacks:     callbacks,
+		// The leader callback performs durable allocation writes and owns worker
+		// goroutines. Do not clear the Lease merely because its context was
+		// cancelled: client-go requires all guarded work to be proven stopped
+		// before ReleaseOnCancel is safe. Lease expiry provides conservative
+		// handoff while the callback drains.
+		ReleaseOnCancel: false,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create leader elector: %w", err)
@@ -399,6 +472,20 @@ func runWithLeaderElection(ctx context.Context, config *Config, controller *Cont
 	// Block until electorCtx is cancelled or leadership is lost
 	klog.InfoS("Starting leader election loop", "lockID", lockID)
 	elector.Run(electorCtx)
+	// LeaderElector.Run launches OnStartedLeading asynchronously. Join that
+	// callback explicitly so this process never returns from leader election
+	// while allocation workers from the old leadership term can still write.
+	// Current observed holder is not acquisition history: after observing a
+	// successor IsLeader/GetLeader may be false while our callback still drains.
+	// The tracking lock closes acquired on the successful Create/Update that
+	// made this identity leader. LeaderElector then schedules OnStartedLeading
+	// before entering renew, so join both scheduling and callback completion.
+	select {
+	case <-lock.acquired:
+		<-controllerStartedCh
+		<-controllerDoneCh
+	default:
+	}
 
 	// If exiting due to a controller failure, propagate the error to main
 	select {

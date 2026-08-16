@@ -1,3 +1,197 @@
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-rbac-binding-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-rbac-binding-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-namespaced-rbac-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-namespaced-rbac-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-workload-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-workload-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-lifecycle-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-lifecycle-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "resourceslices-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "resourceslices-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+  # All ResourceSlices are matched.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-reserved-metadata-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-reserved-metadata-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-node-topology-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-node-topology-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-node-attestation-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-node-attestation-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-reservation-writer-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-reservation-writer-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-snapshot-writer-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-snapshot-writer-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistent-agent-applied-state-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistent-agent-applied-state-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-retirement-evidence-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  policyName: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-retirement-evidence-policy" }}
+  paramRef:
+    name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]
+{{- else }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
@@ -6,3 +200,4 @@ spec:
   policyName: resourceslices-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
   validationActions: [Deny]
   # All ResourceSlices are matched.
+{{- end }}

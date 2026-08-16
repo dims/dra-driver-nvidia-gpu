@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
@@ -31,6 +32,9 @@ import (
 type DaemonInfoManager interface {
 	Start(ctx context.Context) error
 	Stop() error
+}
+
+type daemonInfoUpdateSource interface {
 	GetDaemonInfoUpdateChan() chan []*nvapi.ComputeDomainDaemonInfo
 }
 
@@ -49,6 +53,7 @@ type ManagerConfig struct {
 	podUID                 string
 	podName                string
 	podNamespace           string
+	bootID                 string
 	maxNodesPerIMEXDomain  int
 }
 
@@ -66,13 +71,18 @@ type ControllerConfig struct {
 	podUID                 string
 	podName                string
 	podNamespace           string
+	bootID                 string
 	maxNodesPerIMEXDomain  int
+	protocol               nvapi.ComputeDomainCliqueProtocol
 }
 
 // Controller manages the lifecycle of compute domain operations.
 type Controller struct {
 	daemonInfoManager DaemonInfoManager
 	workQueue         *workqueue.WorkQueue
+	snapshotManager   *PersistentAgentSnapshotManager
+	started           chan struct{}
+	startedOnce       sync.Once
 }
 
 // NewController creates and initializes a new Controller instance.
@@ -93,23 +103,79 @@ func NewController(config *ControllerConfig) (*Controller, error) {
 		podUID:                 config.podUID,
 		podName:                config.podName,
 		podNamespace:           config.podNamespace,
+		bootID:                 config.bootID,
 		maxNodesPerIMEXDomain:  config.maxNodesPerIMEXDomain,
 	}
 
 	// Choose the appropriate daemon info manager based on the feature gate
 	var daemonInfoManager DaemonInfoManager
-	if featuregates.Enabled(featuregates.ComputeDomainCliques) {
+	switch {
+	case config.protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1:
+		daemonInfoManager = NewPersistentAgentSnapshotManager(mc)
+	case featuregates.Enabled(featuregates.ComputeDomainCliques):
 		daemonInfoManager = NewComputeDomainCliqueManager(mc)
-	} else {
+	default:
 		daemonInfoManager = NewComputeDomainStatusManager(mc)
 	}
 
 	controller := &Controller{
 		daemonInfoManager: daemonInfoManager,
 		workQueue:         workQueue,
+		started:           make(chan struct{}),
+	}
+	if manager, ok := daemonInfoManager.(*PersistentAgentSnapshotManager); ok {
+		controller.snapshotManager = manager
 	}
 
 	return controller, nil
+}
+
+func (c *Controller) Started() <-chan struct{} {
+	return c.started
+}
+
+func (c *Controller) HasActiveOrRetiringSnapshot() bool {
+	return c.snapshotManager != nil && c.snapshotManager.HasActiveOrRetiringSnapshot()
+}
+
+func (c *Controller) GetSnapshotDesiredStateChan() <-chan *PersistentAgentDesiredState {
+	if c.snapshotManager == nil {
+		return nil
+	}
+	return c.snapshotManager.DesiredStateChan()
+}
+
+func (c *Controller) MarkSnapshotApplied(state *PersistentAgentDesiredState) {
+	if c.snapshotManager != nil {
+		c.snapshotManager.MarkApplied(state)
+	}
+}
+
+func (c *Controller) MarkSnapshotRetired(state *PersistentAgentDesiredState) {
+	if c.snapshotManager != nil {
+		c.snapshotManager.MarkRetired(state)
+	}
+}
+
+func (c *Controller) WriteSnapshotAppliedState(ctx context.Context, state *PersistentAgentDesiredState) error {
+	if c.snapshotManager == nil {
+		return fmt.Errorf("persistent-agent snapshot manager is unavailable")
+	}
+	return c.snapshotManager.WriteAppliedState(ctx, state)
+}
+
+func (c *Controller) ClearSnapshotAppliedState(ctx context.Context, state *PersistentAgentDesiredState) error {
+	if c.snapshotManager == nil {
+		return fmt.Errorf("persistent-agent snapshot manager is unavailable")
+	}
+	return c.snapshotManager.ClearAppliedState(ctx, state)
+}
+
+func (c *Controller) PublishSnapshotRetirementEvidence(ctx context.Context, state *PersistentAgentDesiredState) error {
+	if c.snapshotManager == nil {
+		return fmt.Errorf("persistent-agent snapshot manager is unavailable")
+	}
+	return c.snapshotManager.PublishRetirementEvidence(ctx, state)
 }
 
 // Run starts the controller's main loop and manages the lifecycle of its components.
@@ -119,6 +185,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	if err := c.daemonInfoManager.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start daemon info manager: %w", err)
 	}
+	c.startedOnce.Do(func() { close(c.started) })
 
 	// Start processing the workqueue
 	c.workQueue.Run(ctx)
@@ -135,5 +202,9 @@ func (c *Controller) Run(ctx context.Context) error {
 // currently present in the CD status or CDClique. This is only a complete set of
 // daemons (size `numNodes`) if IMEXDaemonsWithDNSNames=false.
 func (c *Controller) GetDaemonInfoUpdateChan() chan []*nvapi.ComputeDomainDaemonInfo {
-	return c.daemonInfoManager.GetDaemonInfoUpdateChan()
+	source, ok := c.daemonInfoManager.(daemonInfoUpdateSource)
+	if !ok {
+		return nil
+	}
+	return source.GetDaemonInfoUpdateChan()
 }

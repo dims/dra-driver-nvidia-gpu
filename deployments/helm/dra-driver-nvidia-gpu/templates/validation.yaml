@@ -12,6 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+{{- /*
+The singleton is deliberately checked at render/install time in addition to
+being protected by admission. This makes an ordinary second Helm install or
+control-namespace migration fail before it creates namespaced resources.
+`lookup` is empty for client-only `helm template`, where the rendered guard and
+runtime preflight remain the enforcement boundaries.
+*/ -}}
+{{- $guardName := include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . -}}
+{{- $guard := lookup "rbac.authorization.k8s.io/v1" "ClusterRole" "" $guardName -}}
+{{- if $guard -}}
+  {{- $annotations := dig "metadata" "annotations" (dict) $guard -}}
+  {{- $existingID := index $annotations "resource.nvidia.com/persistent-agent-installation" | default "" -}}
+  {{- $existingNamespace := index $annotations "resource.nvidia.com/persistent-agent-control-namespace" | default "" -}}
+  {{- $existingController := index $annotations "resource.nvidia.com/persistent-agent-controller-subject" | default "" -}}
+  {{- $existingKubelet := index $annotations "resource.nvidia.com/persistent-agent-kubelet-subject" | default "" -}}
+  {{- $existingControllerRole := index $annotations "resource.nvidia.com/persistent-agent-controller-role" | default "" -}}
+  {{- $existingKubeletRole := index $annotations "resource.nvidia.com/persistent-agent-kubelet-role" | default "" -}}
+  {{- $existingControllerBinding := index $annotations "resource.nvidia.com/persistent-agent-controller-binding" | default "" -}}
+  {{- $existingKubeletBinding := index $annotations "resource.nvidia.com/persistent-agent-kubelet-binding" | default "" -}}
+  {{- $existingControllerWorkload := index $annotations "resource.nvidia.com/persistent-agent-controller-workload" | default "" -}}
+  {{- $existingKubeletWorkload := index $annotations "resource.nvidia.com/persistent-agent-kubelet-workload" | default "" -}}
+  {{- $existingControllerNamespaceRole := index $annotations "resource.nvidia.com/persistent-agent-controller-namespace-role" | default "" -}}
+  {{- $existingControllerNamespaceBinding := index $annotations "resource.nvidia.com/persistent-agent-controller-namespace-binding" | default "" -}}
+  {{- $existingKubeletNamespaceRole := index $annotations "resource.nvidia.com/persistent-agent-kubelet-namespace-role" | default "" -}}
+  {{- $existingKubeletNamespaceBinding := index $annotations "resource.nvidia.com/persistent-agent-kubelet-namespace-binding" | default "" -}}
+  {{- $existingLegacyControllerRole := index $annotations "resource.nvidia.com/persistent-agent-legacy-controller-role" | default "" -}}
+  {{- $existingLegacyKubeletRole := index $annotations "resource.nvidia.com/persistent-agent-legacy-kubelet-role" | default "" -}}
+  {{- $existingLegacyControllerBinding := index $annotations "resource.nvidia.com/persistent-agent-legacy-controller-binding" | default "" -}}
+  {{- $existingLegacyKubeletBinding := index $annotations "resource.nvidia.com/persistent-agent-legacy-kubelet-binding" | default "" -}}
+  {{- $existingLegacyControllerNamespaceRole := index $annotations "resource.nvidia.com/persistent-agent-legacy-controller-namespace-role" | default "" -}}
+  {{- $existingLegacyControllerNamespaceBinding := index $annotations "resource.nvidia.com/persistent-agent-legacy-controller-namespace-binding" | default "" -}}
+  {{- $existingLegacyKubeletNamespaceRole := index $annotations "resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-role" | default "" -}}
+  {{- $existingLegacyKubeletNamespaceBinding := index $annotations "resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-binding" | default "" -}}
+  {{- $expectedID := include "dra-driver-nvidia-gpu.persistentAgentInstallationID" . -}}
+  {{- $expectedNamespace := include "dra-driver-nvidia-gpu.namespace" . | trim -}}
+  {{- $expectedController := include "dra-driver-nvidia-gpu.controllerServiceAccountUsername" . -}}
+  {{- $expectedKubelet := include "dra-driver-nvidia-gpu.kubeletPluginServiceAccountUsername" . -}}
+  {{- $expectedControllerRole := include "dra-driver-nvidia-gpu.persistentAgentControllerRoleName" . -}}
+  {{- $expectedKubeletRole := include "dra-driver-nvidia-gpu.persistentAgentKubeletRoleName" . -}}
+  {{- $expectedControllerBinding := include "dra-driver-nvidia-gpu.persistentAgentControllerBindingName" . -}}
+  {{- $expectedKubeletBinding := include "dra-driver-nvidia-gpu.persistentAgentKubeletBindingName" . -}}
+  {{- $expectedControllerWorkload := include "dra-driver-nvidia-gpu.persistentAgentControllerWorkloadName" . -}}
+  {{- $expectedKubeletWorkload := include "dra-driver-nvidia-gpu.persistentAgentKubeletWorkloadName" . -}}
+  {{- $expectedControllerNamespaceRole := include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceRoleName" . -}}
+  {{- $expectedControllerNamespaceBinding := include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceBindingName" . -}}
+  {{- $expectedKubeletNamespaceRole := include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceRoleName" . -}}
+  {{- $expectedKubeletNamespaceBinding := include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceBindingName" . -}}
+  {{- $expectedLegacyControllerRole := include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerRoleName" . -}}
+  {{- $expectedLegacyKubeletRole := include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletRoleName" . -}}
+  {{- $expectedLegacyControllerBinding := include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerBindingName" . -}}
+  {{- $expectedLegacyKubeletBinding := include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletBindingName" . -}}
+  {{- $expectedLegacyControllerNamespaceRole := include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceRoleName" . -}}
+  {{- $expectedLegacyControllerNamespaceBinding := include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceBindingName" . -}}
+  {{- $expectedLegacyKubeletNamespaceRole := include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceRoleName" . -}}
+  {{- $expectedLegacyKubeletNamespaceBinding := include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceBindingName" . -}}
+  {{- if or (ne $existingID $expectedID) (ne $existingNamespace $expectedNamespace) (ne $existingController $expectedController) (ne $existingKubelet $expectedKubelet) (ne $existingControllerRole $expectedControllerRole) (ne $existingKubeletRole $expectedKubeletRole) (ne $existingControllerBinding $expectedControllerBinding) (ne $existingKubeletBinding $expectedKubeletBinding) (ne $existingControllerWorkload $expectedControllerWorkload) (ne $existingKubeletWorkload $expectedKubeletWorkload) (ne $existingControllerNamespaceRole $expectedControllerNamespaceRole) (ne $existingControllerNamespaceBinding $expectedControllerNamespaceBinding) (ne $existingKubeletNamespaceRole $expectedKubeletNamespaceRole) (ne $existingKubeletNamespaceBinding $expectedKubeletNamespaceBinding) (ne $existingLegacyControllerRole $expectedLegacyControllerRole) (ne $existingLegacyKubeletRole $expectedLegacyKubeletRole) (ne $existingLegacyControllerBinding $expectedLegacyControllerBinding) (ne $existingLegacyKubeletBinding $expectedLegacyKubeletBinding) (ne $existingLegacyControllerNamespaceRole $expectedLegacyControllerNamespaceRole) (ne $existingLegacyControllerNamespaceBinding $expectedLegacyControllerNamespaceBinding) (ne $existingLegacyKubeletNamespaceRole $expectedLegacyKubeletNamespaceRole) (ne $existingLegacyKubeletNamespaceBinding $expectedLegacyKubeletNamespaceBinding) -}}
+    {{- fail (printf "persistent-agent CDC alpha supports one Helm installation in one immutable control namespace: cluster installation %q is owned by %q in namespace %q; release %q in namespace %q is rejected" $guardName $existingID $existingNamespace $expectedID $expectedNamespace) -}}
+  {{- end -}}
+{{- end -}}
+
 {{- if .Values.namespace }}
 {{- $error := "" }}
 {{- $error = printf "%s\nValue 'namespace' set to %s" $error .Values.namespace }}

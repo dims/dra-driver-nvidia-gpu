@@ -15,6 +15,7 @@
 {{- if or .Values.resources.computeDomains.enabled .Values.resources.gpus.enabled }}
 {{- if .Values.resources.computeDomains.enabled }}
 {{- include "dra-driver-nvidia-gpu.validateIMEXConfig" . }}
+{{- include "dra-driver-nvidia-gpu.validatePersistentComputeDomainAgents" . }}
 {{- end }}
 ---
 apiVersion: apps/v1
@@ -22,8 +23,15 @@ kind: DaemonSet
 metadata:
   name: {{ include "dra-driver-nvidia-gpu.name" . }}-kubelet-plugin
   namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  {{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+  annotations:
+    resource.nvidia.com/persistent-agent-installation: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationID" . | quote }}
+  {{- end }}
   labels:
     {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
+    {{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+    resource.nvidia.com/persistent-agent-workload: kubelet
+    {{- end }}
 spec:
   selector:
     matchLabels:

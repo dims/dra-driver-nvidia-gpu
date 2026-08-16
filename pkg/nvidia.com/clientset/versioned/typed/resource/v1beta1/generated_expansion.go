@@ -21,3 +21,9 @@ package v1beta1
 type ComputeDomainExpansion interface{}
 
 type ComputeDomainCliqueExpansion interface{}
+
+type ComputeDomainCliqueReservationExpansion interface{}
+
+type ComputeDomainCliqueRetirementEvidenceExpansion interface{}
+
+type ComputeDomainCliqueSnapshotExpansion interface{}

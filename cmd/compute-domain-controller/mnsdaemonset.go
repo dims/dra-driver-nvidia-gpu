@@ -85,6 +85,12 @@ func (m *MultiNamespaceDaemonSetManager) Create(ctx context.Context, cd *nvapi.C
 			return nil, fmt.Errorf("failed to get DaemonSet in namespace %s: %w", ns, err)
 		}
 		if ds != nil {
+			if _, err := manager.resourceClaimTemplateManager.Create(ctx, cd); err != nil {
+				return nil, fmt.Errorf("validate existing daemon ResourceClaimTemplate in namespace %s: %w", ns, err)
+			}
+			if err := validateExistingDaemonSet(ds, cd, manager.config); err != nil {
+				return nil, err
+			}
 			return ds, nil
 		}
 	}

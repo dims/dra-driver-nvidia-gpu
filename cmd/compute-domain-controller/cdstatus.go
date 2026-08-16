@@ -195,6 +195,12 @@ func (m *ComputeDomainStatusManager) sync(ctx context.Context) {
 	// Sync each CD in parallel
 	var wg sync.WaitGroup
 	for _, cd := range cds {
+		protocol, protocolErr := computeDomainCliqueProtocol(cd)
+		if protocolErr != nil || persistentAgentProtocol(protocol) {
+			// Persistent-agent identity and readiness come from the snapshot and Pod
+			// condition. Do not overwrite it with legacy CDC aggregation.
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -287,7 +293,7 @@ func (m *ComputeDomainStatusManager) cleanupClique(ctx context.Context, clique *
 	// Build set of node names that have running daemon pods
 	runningNodes := make(map[string]struct{})
 	for _, pod := range pods {
-		if pod.Spec.NodeName != "" {
+		if pod.Labels[computeDomainLabelKey] == clique.Labels[computeDomainLabelKey] && pod.Spec.NodeName != "" {
 			runningNodes[pod.Spec.NodeName] = struct{}{}
 		}
 	}

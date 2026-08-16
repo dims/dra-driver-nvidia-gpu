@@ -116,6 +116,11 @@ type ComputeDomainStatus struct {
 	// +listType=map
 	// +listMapKey=name
 	Nodes []*ComputeDomainNode `json:"nodes,omitempty"`
+	// Conditions expose lifecycle gates that are not represented by aggregate
+	// daemon readiness, including evidence-bearing persistent-agent retirement.
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // ComputeDomainNode provides information about each node added to a ComputeDomain.

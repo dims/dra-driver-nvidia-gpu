@@ -24,6 +24,36 @@ metadata:
   name: compute-domain-daemon-service-account
   namespace: {{ $namespace }}
 {{- end }}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: compute-domain-daemon-reader-service-account
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentDaemonReaderRoleName" . }}
+rules:
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquereservations"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentDaemonReaderBindingName" . }}
+subjects:
+- kind: ServiceAccount
+  name: compute-domain-daemon-reader-service-account
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentDaemonReaderRoleName" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -39,6 +69,38 @@ roleRef:
   kind: ClusterRole
   name: compute-domain-daemon-role
   apiGroup: rbac.authorization.k8s.io
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: compute-domain-daemon-reader-role
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+rules:
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquesnapshots"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliqueretirementevidences"]
+  verbs: ["get", "create"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: compute-domain-daemon-reader-role-binding
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+subjects:
+- kind: ServiceAccount
+  name: compute-domain-daemon-reader-service-account
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+roleRef:
+  kind: Role
+  name: compute-domain-daemon-reader-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
 {{- if .Capabilities.APIVersions.Has "security.openshift.io/v1/SecurityContextConstraints" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -50,6 +112,11 @@ subjects:
 - kind: ServiceAccount
   name: compute-domain-daemon-service-account
   namespace: {{ $namespace }}
+{{- end }}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+- kind: ServiceAccount
+  name: compute-domain-daemon-reader-service-account
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
 {{- end }}
 roleRef:
   kind: ClusterRole

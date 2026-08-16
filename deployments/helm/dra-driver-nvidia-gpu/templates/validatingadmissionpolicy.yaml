@@ -1,9 +1,328 @@
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
-  name: resourceslices-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
 spec:
   failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["rbac.authorization.k8s.io"]
+      apiVersions: ["v1"]
+      operations: ["UPDATE", "DELETE"]
+      resources: ["clusterroles"]
+      resourceNames: [{{ include "dra-driver-nvidia-gpu.persistentAgentInstallationName" . | quote }}]
+  variables:
+  - name: ownerKeys
+    expression: >-
+      ['resource.nvidia.com/persistent-agent-installation',
+       'resource.nvidia.com/persistent-agent-control-namespace',
+       'resource.nvidia.com/persistent-agent-controller-subject',
+       'resource.nvidia.com/persistent-agent-kubelet-subject',
+       'resource.nvidia.com/persistent-agent-controller-role',
+       'resource.nvidia.com/persistent-agent-kubelet-role',
+       'resource.nvidia.com/persistent-agent-controller-binding',
+       'resource.nvidia.com/persistent-agent-kubelet-binding',
+       'resource.nvidia.com/persistent-agent-legacy-daemon-role',
+       'resource.nvidia.com/persistent-agent-legacy-daemon-binding',
+       'resource.nvidia.com/persistent-agent-controller-workload',
+       'resource.nvidia.com/persistent-agent-kubelet-workload',
+       'resource.nvidia.com/persistent-agent-controller-namespace-role',
+       'resource.nvidia.com/persistent-agent-controller-namespace-binding',
+       'resource.nvidia.com/persistent-agent-kubelet-namespace-role',
+       'resource.nvidia.com/persistent-agent-kubelet-namespace-binding',
+       'resource.nvidia.com/persistent-agent-legacy-controller-role',
+       'resource.nvidia.com/persistent-agent-legacy-kubelet-role',
+       'resource.nvidia.com/persistent-agent-legacy-controller-binding',
+       'resource.nvidia.com/persistent-agent-legacy-kubelet-binding',
+       'resource.nvidia.com/persistent-agent-legacy-controller-namespace-role',
+       'resource.nvidia.com/persistent-agent-legacy-controller-namespace-binding',
+       'resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-role',
+       'resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-binding']
+  validations:
+  - expression: >-
+      request.operation != 'UPDATE' ||
+      (has(oldObject.metadata.annotations) && has(object.metadata.annotations) &&
+       variables.ownerKeys.all(k,
+         k in oldObject.metadata.annotations && k in object.metadata.annotations &&
+         oldObject.metadata.annotations[k] == object.metadata.annotations[k]))
+    message: persistent-agent CDC installation, control namespace, and ServiceAccount identities are immutable; a second release or control-namespace migration is unsupported
+  - expression: >-
+      request.operation != 'DELETE' ||
+      (has(oldObject.metadata.annotations) &&
+       oldObject.metadata.annotations[?'resource.nvidia.com/unsafe-persistent-agent-decommission'].orValue('') == 'approved')
+    message: persistent-agent CDC installation identity may not be deleted; complete the explicit fenced decommission procedure first
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-rbac-binding-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["rbac.authorization.k8s.io"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["clusterrolebindings"]
+  variables:
+  - name: controllerRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-role']
+  - name: kubeletRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-role']
+  - name: controllerBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-binding']
+  - name: kubeletBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-binding']
+  - name: legacyControllerRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-controller-role']
+  - name: legacyKubeletRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-kubelet-role']
+  - name: legacyControllerBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-controller-binding']
+  - name: legacyKubeletBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-kubelet-binding']
+  - name: daemonRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-daemon-role']
+  - name: daemonBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-daemon-binding']
+  - name: controllerSubject
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject']
+  - name: kubeletSubject
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-subject']
+  - name: controllerWorkload
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-workload']
+  - name: kubeletWorkload
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-workload']
+  - name: subjectUsernames
+    expression: object.subjects.filter(s, s.kind == 'ServiceAccount').map(s, 'system:serviceaccount:'+s.namespace+':'+s.name)
+  validations:
+  - expression: >-
+      (object.roleRef.name != variables.controllerRole && object.roleRef.name != variables.legacyControllerRole) ||
+      (((object.metadata.name == variables.controllerBinding && object.roleRef.name == variables.controllerRole) ||
+        (object.metadata.name == variables.legacyControllerBinding && object.roleRef.name == variables.legacyControllerRole)) &&
+       size(object.subjects) == 1 && variables.subjectUsernames == [variables.controllerSubject])
+    message: the controller ClusterRole may be bound only to the immutable installation controller ServiceAccount
+  - expression: >-
+      (object.roleRef.name != variables.kubeletRole && object.roleRef.name != variables.legacyKubeletRole) ||
+      (((object.metadata.name == variables.kubeletBinding && object.roleRef.name == variables.kubeletRole) ||
+        (object.metadata.name == variables.legacyKubeletBinding && object.roleRef.name == variables.legacyKubeletRole)) &&
+       size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject])
+    message: the kubelet-plugin ClusterRole may be bound only to the immutable installation kubelet ServiceAccount
+  - expression: >-
+      object.roleRef.name != 'dra-driver-nvidia-gpu-clusterrole-daemon-reader' ||
+      (object.metadata.name == 'dra-driver-nvidia-gpu-clusterrole-binding-daemon-reader' && size(object.subjects) == 1 &&
+       variables.subjectUsernames == ['system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/persistent-agent-control-namespace']+':compute-domain-daemon-reader-service-account'])
+    message: the daemon-reader ClusterRole may be bound only to the immutable installation reader ServiceAccount
+  - expression: >-
+      object.roleRef.name != variables.daemonRole ||
+      (object.metadata.name == variables.daemonBinding && object.subjects.all(s,
+        s.kind == 'ServiceAccount' && s.name == 'compute-domain-daemon-service-account' &&
+        params.rules.exists(r, r.apiGroups == ['persistent-agent.resource.nvidia.com'] &&
+          r.resources == ['legacydaemonnamespaces'] && has(r.resourceNames) && s.namespace in r.resourceNames)))
+    message: the legacy daemon ClusterRole may be bound only in namespaces owned by the immutable installation
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-namespaced-rbac-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["rbac.authorization.k8s.io"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["roles", "rolebindings"]
+      resourceNames:
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceRoleName" . | quote }}
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceBindingName" . | quote }}
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceRoleName" . | quote }}
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceBindingName" . | quote }}
+      {{- if ne (include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceRoleName" .) (include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceRoleName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceRoleName" . | quote }}
+      {{- end }}
+      {{- if ne (include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceBindingName" .) (include "dra-driver-nvidia-gpu.persistentAgentControllerNamespaceBindingName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyControllerNamespaceBindingName" . | quote }}
+      {{- end }}
+      {{- if ne (include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceRoleName" .) (include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceRoleName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceRoleName" . | quote }}
+      {{- end }}
+      {{- if ne (include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceBindingName" .) (include "dra-driver-nvidia-gpu.persistentAgentKubeletNamespaceBindingName" .) }}
+      - {{ include "dra-driver-nvidia-gpu.persistentAgentLegacyKubeletNamespaceBindingName" . | quote }}
+      {{- end }}
+  variables:
+  - name: installation
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-installation']
+  - name: controllerRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-namespace-role']
+  - name: controllerBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-namespace-binding']
+  - name: kubeletRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-namespace-role']
+  - name: kubeletBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-namespace-binding']
+  - name: legacyControllerRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-controller-namespace-role']
+  - name: legacyControllerBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-controller-namespace-binding']
+  - name: legacyKubeletRole
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-role']
+  - name: legacyKubeletBinding
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-legacy-kubelet-namespace-binding']
+  - name: controlNamespace
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-control-namespace']
+  - name: controllerSubject
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject']
+  - name: kubeletSubject
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-subject']
+  - name: actualInstallation
+    expression: object.metadata.?annotations.orValue({})[?'resource.nvidia.com/persistent-agent-installation'].orValue('')
+  - name: subjectUsernames
+    expression: >-
+      object.kind == 'RoleBinding' ? object.subjects.filter(s, s.kind == 'ServiceAccount').map(s, 'system:serviceaccount:'+s.namespace+':'+s.name) : []
+  validations:
+  - expression: >-
+      variables.actualInstallation == variables.installation ||
+      (object.metadata.namespace == variables.controlNamespace &&
+       object.metadata.name in [variables.legacyControllerRole, variables.legacyControllerBinding,
+        variables.legacyKubeletRole, variables.legacyKubeletBinding])
+    message: protected persistent-agent CDC namespaced RBAC belongs to the immutable installation
+  - expression: >-
+      object.kind != 'RoleBinding' ||
+      (object.metadata.name == variables.controllerBinding && object.roleRef.name == variables.controllerRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.controllerSubject]) ||
+      (object.metadata.name == variables.kubeletBinding && object.roleRef.name == variables.kubeletRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject]) ||
+      (object.metadata.namespace == variables.controlNamespace && object.metadata.name == variables.legacyControllerBinding && object.roleRef.name == variables.legacyControllerRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.controllerSubject]) ||
+      (object.metadata.namespace == variables.controlNamespace && object.metadata.name == variables.legacyKubeletBinding && object.roleRef.name == variables.legacyKubeletRole && size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject])
+    message: protected persistent-agent CDC namespaced RoleBindings may bind only the immutable installation subjects
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-workload-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["deployments", "daemonsets"]
+  variables:
+  - name: controlNamespace
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-control-namespace']
+  - name: installation
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-installation']
+  - name: controllerSubject
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject']
+  - name: kubeletSubject
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-subject']
+  - name: controllerWorkload
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-workload']
+  - name: kubeletWorkload
+    expression: params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-workload']
+  - name: expectedSubject
+    expression: >-
+      object.kind == 'Deployment' ? variables.controllerSubject : variables.kubeletSubject
+  - name: actualSubject
+    expression: >-
+      'system:serviceaccount:'+object.metadata.namespace+':'+object.spec.template.spec.?serviceAccountName.orValue('default')
+  - name: installationAnnotation
+    expression: object.metadata.?annotations.orValue({})[?'resource.nvidia.com/persistent-agent-installation'].orValue('')
+  validations:
+  - expression: >-
+      !has(object.metadata.labels) || !('resource.nvidia.com/persistent-agent-workload' in object.metadata.labels) ||
+      (object.metadata.namespace == variables.controlNamespace && variables.installationAnnotation == variables.installation &&
+       variables.actualSubject == variables.expectedSubject)
+    message: persistent-agent CDC privileged workloads must use the immutable installation namespace and ServiceAccounts
+  - expression: >-
+      variables.actualSubject != variables.controllerSubject && variables.actualSubject != variables.kubeletSubject ||
+      (object.metadata.namespace == variables.controlNamespace && variables.installationAnnotation == variables.installation &&
+       has(object.metadata.labels) && 'resource.nvidia.com/persistent-agent-workload' in object.metadata.labels) ||
+      (object.metadata.namespace == variables.controlNamespace &&
+       ((object.kind == 'Deployment' && object.metadata.name == variables.controllerWorkload && variables.actualSubject == variables.controllerSubject) ||
+        (object.kind == 'DaemonSet' && object.metadata.name == variables.kubeletWorkload && variables.actualSubject == variables.kubeletSubject)))
+    message: immutable installation ServiceAccounts may be used only by installation-owned controller and kubelet workloads
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistentagent-lifecycle-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["DELETE"]
+      resources: ["deployments"]
+      resourceNames: [{{ include "dra-driver-nvidia-gpu.persistentAgentControllerWorkloadName" . | quote }}]
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["DELETE"]
+      resources: ["daemonsets"]
+      resourceNames: [{{ include "dra-driver-nvidia-gpu.persistentAgentKubeletWorkloadName" . | quote }}]
+    - apiGroups: ["apiextensions.k8s.io"]
+      apiVersions: ["v1"]
+      operations: ["DELETE"]
+      resources: ["customresourcedefinitions"]
+      resourceNames:
+      - computedomains.resource.nvidia.com
+      - computedomaincliques.resource.nvidia.com
+      - computedomaincliquesnapshots.resource.nvidia.com
+      - computedomaincliquereservations.resource.nvidia.com
+      - computedomaincliqueretirementevidences.resource.nvidia.com
+  validations:
+  - expression: >-
+      params != null &&
+      params.metadata.?annotations.orValue({})[?'resource.nvidia.com/unsafe-persistent-agent-decommission'].orValue('') == 'approved'
+    message: persistent-agent CDC workloads and APIs may be deleted only after the reviewed decommission is explicitly approved on the installation marker
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "resourceslices-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
   matchConstraints:
     resourceRules:
     - apiGroups:   ["resource.k8s.io"]
@@ -13,7 +332,7 @@ spec:
   matchConditions:
   - name: isRestrictedUser
     expression: >-
-      request.userInfo.username == "system:serviceaccount:{{ include "dra-driver-nvidia-gpu.namespace" . }}:{{ include "dra-driver-nvidia-gpu.serviceAccountName" . }}"
+      request.userInfo.username == params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-subject']
   variables:
   - name: userNodeName
     expression: >-
@@ -34,3 +353,429 @@ spec:
   - expression: variables.userNodeName == variables.objectNodeName || variables.allNodesValue == true || variables.nodeSelectorValue != null
     messageExpression: >-
       "this user running on node '"+variables.userNodeName+"' may not modify cluster or node resourceslices"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-reserved-metadata-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["computedomains"]
+  validations:
+  - expression: params != null
+    message: persistent-agent CDC installation identity is missing
+  - expression: >-
+      request.operation != 'CREATE' ||
+      !has(object.metadata.finalizers) ||
+      !object.metadata.finalizers.exists(f, f == 'resource.nvidia.com/computeDomain')
+    message: the resource.nvidia.com/computeDomain finalizer is persistent-agent and may not be supplied at creation
+  - expression: >-
+      request.operation != 'UPDATE' ||
+      ((has(oldObject.metadata.finalizers) && oldObject.metadata.finalizers.exists(f, f == 'resource.nvidia.com/computeDomain')) ==
+       (has(object.metadata.finalizers) && object.metadata.finalizers.exists(f, f == 'resource.nvidia.com/computeDomain'))) ||
+      request.userInfo.username ==
+      params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject']
+    message: only the compute-domain controller may add or remove its reserved finalizer
+  - expression: >-
+      request.operation != 'CREATE' ||
+      !has(object.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueProtocol' in object.metadata.annotations)
+    message: computeDomainCliqueProtocol is controller-written and may not be supplied at creation
+  - expression: >-
+      !has(object.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueProtocol' in object.metadata.annotations) ||
+      object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol'] in ['legacy-v1', 'persistent-agent-v1']
+    message: computeDomainCliqueProtocol must be legacy-v1 or persistent-agent-v1
+  - expression: >-
+      request.operation != 'UPDATE' ||
+      (has(oldObject.metadata.annotations) &&
+       'resource.nvidia.com/computeDomainCliqueProtocol' in oldObject.metadata.annotations &&
+       has(object.metadata.annotations) &&
+       object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol'] ==
+       oldObject.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol']) ||
+      (request.userInfo.username == params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject'] &&
+       (!has(oldObject.metadata.annotations) ||
+        !('resource.nvidia.com/computeDomainCliqueProtocol' in oldObject.metadata.annotations)) &&
+       has(object.metadata.annotations) &&
+       object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol'] in ['legacy-v1', 'persistent-agent-v1'])
+    message: only the controller may persist the daemon provider, and it is immutable afterward
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-node-topology-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["nodes"]
+  matchConditions:
+  - name: isComputeDomainKubeletPlugin
+    expression: >-
+      params != null && request.userInfo.username ==
+      params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-subject']
+  variables:
+  - name: userNodeName
+    expression: >-
+      request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+  validations:
+  - expression: variables.userNodeName != '' && object.metadata.name == variables.userNodeName
+    message: the kubelet plugin may update only the Node bound into its service-account token
+  - expression: object.spec == oldObject.spec
+    message: the kubelet plugin may not change Node spec
+  - expression: >-
+      object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+      object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([])
+    message: the kubelet plugin may not change Node finalizers or owner references
+  - expression: >-
+      (!has(object.metadata.labels) ||
+       object.metadata.labels.all(k, v,
+         k in ['nvidia.com/gpu.clique', 'resource.nvidia.com/computeDomain'] ||
+         (has(oldObject.metadata.labels) && k in oldObject.metadata.labels && oldObject.metadata.labels[k] == v))) &&
+      (!has(oldObject.metadata.labels) ||
+       oldObject.metadata.labels.all(k, v,
+         k in ['nvidia.com/gpu.clique', 'resource.nvidia.com/computeDomain'] ||
+         (has(object.metadata.labels) && k in object.metadata.labels && object.metadata.labels[k] == v)))
+    message: the kubelet plugin may change only GPU clique topology and the legacy ComputeDomain route; persistent-agent-v1 membership requires controller attestation
+  - expression: >-
+      object.metadata.?labels.orValue({})[?'resource.nvidia.com/persistentAgentComputeDomain'].orValue('') == '' ||
+      object.metadata.?labels.orValue({})[?'resource.nvidia.com/computeDomain'].orValue('') ==
+      oldObject.metadata.?labels.orValue({})[?'resource.nvidia.com/computeDomain'].orValue('')
+    message: the legacy kubelet may not enter a Node isolated for a persistent-agent ComputeDomain
+  - expression: >-
+      (!has(object.metadata.annotations) ||
+       object.metadata.annotations.all(k, v,
+         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
+         (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == v))) &&
+      (!has(oldObject.metadata.annotations) ||
+       oldObject.metadata.annotations.all(k, v,
+         k in ['resource.nvidia.com/computeDomainCliqueStartupID', 'resource.nvidia.com/computeDomainCliqueProtocolCapability', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
+         (has(object.metadata.annotations) && k in object.metadata.annotations && object.metadata.annotations[k] == v)))
+    message: the kubelet plugin may change only its startup-topology, persistent-agent-v1 capability, and consumed retirement-fence annotations
+  - expression: >-
+      !has(oldObject.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueStartupID' in oldObject.metadata.annotations) ||
+      (has(object.metadata.annotations) &&
+       'resource.nvidia.com/computeDomainCliqueStartupID' in object.metadata.annotations &&
+       object.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID'] ==
+       oldObject.metadata.annotations['resource.nvidia.com/computeDomainCliqueStartupID']) ||
+      (oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') != '' &&
+       object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueStartupID'].orValue('') == '' &&
+       object.metadata.?labels.orValue({})[?'nvidia.com/gpu.clique'].orValue('') == '' &&
+       object.metadata.?labels.orValue({})[?'resource.nvidia.com/computeDomain'].orValue('') == '' &&
+       object.metadata.?labels.orValue({})[?'resource.nvidia.com/persistentAgentComputeDomain'].orValue('') == '' &&
+       object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainAttestation'].orValue('') == '')
+    message: the startup GPU clique identity is immutable until the controller records a completed runtime fence
+  - expression: >-
+      oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') ==
+        object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') ||
+      (oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') != '' &&
+       object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueRetirementFenced'].orValue('') == '')
+    message: the kubelet plugin may remove but never add or change the controller's retirement fence authorization
+  - expression: >-
+      !has(object.metadata.annotations) ||
+      !('resource.nvidia.com/computeDomainCliqueProtocolCapability' in object.metadata.annotations) ||
+      object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocolCapability'] == 'persistent-agent-v1'
+    message: the kubelet plugin capability marker has an unsupported value
+  - expression: >-
+      object.metadata.?labels.orValue({})[?'nvidia.com/gpu.clique'].orValue('') ==
+      oldObject.metadata.?labels.orValue({})[?'nvidia.com/gpu.clique'].orValue('') &&
+      object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueStartupID'].orValue('') ==
+      oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueStartupID'].orValue('') ||
+      object.metadata.?labels.orValue({})[?'nvidia.com/gpu.clique'].orValue('') == '' ||
+      object.metadata.?labels.orValue({})[?'nvidia.com/gpu.clique'].orValue('') ==
+      object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueStartupID'].orValue('')
+    message: the published GPU clique label must match the immutable startup identity
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-node-attestation-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["nodes"]
+  variables:
+  - name: controller
+    expression: params != null && request.userInfo.username == params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject']
+  - name: legacyKubelet
+    expression: >-
+      params != null && request.userInfo.username == params.metadata.annotations['resource.nvidia.com/persistent-agent-kubelet-subject'] &&
+      request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('') == object.metadata.name
+  - name: oldDomain
+    expression: oldObject.metadata.?labels.orValue({})[?'resource.nvidia.com/computeDomain'].orValue('')
+  - name: newDomain
+    expression: object.metadata.?labels.orValue({})[?'resource.nvidia.com/computeDomain'].orValue('')
+  - name: oldAttestation
+    expression: oldObject.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainAttestation'].orValue('')
+  - name: newAttestation
+    expression: object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainAttestation'].orValue('')
+  - name: oldIsolation
+    expression: oldObject.metadata.?labels.orValue({})[?'resource.nvidia.com/persistentAgentComputeDomain'].orValue('')
+  - name: newIsolation
+    expression: object.metadata.?labels.orValue({})[?'resource.nvidia.com/persistentAgentComputeDomain'].orValue('')
+  validations:
+  - expression: >-
+      (variables.oldDomain == variables.newDomain && variables.oldAttestation == variables.newAttestation) ||
+      variables.controller ||
+      (variables.legacyKubelet && variables.oldAttestation == variables.newAttestation && variables.newAttestation == '')
+    message: only the compute-domain controller may change claim attestation; the bound kubelet may change an unattested legacy route
+  - expression: >-
+      variables.oldAttestation == '' || variables.oldIsolation == variables.newIsolation ||
+      (variables.controller && variables.newDomain == '' && variables.newAttestation == '' && variables.newIsolation == '')
+    message: whole-clique isolation is immutable while a persistent-agent Node attestation is active; clear the attestation through the controller before draining isolation
+  - expression: >-
+      !variables.controller ||
+      (object.spec == oldObject.spec && object.status == oldObject.status &&
+       object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+       object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+       (!has(object.metadata.labels) || object.metadata.labels.all(k, v,
+         k in ['resource.nvidia.com/computeDomain', 'resource.nvidia.com/persistentAgentComputeDomain'] ||
+         (has(oldObject.metadata.labels) && k in oldObject.metadata.labels && oldObject.metadata.labels[k] == v))) &&
+       (!has(oldObject.metadata.labels) || oldObject.metadata.labels.all(k, v,
+         k in ['resource.nvidia.com/computeDomain', 'resource.nvidia.com/persistentAgentComputeDomain'] ||
+         (has(object.metadata.labels) && k in object.metadata.labels && object.metadata.labels[k] == v))) &&
+       (!has(object.metadata.annotations) || object.metadata.annotations.all(k, v,
+         k in ['resource.nvidia.com/computeDomainAttestation', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
+         (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == v))) &&
+       (!has(oldObject.metadata.annotations) || oldObject.metadata.annotations.all(k, v,
+         k in ['resource.nvidia.com/computeDomainAttestation', 'resource.nvidia.com/computeDomainCliqueRetirementFenced'] ||
+         (has(object.metadata.annotations) && k in object.metadata.annotations && object.metadata.annotations[k] == v))))
+    message: the compute-domain controller may change only ComputeDomain routing, attestation, and retirement-fence Node metadata
+  - expression: >-
+      variables.oldIsolation == variables.newIsolation ||
+      (variables.oldDomain == '' && variables.newDomain == '' &&
+       variables.oldAttestation == '' && variables.newAttestation == '') ||
+      (variables.controller && variables.newDomain == '' &&
+       variables.newAttestation == '' && variables.newIsolation == '')
+    message: whole-clique isolation may change only while the Node has no ComputeDomain route or attestation
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-reservation-writer-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["computedomaincliquereservations", "computedomaincliquereservations/status"]
+  validations:
+  - expression: >-
+      params != null && request.userInfo.username ==
+      params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject'] &&
+      (request.operation != 'DELETE' || oldObject.?status.phase.orValue('') == 'Released')
+    message: only the compute-domain controller may write reservations, and DELETE requires a durable Released status
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-snapshot-writer-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["computedomaincliquesnapshots", "computedomaincliquesnapshots/status"]
+  validations:
+  - expression: >-
+      params != null && request.userInfo.username ==
+      params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject']
+    message: only the compute-domain controller may write persistent-agent clique snapshots
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "persistent-agent-applied-state-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["pods"]
+  matchConditions:
+  - name: isPersistentAgent
+    expression: >-
+      params != null && request.userInfo.username ==
+      'system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/persistent-agent-control-namespace']+':compute-domain-daemon-reader-service-account'
+  variables:
+  - name: podUIDs
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/pod-uid'].orValue([])
+  - name: nodeNames
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/node-name'].orValue([])
+  validations:
+  - expression: >-
+      object.metadata.namespace == params.metadata.annotations['resource.nvidia.com/persistent-agent-control-namespace'] &&
+      variables.podUIDs.exists(uid, uid == string(object.metadata.uid)) &&
+      variables.nodeNames.exists(name, name == object.spec.nodeName) &&
+      object.metadata.?labels.orValue({})[?'resource.nvidia.com/persistentComputeDomainAgent'].orValue('') == 'true' &&
+      object.metadata.?ownerReferences.orValue([]).exists(r,
+        r.?controller.orValue(false) && r.apiVersion == 'apps/v1' && r.kind == 'DaemonSet' &&
+        r.name == 'dra-driver-nvidia-gpu-persistent-agent' && string(r.uid) != '')
+    message: applied state may be written only by the bound persistent-agent Pod
+  - expression: >-
+      object.spec == oldObject.spec && object.status == oldObject.status &&
+      object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+      object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+      object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+      (!has(object.metadata.annotations) || object.metadata.annotations.all(k, v,
+        k == 'resource.nvidia.com/computeDomainCliqueSnapshotApplied' ||
+        (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == v))) &&
+      (!has(oldObject.metadata.annotations) || oldObject.metadata.annotations.all(k, v,
+        k == 'resource.nvidia.com/computeDomainCliqueSnapshotApplied' ||
+        (has(object.metadata.annotations) && k in object.metadata.annotations && object.metadata.annotations[k] == v)))
+    message: persistent agent may change only its applied-snapshot annotation
+  - expression: >-
+      object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueSnapshotApplied'].orValue('').size() <= 2048
+    message: persistent-agent applied state is bounded
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.persistentAgentPolicyName" "computedomain-retirement-evidence-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.persistentAgentAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["resource.nvidia.com"]
+      apiVersions: ["v1beta1"]
+      operations: ["CREATE", "UPDATE", "DELETE"]
+      resources: ["computedomaincliqueretirementevidences"]
+  variables:
+  - name: controller
+    expression: >-
+      params != null && request.userInfo.username ==
+      params.metadata.annotations['resource.nvidia.com/persistent-agent-controller-subject']
+  - name: reader
+    expression: >-
+      params != null && request.userInfo.username ==
+      'system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/persistent-agent-control-namespace']+':compute-domain-daemon-reader-service-account'
+  - name: podUID
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/pod-uid'][0].orValue('')
+  - name: nodeUID
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/node-uid'][0].orValue('')
+  validations:
+  - expression: request.operation != 'UPDATE'
+    message: retirement evidence is immutable and may not be updated
+  - expression: request.operation != 'DELETE' || variables.controller
+    message: only the compute-domain controller may delete durable retirement evidence
+  - expression: request.operation != 'CREATE' || variables.reader
+    message: only the compute-domain daemon reader may create retirement evidence
+  - expression: >-
+      request.operation != 'CREATE' ||
+      (object.metadata.namespace == params.metadata.annotations['resource.nvidia.com/persistent-agent-control-namespace'] &&
+       variables.podUID != '' && variables.nodeUID != '' &&
+       string(object.spec.witnessPodUID) == variables.podUID &&
+       string(object.spec.nodeUID) == variables.nodeUID)
+    message: retirement evidence must match the Pod and Node UIDs bound into the daemon service-account token
+  - expression: >-
+      request.operation != 'CREATE' ||
+      (object.metadata.name == 'retirement-'+string(object.spec.snapshotUID)+'-'+string(object.spec.index) &&
+       object.metadata.?labels.orValue({}).size() == 1 &&
+       object.metadata.labels['resource.nvidia.com/computeDomain'] != '')
+    message: retirement evidence name and labels must match its immutable snapshot and ComputeDomain identity
+{{- else }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: resourceslices-policy-{{ include "dra-driver-nvidia-gpu.name" . }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["resource.k8s.io"]
+      apiVersions: ["v1", "v1beta1", "v1beta2"]
+      operations:  ["CREATE", "UPDATE", "DELETE"]
+      resources:   ["resourceslices"]
+  matchConditions:
+  - name: isRestrictedUser
+    expression: >-
+      request.userInfo.username == {{ include "dra-driver-nvidia-gpu.kubeletPluginServiceAccountUsername" . | quote }}
+  variables:
+  - name: userNodeName
+    expression: >-
+      request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+  - name: objectNodeName
+    expression: >-
+      (request.operation == "DELETE" ? oldObject : object).spec.?nodeName.orValue("")
+  - name: nodeSelectorValue
+    expression: >-
+      (request.operation == "DELETE" ? oldObject : object).spec.?nodeSelector.orValue(null)
+  - name: allNodesValue
+    expression: >-
+      (request.operation == "DELETE" ? oldObject : object).spec.?allNodes.orValue(false)
+  validations:
+  - expression: variables.userNodeName != ""
+    message: >-
+      no node association found for user, this user must run in a pod on a node and ServiceAccountTokenPodNodeInfo must be enabled
+  - expression: variables.userNodeName == variables.objectNodeName || variables.allNodesValue == true || variables.nodeSelectorValue != null
+    messageExpression: >-
+      "this user running on node '"+variables.userNodeName+"' may not modify cluster or node resourceslices"
+{{- end }}

@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -34,6 +35,7 @@ type ProcessManager struct {
 	handle      *exec.Cmd
 	cmd         []string
 	waitResChan chan error
+	stopTimeout time.Duration
 }
 
 func NewProcessManager(cmd []string) *ProcessManager {
@@ -41,6 +43,7 @@ func NewProcessManager(cmd []string) *ProcessManager {
 		handle:      nil,
 		cmd:         cmd,
 		waitResChan: make(chan error, 1),
+		stopTimeout: 30 * time.Second,
 	}
 	return m
 }
@@ -64,6 +67,23 @@ func (m *ProcessManager) EnsureStarted() (bool, error) {
 		return false, nil
 	}
 	return true, m.start()
+}
+
+// Stop terminates and reaps the managed child. The manager may be reused by a
+// later assignment after Stop returns.
+func (m *ProcessManager) Stop() error {
+	return m.stop()
+}
+
+// SetCommand changes the child command while the manager is idle.
+func (m *ProcessManager) SetCommand(cmd []string) error {
+	m.Lock()
+	defer m.Unlock()
+	if m.handle != nil {
+		return fmt.Errorf("pm: set command failed: child is running")
+	}
+	m.cmd = append(m.cmd[:0], cmd...)
+	return nil
 }
 
 // Signal() attempts to send the provided signal to the managed child process.
@@ -120,7 +140,10 @@ func (m *ProcessManager) start() error {
 // safe to call start() again). If the wait() system call that feeds the channel
 // returns an error: fatal.
 func (m *ProcessManager) wait() error {
-	werr := <-m.waitResChan
+	return m.finishWait(<-m.waitResChan)
+}
+
+func (m *ProcessManager) finishWait(werr error) error {
 	if werr == nil {
 		klog.Infof("Child exited with code 0")
 	} else {
@@ -142,19 +165,53 @@ func (m *ProcessManager) stop() error {
 	defer m.Unlock()
 
 	if m.handle == nil {
-		return fmt.Errorf("pm: stop failed: not started")
+		// Cancellation before the first desired snapshot, or after a retirement
+		// already reaped the child, is a successful stopped state.
+		return nil
+	}
+	if len(m.waitResChan) > 0 {
+		// The child exited between watchdog polls. It is not running, but its
+		// status still must be consumed before retirement can claim process exit.
+		if err := m.wait(); err != nil {
+			return fmt.Errorf("pm: stop: reap exited child: %w", err)
+		}
+		return nil
 	}
 
 	klog.Infof("Stop: send SIGTERM to pid %d", m.handle.Process.Pid)
 	err := m.handle.Process.Signal(syscall.SIGTERM)
 	if err != nil {
+		if errors.Is(err, os.ErrProcessDone) {
+			// The child exited after the buffered-result check above. Process
+			// absence alone is not retirement evidence; consume Wait's result so
+			// the supervisor has positive exit/reap evidence.
+			if waitErr := m.wait(); waitErr != nil {
+				return fmt.Errorf("pm: stop: reap child after SIGTERM race: %w", waitErr)
+			}
+			return nil
+		}
 		return fmt.Errorf("pm: stop: could not send SIGTERM to child: %w", err)
 	}
 
-	// Wait for process to gracefully shut down. TODO: apply timeout, send
-	// SIGKILL upon timeout, wait again. Update: it's reasonable to leave this
-	// to the k8s orchestration layer.
-	klog.Infof("Wait() for child")
+	// Retirement deliberately retains this Pod until positive process-exit
+	// evidence exists, so Kubernetes cannot provide its usual grace-period
+	// SIGKILL. Apply that bounded escalation in the trusted supervisor, then
+	// always reap before a receipt can be published.
+	klog.Infof("Wait() for child (grace period %s)", m.stopTimeout)
+	timer := time.NewTimer(m.stopTimeout)
+	defer timer.Stop()
+	select {
+	case waitErr := <-m.waitResChan:
+		if err := m.finishWait(waitErr); err != nil {
+			return fmt.Errorf("pm: stop: wait failed: %w", err)
+		}
+		return nil
+	case <-timer.C:
+		klog.Warningf("Child did not exit after %s: send SIGKILL to pid %d", m.stopTimeout, m.handle.Process.Pid)
+		if err := m.handle.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("pm: stop: could not SIGKILL child: %w", err)
+		}
+	}
 	if err := m.wait(); err != nil {
 		return fmt.Errorf("pm: stop: wait failed: %w", err)
 	}
@@ -167,6 +224,18 @@ func (m *ProcessManager) stop() error {
 // injected context is the intended way to gracefully stop the child (and to
 // also terminate the watchdog).
 func (m *ProcessManager) Watchdog(ctx context.Context) error {
+	return m.watchdog(ctx, true)
+}
+
+// WatchdogWithoutRestart fails the supervisor when a child exits unexpectedly.
+// The persistent agent uses this mode so the container restart path first
+// invalidates its durable receipt and applied-state annotation before the same
+// snapshot may start another child.
+func (m *ProcessManager) WatchdogWithoutRestart(ctx context.Context) error {
+	return m.watchdog(ctx, false)
+}
+
+func (m *ProcessManager) watchdog(ctx context.Context, restart bool) error {
 	// Maybe use SIGCHLD handler instead to make this ticker-less
 	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
@@ -189,6 +258,9 @@ func (m *ProcessManager) Watchdog(ctx context.Context) error {
 			// `m.wait()` is known to not block at this point.
 			if err := m.wait(); err != nil {
 				return fmt.Errorf("watchdog: process lost, wait failed, treat fatal: %w", err)
+			}
+			if !restart {
+				return fmt.Errorf("watchdog: managed child exited unexpectedly")
 			}
 
 			klog.Warningf("Watchdog: start process again")
