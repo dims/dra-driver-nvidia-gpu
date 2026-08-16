@@ -18,6 +18,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"slices"
 	"testing"
@@ -28,6 +29,8 @@ import (
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/cdclique"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
+	nvfake "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/clientset/versioned/fake"
 )
 
 func newTestSnapshotManager() *ComputeDomainCliqueSnapshotManager {
@@ -117,6 +120,82 @@ func TestSnapshotConsumerValidatesAndCouplesDesiredState(t *testing.T) {
 		t.Fatal("an already applied snapshot was delivered again")
 	default:
 	}
+}
+
+func TestPersistentAgentSnapshotUsesSameValidatedDesiredState(t *testing.T) {
+	snapshot := newTestSnapshot(t)
+	snapshot.Name = cdclique.SnapshotName(string(snapshot.Spec.ComputeDomainUID), snapshot.Spec.CliqueID)
+	snapshot.Spec.Protocol = nvapi.ComputeDomainCliqueProtocolPersistentAgentV1
+	snapshot.OwnerReferences = nil
+	snapshot.Labels = map[string]string{
+		computeDomainLabelKey:                             string(snapshot.Spec.ComputeDomainUID),
+		computeDomainCliqueLabelKey:                       snapshot.Spec.CliqueID,
+		"resource.nvidia.com/computeDomainCliqueProtocol": string(snapshot.Spec.Protocol),
+	}
+	reservation := &nvapi.ComputeDomainCliqueReservation{
+		ObjectMeta: metav1.ObjectMeta{Name: cdclique.ReservationName(snapshot.Spec.CliqueID)},
+		Spec: nvapi.ComputeDomainCliqueReservationSpec{
+			CliqueID: snapshot.Spec.CliqueID, ComputeDomainUID: snapshot.Spec.ComputeDomainUID,
+		},
+		Status: nvapi.ComputeDomainCliqueReservationStatus{
+			Phase: nvapi.ComputeDomainCliqueReservationPhaseActive, SnapshotUID: snapshot.UID,
+			ActivationGeneration: 1, ActivationHash: snapshot.Status.Hash,
+		},
+	}
+	m := newTestSnapshotManager()
+	m.config.protocol = nvapi.ComputeDomainCliqueProtocolPersistentAgentV1
+	m.config.computeDomainUUID = ""
+	m.config.clientsets = flags.ClientSets{Nvidia: nvfake.NewSimpleClientset(reservation)}
+	m.ctx = context.Background()
+
+	require.NoError(t, m.consume(snapshot))
+	desired := <-m.desiredStateChan
+	require.Equal(t, nvapi.ComputeDomainCliqueProtocolPersistentAgentV1, desired.Protocol)
+	require.Equal(t, snapshot.Spec.ComputeDomainUID, desired.ComputeDomainUID)
+	require.Equal(t, snapshot.Spec.CliqueID, desired.CliqueID)
+	require.Len(t, desired.Members, 2)
+	m.MarkApplied(desired)
+	retiring := snapshot.DeepCopy()
+	retiring.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseRetiring
+	require.NoError(t, m.consume(retiring))
+	retirement := <-m.desiredStateChan
+	require.NotNil(t, retirement.RetirementEvidence)
+	m.MarkRetired(retirement)
+	fenced := retiring.DeepCopy()
+	fenced.Status.Phase = nvapi.ComputeDomainCliqueSnapshotPhaseFenced
+	m.acceptFenced(fenced)
+	require.Empty(t, m.currentSnapshotUID, "verified fenced state must make the long-lived agent reusable")
+
+	conflicting := snapshot.DeepCopy()
+	conflicting.UID = types.UID("other-snapshot")
+	conflicting.Status.Generation++
+	require.ErrorContains(t, m.consume(conflicting), "does not authorize")
+}
+
+func TestPersistentAgentRequiresExactReleasedReservationWhenFencedEventWasMissed(t *testing.T) {
+	reservation := &nvapi.ComputeDomainCliqueReservation{
+		ObjectMeta: metav1.ObjectMeta{Name: cdclique.ReservationName("clique-a")},
+		Spec:       nvapi.ComputeDomainCliqueReservationSpec{CliqueID: "clique-a", ComputeDomainUID: types.UID("cd-uid")},
+		Status: nvapi.ComputeDomainCliqueReservationStatus{
+			Phase: nvapi.ComputeDomainCliqueReservationPhaseReleased, ReleaseReason: nvapi.ComputeDomainCliqueReservationReleaseReasonVerifiedFence,
+			SnapshotUID: types.UID("snapshot-uid"), FencedGeneration: 7,
+			FencedHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+	}
+	m := newTestSnapshotManager()
+	m.config.protocol = nvapi.ComputeDomainCliqueProtocolPersistentAgentV1
+	m.config.clientsets = flags.ClientSets{Nvidia: nvfake.NewSimpleClientset(reservation)}
+	m.currentSnapshotUID = types.UID("snapshot-uid")
+	m.retired = controllerSnapshotIdentity{uid: types.UID("snapshot-uid"), generation: 7, hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", retiring: true}
+
+	m.acceptReleasedReservation()
+	require.Equal(t, types.UID("snapshot-uid"), m.currentSnapshotUID, "mismatched fence hash must preserve retired state")
+
+	reservation.Status.FencedHash = m.retired.hash
+	_, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().UpdateStatus(context.Background(), reservation, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	m.acceptReleasedReservation()
+	require.Empty(t, m.currentSnapshotUID)
 }
 
 func TestSnapshotConsumerTracksGenerationWithinUID(t *testing.T) {

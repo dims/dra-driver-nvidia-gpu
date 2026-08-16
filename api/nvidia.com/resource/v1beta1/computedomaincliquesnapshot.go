@@ -22,6 +22,11 @@ import (
 )
 
 const (
+	// ComputeDomainCliqueSnapshotAppliedAnnotation records the exact snapshot
+	// receipt installed by a persistent agent. It is status/debugging data; the
+	// kubelet authorizes workloads from the durable local receipt instead.
+	ComputeDomainCliqueSnapshotAppliedAnnotation = "resource.nvidia.com/computeDomainCliqueSnapshotApplied"
+
 	ComputeDomainCliqueSnapshotPhasePending  = "Pending"
 	ComputeDomainCliqueSnapshotPhaseActive   = "Active"
 	ComputeDomainCliqueSnapshotPhaseRetiring = "Retiring"

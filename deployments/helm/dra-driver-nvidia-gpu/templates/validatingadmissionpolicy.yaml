@@ -121,6 +121,11 @@ spec:
        size(object.subjects) == 1 && variables.subjectUsernames == [variables.kubeletSubject])
     message: the kubelet-plugin ClusterRole may be bound only to the immutable installation kubelet ServiceAccount
   - expression: >-
+      object.roleRef.name != 'dra-driver-nvidia-gpu-clusterrole-daemon-reader' ||
+      (object.metadata.name == 'dra-driver-nvidia-gpu-clusterrole-binding-daemon-reader' && size(object.subjects) == 1 &&
+       variables.subjectUsernames == ['system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace']+':compute-domain-daemon-reader-service-account'])
+    message: the daemon-reader ClusterRole may be bound only to the immutable installation reader ServiceAccount
+  - expression: >-
       object.roleRef.name != variables.daemonRole ||
       (object.metadata.name == variables.daemonBinding && object.subjects.all(s,
         s.kind == 'ServiceAccount' && s.name == 'compute-domain-daemon-service-account' &&
@@ -675,6 +680,61 @@ spec:
       params != null && request.userInfo.username ==
       params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-controller-subject']
     message: only the compute-domain controller may write controller-owned clique snapshots
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCPolicyName" "persistent-agent-applied-state-policy" }}
+  labels:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCLabels" . | nindent 4 }}
+  annotations:
+    {{- include "dra-driver-nvidia-gpu.controllerOwnedCDCAnnotations" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["pods"]
+  matchConditions:
+  - name: isPersistentAgent
+    expression: >-
+      params != null && request.userInfo.username ==
+      'system:serviceaccount:'+params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace']+':compute-domain-daemon-reader-service-account'
+  variables:
+  - name: podUIDs
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/pod-uid'].orValue([])
+  - name: nodeNames
+    expression: request.userInfo.extra[?'authentication.kubernetes.io/node-name'].orValue([])
+  validations:
+  - expression: >-
+      object.metadata.namespace == params.metadata.annotations['resource.nvidia.com/controller-owned-cdc-control-namespace'] &&
+      variables.podUIDs.exists(uid, uid == string(object.metadata.uid)) &&
+      variables.nodeNames.exists(name, name == object.spec.nodeName) &&
+      object.metadata.?labels.orValue({})[?'resource.nvidia.com/persistentComputeDomainAgent'].orValue('') == 'true' &&
+      object.metadata.?ownerReferences.orValue([]).exists(r,
+        r.?controller.orValue(false) && r.apiVersion == 'apps/v1' && r.kind == 'DaemonSet' &&
+        r.name == 'dra-driver-nvidia-gpu-persistent-agent' && string(r.uid) != '')
+    message: applied state may be written only by the bound persistent-agent Pod
+  - expression: >-
+      object.spec == oldObject.spec && object.status == oldObject.status &&
+      object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+      object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+      object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+      (!has(object.metadata.annotations) || object.metadata.annotations.all(k, v,
+        k == 'resource.nvidia.com/computeDomainCliqueSnapshotApplied' ||
+        (has(oldObject.metadata.annotations) && k in oldObject.metadata.annotations && oldObject.metadata.annotations[k] == v))) &&
+      (!has(oldObject.metadata.annotations) || oldObject.metadata.annotations.all(k, v,
+        k == 'resource.nvidia.com/computeDomainCliqueSnapshotApplied' ||
+        (has(object.metadata.annotations) && k in object.metadata.annotations && object.metadata.annotations[k] == v)))
+    message: persistent agent may change only its applied-snapshot annotation
+  - expression: >-
+      object.metadata.?annotations.orValue({})[?'resource.nvidia.com/computeDomainCliqueSnapshotApplied'].orValue('').size() <= 2048
+    message: persistent-agent applied state is bounded
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy

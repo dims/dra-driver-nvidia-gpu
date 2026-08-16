@@ -592,7 +592,7 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, cs *resourceapi.Reso
 	for c := range configResultsMap {
 		switch config := c.(type) {
 		case *configapi.ComputeDomainChannelConfig:
-			if s.config.imexConfig.EffectiveHostManaged() || configapi.EffectiveComputeDomainCliqueProtocol(config.Protocol) == configapi.ComputeDomainCliqueProtocolControllerV1 {
+			if s.config.imexConfig.EffectiveHostManaged() || configapi.IsControllerOwnedComputeDomainCliqueProtocol(config.Protocol) {
 				continue
 			}
 			if err := s.computeDomainManager.RemoveNodeLabel(ctx, config.DomainID); err != nil {

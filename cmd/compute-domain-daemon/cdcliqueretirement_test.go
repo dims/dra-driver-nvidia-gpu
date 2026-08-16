@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -35,7 +36,8 @@ import (
 
 type retirementPodClient struct {
 	kubernetes.Interface
-	pod *corev1.Pod
+	pod     *corev1.Pod
+	patches [][]byte
 }
 
 func (c *retirementPodClient) CoreV1() coretyped.CoreV1Interface {
@@ -70,6 +72,33 @@ func (p *retirementPods) Update(_ context.Context, pod *corev1.Pod, _ metav1.Upd
 	}
 	p.client.pod = pod.DeepCopy()
 	return pod.DeepCopy(), nil
+}
+
+func (p *retirementPods) Patch(_ context.Context, name string, patchType types.PatchType, data []byte, _ metav1.PatchOptions, _ ...string) (*corev1.Pod, error) {
+	if p.client.pod == nil || p.client.pod.Name != name || patchType != types.JSONPatchType {
+		return nil, apierrors.NewNotFound(corev1.Resource("pods"), name)
+	}
+	var operations []podJSONPatchOperation
+	if err := json.Unmarshal(data, &operations); err != nil {
+		return nil, err
+	}
+	updated := p.client.pod.DeepCopy()
+	last := operations[len(operations)-1]
+	if last.Operation == "remove" {
+		delete(updated.Annotations, nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation)
+	} else {
+		if updated.Annotations == nil {
+			updated.Annotations = map[string]string{}
+		}
+		if values, ok := last.Value.(map[string]any); ok {
+			updated.Annotations[nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation], _ = values[nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation].(string)
+		} else {
+			updated.Annotations[nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation], _ = last.Value.(string)
+		}
+	}
+	p.client.pod = updated
+	p.client.patches = append(p.client.patches, data)
+	return updated.DeepCopy(), nil
 }
 
 func TestPublishRetirementEvidenceIsExactDurableAndIdempotent(t *testing.T) {
@@ -114,4 +143,37 @@ func TestPublishRetirementEvidenceRejectsDifferentWitnessPodUID(t *testing.T) {
 	}})
 	require.ErrorContains(t, err, "does not match retirement witness")
 	require.Empty(t, core.pod.Annotations)
+}
+
+func TestPersistentAgentAppliedStateUsesGuardedIdempotentJSONPatch(t *testing.T) {
+	controller := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "persistent-agent", Namespace: "driver", UID: types.UID("agent-uid"), ResourceVersion: "7",
+			Labels:          map[string]string{"resource.nvidia.com/persistentComputeDomainAgent": "true"},
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "dra-driver-nvidia-gpu-persistent-agent", UID: types.UID("agent-ds-uid"), Controller: &controller}},
+		},
+		Spec: corev1.PodSpec{NodeName: "node-a"},
+	}
+	core := &retirementPodClient{pod: pod}
+	manager := &ComputeDomainCliqueSnapshotManager{config: &ManagerConfig{
+		clientsets: flags.ClientSets{Core: core}, protocol: nvapi.ComputeDomainCliqueProtocolPersistentAgentV1,
+		nodeName: "node-a", podNamespace: pod.Namespace, podName: pod.Name, podUID: string(pod.UID),
+	}}
+	state := &ControllerSnapshotDesiredState{Protocol: nvapi.ComputeDomainCliqueProtocolPersistentAgentV1, Receipt: &nvapi.ComputeDomainCliqueSnapshotReceipt{
+		SnapshotUID: types.UID("snapshot-uid"), SnapshotGeneration: 2,
+		SnapshotHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		NodeUID:      types.UID("node-uid"), PodUID: pod.UID, Index: 0,
+	}}
+
+	require.NoError(t, manager.WriteAppliedState(context.Background(), state))
+	require.Len(t, core.patches, 1)
+	require.NotEmpty(t, core.pod.Annotations[nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation])
+	require.NoError(t, manager.WriteAppliedState(context.Background(), state))
+	require.Len(t, core.patches, 1, "identical applied state must be an API no-op")
+	require.NoError(t, manager.ClearAppliedState(context.Background(), state))
+	require.Len(t, core.patches, 2)
+	require.NotContains(t, core.pod.Annotations, nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation)
+	require.NoError(t, manager.ClearAppliedState(context.Background(), state))
+	require.Len(t, core.patches, 2, "clearing absent state must be an API no-op")
 }

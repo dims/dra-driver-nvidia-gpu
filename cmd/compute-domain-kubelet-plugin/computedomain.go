@@ -136,7 +136,6 @@ func NewComputeDomainManager(config *Config, getCliqueIDFunc func() (string, err
 		informerResyncPeriod,
 		informers.WithNamespace(config.flags.namespace),
 		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = computeDomainLabelKey
 			options.FieldSelector = "spec.nodeName=" + config.flags.nodeName
 		}),
 	)
@@ -166,7 +165,7 @@ func NewComputeDomainManager(config *Config, getCliqueIDFunc func() (string, err
 		cliqueID:             cliqueID,
 		getCliqueIDFunc:      getCliqueIDFunc,
 		controllerOwnedEnabled: func() bool {
-			return featuregates.Enabled(featuregates.ControllerOwnedCDCliques)
+			return featuregates.Enabled(featuregates.ControllerOwnedCDCliques) || featuregates.Enabled(featuregates.PersistentComputeDomainAgents)
 		},
 		strictFabricErrorsEnabled: func() bool {
 			return featuregates.Enabled(featuregates.CrashOnNVLinkFabricErrors)
@@ -249,7 +248,7 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 	// snapshot LIST/WATCH streams. Start controller-v1 readers only when the
 	// gate admits new controller-v1 domains or the cache proves that persisted
 	// controller-v1 state must keep working after the gate is disabled.
-	m.controllerReadersOn = m.controllerOwnedEnabled() || m.hasPersistedControllerV1()
+	m.controllerReadersOn = m.controllerOwnedEnabled() || m.hasPersistedControllerOwnedProtocol()
 	if m.controllerReadersOn {
 		if err := m.validateControllerReaderPrerequisites(); err != nil {
 			return err
@@ -308,10 +307,10 @@ func (m *ComputeDomainManager) Start(ctx context.Context) (rerr error) {
 	return nil
 }
 
-func (m *ComputeDomainManager) hasPersistedControllerV1() bool {
+func (m *ComputeDomainManager) hasPersistedControllerOwnedProtocol() bool {
 	for _, object := range m.informer.GetStore().List() {
 		cd, ok := object.(*nvapi.ComputeDomain)
-		if ok && nvapi.EffectiveComputeDomainCliqueProtocol(nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation])) == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		if ok && nvapi.IsControllerOwnedComputeDomainCliqueProtocol(nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation])) {
 			return true
 		}
 	}
@@ -503,8 +502,8 @@ func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdU
 	if protocol != persistedProtocol {
 		return fmt.Errorf("claim clique protocol %q does not match ComputeDomain protocol %q", protocol, persistedProtocol)
 	}
-	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
-		return m.assertCurrentNodeReadyInSnapshot(ctx, cd)
+	if nvapi.IsControllerOwnedComputeDomainCliqueProtocol(protocol) {
+		return m.assertCurrentNodeReadyInSnapshot(ctx, cd, protocol)
 	}
 
 	// Marker-less and explicit legacy-v1 claims retain the compatibility path.
@@ -515,7 +514,7 @@ func (m *ComputeDomainManager) AssertComputeDomainReady(ctx context.Context, cdU
 	return nil
 }
 
-func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(ctx context.Context, cd *nvapi.ComputeDomain) error {
+func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(ctx context.Context, cd *nvapi.ComputeDomain, protocol nvapi.ComputeDomainCliqueProtocol) error {
 	// This quorum-backed read pairs with the controller's live workload-Pod
 	// inventory to close the destructive retirement barrier. If Prepare wins
 	// before deletion, its Pod already exists and the controller inventory sees
@@ -548,6 +547,7 @@ func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(ctx context.Cont
 	}
 	if snapshot.Spec.ComputeDomainUID != cd.UID ||
 		snapshot.Spec.CliqueID != cliqueID ||
+		nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol) != protocol ||
 		snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseActive ||
 		snapshot.Status.Generation < 1 ||
 		snapshot.Status.Hash == "" {
@@ -555,6 +555,16 @@ func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(ctx context.Cont
 	}
 	if _, err := cdclique.ValidatePublishedState(snapshot); err != nil {
 		return fmt.Errorf("validate controller-owned snapshot: %w", err)
+	}
+	reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, cdclique.ReservationName(cliqueID), metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("get controller-owned physical clique reservation: %w", err)
+	}
+	if reservation.Spec.CliqueID != cliqueID || reservation.Spec.ComputeDomainUID != cd.UID ||
+		reservation.Status.Phase != nvapi.ComputeDomainCliqueReservationPhaseActive || reservation.Status.SnapshotUID != snapshot.UID ||
+		reservation.Status.ActivationGeneration <= 0 || reservation.Status.ActivationGeneration > snapshot.Status.Generation ||
+		len(reservation.Status.ActivationHash) != cdclique.HashHexLength || reservation.Status.FencedGeneration != 0 {
+		return fmt.Errorf("physical clique reservation does not authorize active snapshot")
 	}
 
 	var local *nvapi.ComputeDomainCliqueMember
@@ -584,8 +594,17 @@ func (m *ComputeDomainManager) assertCurrentNodeReadyInSnapshot(ctx context.Cont
 	if pod.DeletionTimestamp != nil || podTerminal(pod.Status.Phase) {
 		return fmt.Errorf("current daemon Pod is deleting or terminal")
 	}
+	validOwner := false
 	controller := metav1.GetControllerOf(snapshot)
-	if controller == nil || pod.Spec.NodeName != local.NodeName || pod.UID != local.PodUID || pod.Status.PodIP != local.PodIP || !podControlledByUID(pod.OwnerReferences, controller.UID) || !podReady(pod.Status.Conditions) {
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		validOwner = controller != nil && podControlledByUID(pod.OwnerReferences, controller.UID)
+	} else {
+		podController := metav1.GetControllerOf(pod)
+		validOwner = controller == nil && pod.Labels["resource.nvidia.com/persistentComputeDomainAgent"] == "true" &&
+			podController != nil && podController.APIVersion == "apps/v1" && podController.Kind == "DaemonSet" &&
+			podController.Name == "dra-driver-nvidia-gpu-persistent-agent" && podController.UID != ""
+	}
+	if pod.Spec.NodeName != local.NodeName || pod.UID != local.PodUID || pod.Status.PodIP != local.PodIP || !validOwner || !podReady(pod.Status.Conditions) {
 		return fmt.Errorf("current daemon Pod identity, ownership, address, or readiness does not match snapshot")
 	}
 

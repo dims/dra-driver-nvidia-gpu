@@ -9,6 +9,8 @@ kind: ResourceClaimTemplate
 metadata:
   name: dra-driver-nvidia-gpu-persistent-agent
   namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+  annotations:
+    helm.sh/resource-policy: keep
   labels:
     {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}
     resource.nvidia.com/persistentComputeDomainAgent: "true"
@@ -43,6 +45,7 @@ metadata:
   name: dra-driver-nvidia-gpu-persistent-agent
   namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
   annotations:
+    helm.sh/resource-policy: keep
     resource.nvidia.com/controller-owned-cdc-installation: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCInstallationID" . | quote }}
   labels:
     {{- include "dra-driver-nvidia-gpu.labels" . | nindent 4 }}

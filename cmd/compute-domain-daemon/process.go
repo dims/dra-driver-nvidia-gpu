@@ -224,6 +224,18 @@ func (m *ProcessManager) stop() error {
 // injected context is the intended way to gracefully stop the child (and to
 // also terminate the watchdog).
 func (m *ProcessManager) Watchdog(ctx context.Context) error {
+	return m.watchdog(ctx, true)
+}
+
+// WatchdogWithoutRestart fails the supervisor when a child exits unexpectedly.
+// The persistent agent uses this mode so the container restart path first
+// invalidates its durable receipt and applied-state annotation before the same
+// snapshot may start another child.
+func (m *ProcessManager) WatchdogWithoutRestart(ctx context.Context) error {
+	return m.watchdog(ctx, false)
+}
+
+func (m *ProcessManager) watchdog(ctx context.Context, restart bool) error {
 	// Maybe use SIGCHLD handler instead to make this ticker-less
 	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
@@ -246,6 +258,9 @@ func (m *ProcessManager) Watchdog(ctx context.Context) error {
 			// `m.wait()` is known to not block at this point.
 			if err := m.wait(); err != nil {
 				return fmt.Errorf("watchdog: process lost, wait failed, treat fatal: %w", err)
+			}
+			if !restart {
+				return fmt.Errorf("watchdog: managed child exited unexpectedly")
 			}
 
 			klog.Warningf("Watchdog: start process again")

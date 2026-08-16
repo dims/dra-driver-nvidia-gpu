@@ -153,6 +153,14 @@ dra-driver-nvidia-gpu-clusterrole-binding-kubeletplugin
 {{- end -}}
 {{- end -}}
 
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCDaemonReaderRoleName" -}}
+dra-driver-nvidia-gpu-clusterrole-daemon-reader
+{{- end -}}
+
+{{- define "dra-driver-nvidia-gpu.controllerOwnedCDCDaemonReaderBindingName" -}}
+dra-driver-nvidia-gpu-clusterrole-binding-daemon-reader
+{{- end -}}
+
 {{- define "dra-driver-nvidia-gpu.controllerOwnedCDCControllerWorkloadName" -}}
 {{- printf "%s-controller" (include "dra-driver-nvidia-gpu.name" .) -}}
 {{- end -}}

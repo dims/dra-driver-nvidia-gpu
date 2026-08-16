@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"os/exec"
 	"testing"
 	"time"
@@ -64,4 +65,17 @@ func TestProcessManagerReusableChildLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, started)
 	require.NoError(t, manager.Stop())
+}
+
+func TestProcessManagerFailClosedWatchdogDoesNotRestartLostChild(t *testing.T) {
+	manager := NewProcessManager([]string{"/bin/sh", "-c", "exit 0"})
+	started, err := manager.EnsureStarted()
+	require.NoError(t, err)
+	require.True(t, started)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err = manager.WatchdogWithoutRestart(ctx)
+	require.ErrorContains(t, err, "exited unexpectedly")
+	require.Nil(t, manager.handle)
 }

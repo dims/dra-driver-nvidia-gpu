@@ -17,9 +17,12 @@ limitations under the License.
 package metrics
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 )
@@ -29,15 +32,17 @@ const (
 	CliqueAPIResourceReservation = "reservation"
 	CliqueAPIResourceEvidence    = "retirement_evidence"
 	CliqueAPIResourceNode        = "node"
+	CliqueAPIResourcePod         = "pod"
 
-	CliqueAPIOperationCreate            = "create"
-	CliqueAPIOperationDelete            = "delete"
-	CliqueAPIOperationGet               = "get"
-	CliqueAPIOperationWriteBarrierGet   = "write_barrier_get"
-	CliqueAPIOperationFinalizerAdd      = "finalizer_add"
-	CliqueAPIOperationFinalizerRemove   = "finalizer_remove"
-	CliqueAPIOperationStatusUpdate      = "status_update"
-	CliqueAPIOperationAttestationUpdate = "attestation_update"
+	CliqueAPIOperationCreate             = "create"
+	CliqueAPIOperationDelete             = "delete"
+	CliqueAPIOperationGet                = "get"
+	CliqueAPIOperationWriteBarrierGet    = "write_barrier_get"
+	CliqueAPIOperationFinalizerAdd       = "finalizer_add"
+	CliqueAPIOperationFinalizerRemove    = "finalizer_remove"
+	CliqueAPIOperationStatusUpdate       = "status_update"
+	CliqueAPIOperationAttestationUpdate  = "attestation_update"
+	CliqueAPIOperationAppliedStateUpdate = "applied_state_update"
 
 	CliqueAPIResultSuccess       = "success"
 	CliqueAPIResultAlreadyExists = "already_exists"
@@ -48,6 +53,27 @@ const (
 	CliqueAPIResultTimeout       = "timeout"
 	CliqueAPIResultError         = "error"
 )
+
+func CliqueAPIResultForError(err error) string {
+	switch {
+	case err == nil:
+		return CliqueAPIResultSuccess
+	case apierrors.IsAlreadyExists(err):
+		return CliqueAPIResultAlreadyExists
+	case apierrors.IsNotFound(err):
+		return CliqueAPIResultNotFound
+	case apierrors.IsConflict(err):
+		return CliqueAPIResultConflict
+	case apierrors.IsTooManyRequests(err):
+		return CliqueAPIResultThrottled
+	case apierrors.IsForbidden(err):
+		return CliqueAPIResultForbidden
+	case apierrors.IsTimeout(err), apierrors.IsServerTimeout(err), errors.Is(err, context.DeadlineExceeded):
+		return CliqueAPIResultTimeout
+	default:
+		return CliqueAPIResultError
+	}
+}
 
 var (
 	cliqueMetricsOnce sync.Once

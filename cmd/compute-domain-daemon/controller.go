@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
@@ -54,6 +55,7 @@ type ManagerConfig struct {
 	podNamespace           string
 	bootID                 string
 	maxNodesPerIMEXDomain  int
+	protocol               nvapi.ComputeDomainCliqueProtocol
 }
 
 // ControllerConfig holds the configuration for the controller.
@@ -80,6 +82,8 @@ type Controller struct {
 	daemonInfoManager DaemonInfoManager
 	workQueue         *workqueue.WorkQueue
 	snapshotManager   *ComputeDomainCliqueSnapshotManager
+	started           chan struct{}
+	startedOnce       sync.Once
 }
 
 // NewController creates and initializes a new Controller instance.
@@ -102,12 +106,13 @@ func NewController(config *ControllerConfig) (*Controller, error) {
 		podNamespace:           config.podNamespace,
 		bootID:                 config.bootID,
 		maxNodesPerIMEXDomain:  config.maxNodesPerIMEXDomain,
+		protocol:               config.protocol,
 	}
 
 	// Choose the appropriate daemon info manager based on the feature gate
 	var daemonInfoManager DaemonInfoManager
 	switch {
-	case config.protocol == nvapi.ComputeDomainCliqueProtocolControllerV1:
+	case config.protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 || config.protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1:
 		daemonInfoManager = NewComputeDomainCliqueSnapshotManager(mc)
 	case featuregates.Enabled(featuregates.ComputeDomainCliques):
 		daemonInfoManager = NewComputeDomainCliqueManager(mc)
@@ -118,12 +123,21 @@ func NewController(config *ControllerConfig) (*Controller, error) {
 	controller := &Controller{
 		daemonInfoManager: daemonInfoManager,
 		workQueue:         workQueue,
+		started:           make(chan struct{}),
 	}
 	if manager, ok := daemonInfoManager.(*ComputeDomainCliqueSnapshotManager); ok {
 		controller.snapshotManager = manager
 	}
 
 	return controller, nil
+}
+
+func (c *Controller) Started() <-chan struct{} {
+	return c.started
+}
+
+func (c *Controller) HasActiveOrRetiringSnapshot() bool {
+	return c.snapshotManager != nil && c.snapshotManager.HasActiveOrRetiringSnapshot()
 }
 
 func (c *Controller) GetSnapshotDesiredStateChan() <-chan *ControllerSnapshotDesiredState {
@@ -145,6 +159,20 @@ func (c *Controller) MarkSnapshotRetired(state *ControllerSnapshotDesiredState) 
 	}
 }
 
+func (c *Controller) WriteSnapshotAppliedState(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+	if c.snapshotManager == nil {
+		return fmt.Errorf("controller-owned snapshot manager is unavailable")
+	}
+	return c.snapshotManager.WriteAppliedState(ctx, state)
+}
+
+func (c *Controller) ClearSnapshotAppliedState(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+	if c.snapshotManager == nil {
+		return fmt.Errorf("controller-owned snapshot manager is unavailable")
+	}
+	return c.snapshotManager.ClearAppliedState(ctx, state)
+}
+
 func (c *Controller) PublishSnapshotRetirementEvidence(ctx context.Context, state *ControllerSnapshotDesiredState) error {
 	if c.snapshotManager == nil {
 		return fmt.Errorf("controller-v1 snapshot manager is unavailable")
@@ -159,6 +187,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	if err := c.daemonInfoManager.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start daemon info manager: %w", err)
 	}
+	c.startedOnce.Do(func() { close(c.started) })
 
 	// Start processing the workqueue
 	c.workQueue.Run(ctx)

@@ -69,7 +69,11 @@ func ValidatePublishedState(snapshot *nvapi.ComputeDomainCliqueSnapshot) ([]nvap
 		return nil, fmt.Errorf("snapshot is not a published generation")
 	}
 	controller := metav1.GetControllerOf(snapshot)
-	if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" ||
+	if nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol) == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		if controller != nil {
+			return nil, fmt.Errorf("persistent-agent snapshot must not have a controller owner")
+		}
+	} else if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" ||
 		controller.Name == "" || controller.UID == "" {
 		return nil, fmt.Errorf("snapshot controller owner is not an exact DaemonSet identity")
 	}

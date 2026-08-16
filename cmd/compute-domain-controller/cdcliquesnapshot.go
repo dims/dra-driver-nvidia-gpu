@@ -19,7 +19,7 @@ package main
 import (
 	"cmp"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -155,23 +155,7 @@ type selectedNodeSummary struct {
 }
 
 func observeCliqueAPIAction(resource, operation string, err error, protocols ...nvapi.ComputeDomainCliqueProtocol) {
-	result := metrics.CliqueAPIResultSuccess
-	switch {
-	case apierrors.IsAlreadyExists(err):
-		result = metrics.CliqueAPIResultAlreadyExists
-	case apierrors.IsNotFound(err):
-		result = metrics.CliqueAPIResultNotFound
-	case apierrors.IsConflict(err):
-		result = metrics.CliqueAPIResultConflict
-	case apierrors.IsTooManyRequests(err):
-		result = metrics.CliqueAPIResultThrottled
-	case apierrors.IsForbidden(err):
-		result = metrics.CliqueAPIResultForbidden
-	case apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || errors.Is(err, context.DeadlineExceeded):
-		result = metrics.CliqueAPIResultTimeout
-	case err != nil:
-		result = metrics.CliqueAPIResultError
-	}
+	result := metrics.CliqueAPIResultForError(err)
 	mutated := err == nil && operation != metrics.CliqueAPIOperationGet && operation != metrics.CliqueAPIOperationWriteBarrierGet
 	protocol := nvapi.ComputeDomainCliqueProtocolControllerV1
 	if len(protocols) != 0 {
@@ -721,6 +705,9 @@ func (m *ControllerOwnedCliqueManager) runWorker(ctx context.Context) {
 		started := time.Now()
 		protocol := m.protocolForKey(key)
 		err := m.reconcile(ctx, key)
+		if err == nil && protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+			err = m.updatePersistentComputeDomainStatusForKey(ctx, key)
+		}
 		if err != nil {
 			metrics.ObserveCliqueReconcile(string(protocol), "error", time.Since(started))
 			klog.Errorf("reconciling controller-owned clique %s: %v", key, err)
@@ -731,6 +718,108 @@ func (m *ControllerOwnedCliqueManager) runWorker(ctx context.Context) {
 		}
 		m.queue.Done(key)
 	}
+}
+
+func (m *ControllerOwnedCliqueManager) updatePersistentComputeDomainStatusForKey(ctx context.Context, key string) error {
+	object, exists, err := m.snapshotInformer.GetIndexer().GetByKey(key)
+	if err != nil || !exists {
+		return err
+	}
+	snapshot, ok := object.(*nvapi.ComputeDomainCliqueSnapshot)
+	if !ok || nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol) != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		return nil
+	}
+	owners, err := m.computeDomainInformer.GetIndexer().ByIndex("uid", string(snapshot.Spec.ComputeDomainUID))
+	if err != nil || len(owners) != 1 {
+		return err
+	}
+	owner, ok := owners[0].(*nvapi.ComputeDomain)
+	if !ok {
+		return fmt.Errorf("unexpected ComputeDomain cache object %T", owners[0])
+	}
+	ready := m.persistentComputeDomainReady(owner)
+	desired := nvapi.ComputeDomainStatusNotReady
+	if ready {
+		desired = nvapi.ComputeDomainStatusReady
+	}
+	if owner.Status.Status == desired {
+		return nil
+	}
+	live, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(owner.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if live.UID != owner.UID {
+		return fmt.Errorf("ComputeDomain identity changed while updating persistent-agent status")
+	}
+	updated := live.DeepCopy()
+	updated.Status.Status = desired
+	_, err = m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(owner.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+	if err == nil {
+		metrics.ObserveComputeDomainStatus(string(owner.UID), desired)
+	}
+	return err
+}
+
+func (m *ControllerOwnedCliqueManager) persistentComputeDomainReady(owner *nvapi.ComputeDomain) bool {
+	if owner == nil || owner.DeletionTimestamp != nil || owner.Spec.NumNodes <= 0 || !m.expectedSetReady(string(owner.UID), owner.Spec.NumNodes) {
+		return false
+	}
+	m.nodeStateMu.RLock()
+	cliqueNodes := make(map[string]map[string]struct{})
+	for nodeName, state := range m.nodeStates {
+		if state.computeDomainUID != string(owner.UID) || !state.topologyReady {
+			continue
+		}
+		if cliqueNodes[state.cliqueID] == nil {
+			cliqueNodes[state.cliqueID] = make(map[string]struct{})
+		}
+		cliqueNodes[state.cliqueID][nodeName] = struct{}{}
+	}
+	m.nodeStateMu.RUnlock()
+	if len(cliqueNodes) == 0 {
+		return false
+	}
+	snapshots, err := m.snapshotInformer.GetIndexer().ByIndex(computeDomainUIDIndex, string(owner.UID))
+	if err != nil || len(snapshots) != len(cliqueNodes) {
+		return false
+	}
+	for _, object := range snapshots {
+		snapshot, ok := object.(*nvapi.ComputeDomainCliqueSnapshot)
+		if !ok || snapshot.DeletionTimestamp != nil || snapshot.Status.Phase != nvapi.ComputeDomainCliqueSnapshotPhaseActive ||
+			nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol) != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+			return false
+		}
+		expected := cliqueNodes[snapshot.Spec.CliqueID]
+		if len(expected) == 0 || len(snapshot.Status.Members) != len(expected) {
+			return false
+		}
+		provider, err := m.daemonProviderFor(snapshot.Namespace, owner, nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
+		if err != nil || provider.daemonSet == nil {
+			return false
+		}
+		for i := range snapshot.Status.Members {
+			member := &snapshot.Status.Members[i]
+			if _, found := expected[member.NodeName]; !found {
+				return false
+			}
+			pod, exists, err := m.podInformer.GetIndexer().GetByKey(snapshot.Namespace + "/" + member.PodName)
+			if err != nil || !exists {
+				return false
+			}
+			agent, ok := pod.(*corev1.Pod)
+			if !ok || !eligibleSnapshotPod(agent, provider.daemonSet) || agent.UID != member.PodUID || agent.Status.PodIP != member.PodIP {
+				return false
+			}
+			var receipt nvapi.ComputeDomainCliqueSnapshotReceipt
+			if err := json.Unmarshal([]byte(agent.Annotations[nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation]), &receipt); err != nil ||
+				receipt.SnapshotUID != snapshot.UID || receipt.SnapshotGeneration != snapshot.Status.Generation || receipt.SnapshotHash != snapshot.Status.Hash ||
+				receipt.NodeUID != member.NodeUID || receipt.PodUID != member.PodUID || receipt.Index != member.Index {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (m *ControllerOwnedCliqueManager) protocolForKey(key string) nvapi.ComputeDomainCliqueProtocol {

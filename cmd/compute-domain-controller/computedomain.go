@@ -290,7 +290,11 @@ func (m *ComputeDomainManager) RemoveFinalizer(ctx context.Context, uid string) 
 	return nil
 }
 
-func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string) error {
+func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string, protocols ...nvapi.ComputeDomainCliqueProtocol) error {
+	protocol := nvapi.ComputeDomainCliqueProtocolControllerV1
+	if len(protocols) != 0 {
+		protocol = nvapi.EffectiveComputeDomainCliqueProtocol(protocols[0])
+	}
 	namespace := m.config.driverNamespace
 	selector := labels.SelectorFromSet(labels.Set{computeDomainLabelKey: cdUID}).String()
 	snapshotList, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
@@ -394,7 +398,7 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 				updated.Status.FencedHash = snapshot.Status.Hash
 			}
 			result, updateErr := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().UpdateStatus(ctx, updated, metav1.UpdateOptions{})
-			observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, updateErr)
+			observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationStatusUpdate, updateErr, protocol)
 			if updateErr != nil {
 				return updateErr
 			}
@@ -409,7 +413,7 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 			return fmt.Errorf("retirement evidence %s/%s has mismatched ComputeDomain UID", evidence.Namespace, evidence.Name)
 		}
 		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueRetirementEvidences(evidence.Namespace).Delete(ctx, evidence.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &evidence.UID}})
-		observeCliqueAPIAction(metrics.CliqueAPIResourceEvidence, metrics.CliqueAPIOperationDelete, err)
+		observeCliqueAPIAction(metrics.CliqueAPIResourceEvidence, metrics.CliqueAPIOperationDelete, err, protocol)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -422,13 +426,13 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 				return finalizer == nvapi.ComputeDomainCliqueSnapshotFinalizer
 			})
 			_, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Update(ctx, withoutFence, metav1.UpdateOptions{})
-			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerRemove, err)
+			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationFinalizerRemove, err, snapshot.Spec.Protocol)
 			if err != nil {
 				return err
 			}
 		}
 		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).Delete(ctx, snapshot.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &snapshot.UID}})
-		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationDelete, err)
+		observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationDelete, err, snapshot.Spec.Protocol)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -436,7 +440,7 @@ func (m *ComputeDomainManager) DeleteSnapshots(ctx context.Context, cdUID string
 	for i := range reservations.Items {
 		reservation := &reservations.Items[i]
 		err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Delete(ctx, reservation.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &reservation.UID}})
-		observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationDelete, err)
+		observeCliqueAPIAction(metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationDelete, err, protocol)
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -576,7 +580,7 @@ func computeDomainCliqueProtocol(cd *nvapi.ComputeDomain) (nvapi.ComputeDomainCl
 }
 
 func controllerOwnedProtocol(protocol nvapi.ComputeDomainCliqueProtocol) bool {
-	return protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 || protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1
+	return nvapi.IsControllerOwnedComputeDomainCliqueProtocol(protocol)
 }
 
 func usesPerDomainDaemon(protocol nvapi.ComputeDomainCliqueProtocol) bool {
@@ -674,7 +678,7 @@ func (m *ComputeDomainManager) onAddOrUpdateDriverManaged(ctx context.Context, c
 		}
 
 		if controllerOwnedProtocol(protocol) {
-			if err := m.DeleteSnapshots(ctx, string(cd.UID)); err != nil {
+			if err := m.DeleteSnapshots(ctx, string(cd.UID), protocol); err != nil {
 				// Kubernetes object disappearance is not a runtime fence. Preserve
 				// tombstones and the ComputeDomain finalizer until durable retirement
 				// evidence permits their controller-owned removal.

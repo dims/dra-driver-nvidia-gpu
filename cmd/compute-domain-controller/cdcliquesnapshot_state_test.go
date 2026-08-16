@@ -500,6 +500,26 @@ func TestPersistentAgentExpectedSetUsesSharedStateMachine(t *testing.T) {
 
 	require.Equal(t, nvapi.ComputeDomainCliqueSnapshotPhaseActive, snapshot.Status.Phase)
 	require.Len(t, snapshot.Status.Members, 2)
+	require.False(t, h.manager.persistentComputeDomainReady(h.cd), "an Active snapshot without exact agent acknowledgments is not globally Ready")
+	for i := range snapshot.Status.Members {
+		member := &snapshot.Status.Members[i]
+		object, exists, err := h.manager.podInformer.GetStore().GetByKey(snapshot.Namespace + "/" + member.PodName)
+		require.NoError(t, err)
+		require.True(t, exists)
+		pod := object.(*corev1.Pod).DeepCopy()
+		receipt, err := json.Marshal(nvapi.ComputeDomainCliqueSnapshotReceipt{
+			SnapshotUID: snapshot.UID, SnapshotGeneration: snapshot.Status.Generation, SnapshotHash: snapshot.Status.Hash,
+			NodeUID: member.NodeUID, PodUID: member.PodUID, Index: member.Index,
+		})
+		require.NoError(t, err)
+		if pod.Annotations == nil {
+			pod.Annotations = map[string]string{}
+		}
+		pod.Annotations[nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation] = string(receipt)
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		require.NoError(t, h.manager.podInformer.GetStore().Update(pod))
+	}
+	require.True(t, h.manager.persistentComputeDomainReady(h.cd))
 	require.Equal(t, 3, countFakeMutations(h.observed, "computedomaincliquesnapshots"))
 	require.Equal(t, 2, countFakeMutations(h.observed, "computedomaincliquereservations"))
 	for _, action := range h.observed {

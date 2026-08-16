@@ -115,10 +115,10 @@ func (m *ControllerOwnedCliqueManager) PrepareComputeDomainRetirement(ctx contex
 				ObservedGeneration: snapshot.Generation,
 			})
 			if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{}); err != nil {
-				observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, err)
+				observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, err, snapshot.Spec.Protocol)
 				return false, err
 			}
-			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, nil)
+			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, nil, snapshot.Spec.Protocol)
 			allFenced = false
 		case nvapi.ComputeDomainCliqueSnapshotPhaseRetiring:
 			complete, err := m.snapshotRetirementEvidenceComplete(ctx, snapshot)
@@ -143,10 +143,10 @@ func (m *ControllerOwnedCliqueManager) PrepareComputeDomainRetirement(ctx contex
 				ObservedGeneration: snapshot.Generation,
 			})
 			if _, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueSnapshots(snapshot.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{}); err != nil {
-				observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, err)
+				observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, err, snapshot.Spec.Protocol)
 				return false, err
 			}
-			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, nil)
+			observeCliqueAPIAction(metrics.CliqueAPIResourceSnapshot, metrics.CliqueAPIOperationStatusUpdate, nil, snapshot.Spec.Protocol)
 			allFenced = false
 		case nvapi.ComputeDomainCliqueSnapshotPhaseFenced:
 			// Durable evidence is already committed.

@@ -79,6 +79,9 @@ helm template "${HELM_ARGS[@]}" \
   --show-only templates/rbac-controller.yaml \
   > "${TMP_DIR}/controller-rbac.yaml"
 helm template "${HELM_ARGS[@]}" \
+  --show-only templates/rbac-compute-domain-daemon.yaml \
+  > "${TMP_DIR}/daemon-rbac.yaml"
+helm template "${HELM_ARGS[@]}" \
   --show-only templates/validatingadmissionpolicy.yaml \
   > "${TMP_DIR}/policies.yaml"
 helm template "${HELM_ARGS[@]}" \
@@ -88,6 +91,7 @@ helm template "${HELM_ARGS[@]}" \
 # Install authorization and policy parameters before activating the bindings.
 kubectl apply -f "${TMP_DIR}/installation.yaml"
 kubectl apply -f "${TMP_DIR}/controller-rbac.yaml"
+kubectl apply -f "${TMP_DIR}/daemon-rbac.yaml"
 
 INSTALLATION_NAME="controller-owned-cdc-installation.dra-driver-nvidia-gpu"
 CONTROLLER_SUBJECT="$(kubectl get clusterrole "${INSTALLATION_NAME}" \
@@ -237,3 +241,65 @@ test "$(kubectl get node "${NODE_NAME}" -o jsonpath='{.metadata.labels.admission
 test "$(kubectl get node "${NODE_NAME}" -o jsonpath='{.metadata.annotations.admission-test-preserved-annotation}')" = preserved
 
 echo "PASS: controller atomic retirement cleanup"
+
+# Exercise the persistent agent's only write permission with a real
+# Pod-bound ServiceAccount token. This proves the token UID/Node checks and
+# narrow metadata diff against an API server, which fake clients cannot do.
+kubectl create -f - > /dev/null <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dra-driver-nvidia-gpu-persistent-agent
+  namespace: ${TEST_NAMESPACE}
+spec:
+  selector:
+    matchLabels:
+      resource.nvidia.com/persistentComputeDomainAgent: "true"
+  template:
+    metadata:
+      labels:
+        resource.nvidia.com/persistentComputeDomainAgent: "true"
+    spec:
+      serviceAccountName: compute-domain-daemon-reader-service-account
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.10
+EOF
+kubectl rollout status daemonset/dra-driver-nvidia-gpu-persistent-agent -n "${TEST_NAMESPACE}" --timeout=60s > /dev/null
+AGENT_POD="$(kubectl get pods -n "${TEST_NAMESPACE}" -l resource.nvidia.com/persistentComputeDomainAgent=true -o jsonpath='{.items[0].metadata.name}')"
+test -n "${AGENT_POD}"
+kubectl create -f - > /dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: persistent-agent-other
+  namespace: ${TEST_NAMESPACE}
+spec:
+  containers:
+  - name: pause
+    image: registry.k8s.io/pause:3.10
+EOF
+AGENT_TOKEN="$(kubectl create token compute-domain-daemon-reader-service-account -n "${TEST_NAMESPACE}" \
+  --bound-object-kind Pod --bound-object-name "${AGENT_POD}" --duration=10m)"
+AGENT_KUBECONFIG="${TMP_DIR}/persistent-agent.kubeconfig"
+APISERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+kubectl config set-cluster admission-test --server="${APISERVER}" --insecure-skip-tls-verify=true --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
+kubectl config set-credentials persistent-agent --token="${AGENT_TOKEN}" --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
+kubectl config set-context persistent-agent --cluster=admission-test --user=persistent-agent --namespace="${TEST_NAMESPACE}" --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
+kubectl config use-context persistent-agent --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
+AGENT_KUBECTL=(kubectl --kubeconfig="${AGENT_KUBECONFIG}")
+test "$("${AGENT_KUBECTL[@]}" auth whoami -o jsonpath='{.status.userInfo.username}')" = \
+  "system:serviceaccount:${TEST_NAMESPACE}:compute-domain-daemon-reader-service-account"
+
+"${AGENT_KUBECTL[@]}" patch pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" --type=merge \
+  -p '{"metadata":{"annotations":{"resource.nvidia.com/computeDomainCliqueSnapshotApplied":"{\"snapshotUID\":\"snapshot-a\"}"}}}' > /dev/null
+test "$(kubectl get pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" -o jsonpath='{.metadata.annotations.resource\.nvidia\.com/computeDomainCliqueSnapshotApplied}')" = '{"snapshotUID":"snapshot-a"}'
+
+expect_denied "persistent agent unrelated Pod annotation mutation" \
+  "${AGENT_KUBECTL[@]}" patch pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" --type=merge \
+    -p '{"metadata":{"annotations":{"admission-test.invalid/unrelated":"changed"}}}'
+expect_denied "persistent agent mutation of a different Pod" \
+  "${AGENT_KUBECTL[@]}" patch pod persistent-agent-other -n "${TEST_NAMESPACE}" --type=merge \
+    -p '{"metadata":{"annotations":{"resource.nvidia.com/computeDomainCliqueSnapshotApplied":"{}"}}}'
+
+echo "PASS: Pod-bound persistent-agent applied-state update"

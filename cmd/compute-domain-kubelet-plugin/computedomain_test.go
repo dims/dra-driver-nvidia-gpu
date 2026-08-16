@@ -43,6 +43,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/cdclique"
 	pkgflags "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/flags"
 	nvfake "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/clientset/versioned/fake"
 )
@@ -65,7 +66,7 @@ func TestComputeDomainManagerStartsWithoutSnapshotAPI(t *testing.T) {
 
 	assertWatchScope(t, nvidiaClient.Actions(), "computedomains", "", "", "")
 	assertListScope(t, nvidiaClient.Actions(), "computedomaincliquesnapshots", testDriverNamespace, "", "")
-	coreClient.assertInformerScope(t, "pods", testDriverNamespace, computeDomainLabelKey, "spec.nodeName="+testNodeName)
+	coreClient.assertInformerScope(t, "pods", testDriverNamespace, "", "spec.nodeName="+testNodeName)
 	coreClient.assertInformerScope(t, "nodes", "", "", "metadata.name="+testNodeName)
 }
 
@@ -120,8 +121,8 @@ func TestPersistedControllerV1RequiresStrictFabricErrorsAfterGateDisable(t *test
 	manager.controllerOwnedEnabled = func() bool { return false }
 	manager.strictFabricErrorsEnabled = func() bool { return false }
 	require.NoError(t, manager.informer.GetStore().Add(cd))
-	require.True(t, manager.hasPersistedControllerV1())
-	manager.controllerReadersOn = manager.controllerOwnedEnabled() || manager.hasPersistedControllerV1()
+	require.True(t, manager.hasPersistedControllerOwnedProtocol())
+	manager.controllerReadersOn = manager.controllerOwnedEnabled() || manager.hasPersistedControllerOwnedProtocol()
 
 	err := manager.validateControllerReaderPrerequisites()
 	require.ErrorContains(t, err, "controller-v1 state requires feature gate CrashOnNVLinkFabricErrors=true")
@@ -366,6 +367,34 @@ func TestControllerOwnedReadinessUsesExactCachedIdentityAndReceipt(t *testing.T)
 
 }
 
+func TestPersistentAgentReadinessUsesExactSnapshotReservationPodAndReceipt(t *testing.T) {
+	manager, cd, snapshot, pod := readyControllerOwnedManager(t)
+	cd = cd.DeepCopy()
+	cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation] = string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
+	_, err := manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(cd.Namespace).Update(context.Background(), cd, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, manager.informer.GetIndexer().Update(cd))
+
+	snapshot = snapshot.DeepCopy()
+	snapshot.Spec.Protocol = nvapi.ComputeDomainCliqueProtocolPersistentAgentV1
+	snapshot.OwnerReferences = nil
+	require.NoError(t, manager.snapshotInformer.GetIndexer().Update(snapshot))
+	pod = pod.DeepCopy()
+	pod.Labels = map[string]string{"resource.nvidia.com/persistentComputeDomainAgent": "true"}
+	pod.OwnerReferences[0].APIVersion = "apps/v1"
+	pod.OwnerReferences[0].Kind = "DaemonSet"
+	pod.OwnerReferences[0].Name = "dra-driver-nvidia-gpu-persistent-agent"
+	require.NoError(t, manager.podInformer.GetIndexer().Update(pod))
+
+	require.NoError(t, manager.AssertComputeDomainReady(context.Background(), string(cd.UID), nvapi.ComputeDomainCliqueProtocolPersistentAgentV1))
+
+	stale := pod.DeepCopy()
+	stale.UID = types.UID("replacement-agent")
+	require.NoError(t, manager.podInformer.GetIndexer().Update(stale))
+	err = manager.AssertComputeDomainReady(context.Background(), string(cd.UID), nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
+	require.ErrorContains(t, err, "identity")
+}
+
 func TestControllerOwnedReadinessLiveDeletionBarrier(t *testing.T) {
 	manager, cd, _, _ := readyControllerOwnedManager(t)
 	deleting := cd.DeepCopy()
@@ -483,6 +512,17 @@ func readyControllerOwnedManager(t *testing.T) (*ComputeDomainManager, *nvapi.Co
 	hash := sha256.Sum256(canonical)
 	snapshot.Status.Hash = hex.EncodeToString(hash[:])
 	require.NoError(t, manager.snapshotInformer.GetIndexer().Add(snapshot))
+	_, err = manager.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Create(context.Background(), &nvapi.ComputeDomainCliqueReservation{
+		ObjectMeta: metav1.ObjectMeta{Name: cdclique.ReservationName(manager.CliqueID())},
+		Spec: nvapi.ComputeDomainCliqueReservationSpec{
+			CliqueID: manager.CliqueID(), ComputeDomainUID: cd.UID,
+		},
+		Status: nvapi.ComputeDomainCliqueReservationStatus{
+			Phase: nvapi.ComputeDomainCliqueReservationPhaseActive, SnapshotUID: snapshot.UID,
+			ActivationGeneration: 1, ActivationHash: snapshot.Status.Hash,
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
 
 	controller := true
 	pod := &corev1.Pod{

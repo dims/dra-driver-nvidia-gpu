@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"reflect"
@@ -25,12 +26,14 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	nvapi "sigs.k8s.io/dra-driver-nvidia-gpu/api/nvidia.com/resource/v1beta1"
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/cdclique"
+	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/metrics"
 	nvinformers "sigs.k8s.io/dra-driver-nvidia-gpu/pkg/nvidia.com/informers/externalversions"
 )
 
@@ -39,6 +42,9 @@ import (
 // has been started or restarted. Keeping these in one event prevents a consumer
 // from acknowledging a different snapshot than the one it just applied.
 type ControllerSnapshotDesiredState struct {
+	ComputeDomainUID   types.UID
+	CliqueID           string
+	Protocol           nvapi.ComputeDomainCliqueProtocol
 	Members            []*nvapi.ComputeDomainDaemonInfo
 	Receipt            *nvapi.ComputeDomainCliqueSnapshotReceipt
 	RetirementEvidence *nvapi.ComputeDomainCliqueRetirementEvidenceSpec
@@ -76,6 +82,7 @@ type ComputeDomainCliqueSnapshotManager struct {
 	informer  cache.SharedIndexInformer
 	waitGroup sync.WaitGroup
 	cancel    context.CancelFunc
+	ctx       context.Context
 
 	mu                 sync.Mutex
 	currentSnapshotUID types.UID
@@ -90,7 +97,14 @@ type ComputeDomainCliqueSnapshotManager struct {
 
 func NewComputeDomainCliqueSnapshotManager(config *ManagerConfig) *ComputeDomainCliqueSnapshotManager {
 	options := []nvinformers.SharedInformerOption{nvinformers.WithNamespace(config.podNamespace)}
-	if config.cliqueID != "" {
+	if config.protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		options = append(options, nvinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.LabelSelector = labels.SelectorFromSet(labels.Set{
+				computeDomainCliqueLabelKey:                       config.cliqueID,
+				"resource.nvidia.com/computeDomainCliqueProtocol": string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1),
+			}).String()
+		}))
+	} else if config.cliqueID != "" {
 		name := cdclique.SnapshotName(config.computeDomainUUID, config.cliqueID)
 		options = append(options, nvinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
 			options.FieldSelector = "metadata.name=" + name
@@ -116,9 +130,11 @@ func NewComputeDomainCliqueSnapshotManager(config *ManagerConfig) *ComputeDomain
 func (m *ComputeDomainCliqueSnapshotManager) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
+	m.ctx = ctx
 	if _, err := m.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    m.enqueue,
 		UpdateFunc: func(_, current any) { m.enqueue(current) },
+		DeleteFunc: m.enqueue,
 	}); err != nil {
 		return err
 	}
@@ -129,6 +145,9 @@ func (m *ComputeDomainCliqueSnapshotManager) Start(ctx context.Context) error {
 	}()
 	if !cache.WaitForCacheSync(ctx.Done(), m.informer.HasSynced) {
 		return fmt.Errorf("informer cache sync for ComputeDomainCliqueSnapshots failed")
+	}
+	if m.config.protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		m.reconcilePersistentSnapshots()
 	}
 	return nil
 }
@@ -143,6 +162,20 @@ func (m *ComputeDomainCliqueSnapshotManager) Stop() error {
 
 func (m *ComputeDomainCliqueSnapshotManager) DesiredStateChan() <-chan *ControllerSnapshotDesiredState {
 	return m.desiredStateChan
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) HasActiveOrRetiringSnapshot() bool {
+	for _, object := range m.informer.GetStore().List() {
+		snapshot, ok := object.(*nvapi.ComputeDomainCliqueSnapshot)
+		if !ok || snapshot.DeletionTimestamp != nil {
+			continue
+		}
+		switch snapshot.Status.Phase {
+		case nvapi.ComputeDomainCliqueSnapshotPhaseActive, nvapi.ComputeDomainCliqueSnapshotPhaseRetiring:
+			return true
+		}
+	}
+	return false
 }
 
 // MarkApplied records success only after the caller has installed the hosts
@@ -173,6 +206,76 @@ func (m *ComputeDomainCliqueSnapshotManager) MarkRetired(state *ControllerSnapsh
 	}
 }
 
+type podJSONPatchOperation struct {
+	Operation string `json:"op"`
+	Path      string `json:"path"`
+	Value     any    `json:"value,omitempty"`
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) WriteAppliedState(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+	if state == nil || state.Protocol != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 || state.Receipt == nil {
+		return nil
+	}
+	value, err := json.Marshal(state.Receipt)
+	if err != nil {
+		return err
+	}
+	return m.patchAppliedAnnotation(ctx, string(value))
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) ClearAppliedState(ctx context.Context, state *ControllerSnapshotDesiredState) error {
+	if state == nil || state.Protocol != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		return nil
+	}
+	return m.patchAppliedAnnotation(ctx, "")
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) patchAppliedAnnotation(ctx context.Context, value string) error {
+	pod, err := m.config.clientsets.Core.CoreV1().Pods(m.config.podNamespace).Get(ctx, m.config.podName, metav1.GetOptions{})
+	metrics.ObserveCliqueAPIAction(string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1), metrics.CliqueAPIResourcePod, metrics.CliqueAPIOperationGet, metrics.CliqueAPIResultForError(err), false)
+	if err != nil {
+		return err
+	}
+	if string(pod.UID) != m.config.podUID || pod.Spec.NodeName != m.config.nodeName || pod.Labels["resource.nvidia.com/persistentComputeDomainAgent"] != "true" {
+		return fmt.Errorf("live Pod identity does not match persistent agent")
+	}
+	controller := metav1.GetControllerOf(pod)
+	if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" || controller.Name != "dra-driver-nvidia-gpu-persistent-agent" || controller.UID == "" {
+		return fmt.Errorf("persistent agent Pod owner is invalid")
+	}
+	oldValue, exists := pod.Annotations[nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation]
+	if value == oldValue && (value != "" || !exists) {
+		return nil
+	}
+	operations := []podJSONPatchOperation{
+		{Operation: "test", Path: "/metadata/uid", Value: string(pod.UID)},
+		{Operation: "test", Path: "/metadata/resourceVersion", Value: pod.ResourceVersion},
+	}
+	path := "/metadata/annotations/resource.nvidia.com~1computeDomainCliqueSnapshotApplied"
+	if value == "" {
+		operations = append(operations,
+			podJSONPatchOperation{Operation: "test", Path: path, Value: oldValue},
+			podJSONPatchOperation{Operation: "remove", Path: path},
+		)
+	} else if pod.Annotations == nil {
+		operations = append(operations, podJSONPatchOperation{Operation: "add", Path: "/metadata/annotations", Value: map[string]string{nvapi.ComputeDomainCliqueSnapshotAppliedAnnotation: value}})
+	} else {
+		operation := "add"
+		if exists {
+			operations = append(operations, podJSONPatchOperation{Operation: "test", Path: path, Value: oldValue})
+			operation = "replace"
+		}
+		operations = append(operations, podJSONPatchOperation{Operation: operation, Path: path, Value: value})
+	}
+	patch, err := json.Marshal(operations)
+	if err != nil {
+		return err
+	}
+	_, err = m.config.clientsets.Core.CoreV1().Pods(m.config.podNamespace).Patch(ctx, m.config.podName, types.JSONPatchType, patch, metav1.PatchOptions{})
+	metrics.ObserveCliqueAPIAction(string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1), metrics.CliqueAPIResourcePod, metrics.CliqueAPIOperationAppliedStateUpdate, metrics.CliqueAPIResultForError(err), err == nil)
+	return err
+}
+
 func (m *ComputeDomainCliqueSnapshotManager) PublishRetirementEvidence(ctx context.Context, state *ControllerSnapshotDesiredState) error {
 	if state == nil || state.RetirementEvidence == nil {
 		return fmt.Errorf("retirement evidence is missing")
@@ -186,18 +289,25 @@ func (m *ComputeDomainCliqueSnapshotManager) PublishRetirementEvidence(ctx conte
 		return fmt.Errorf("live Pod identity does not match retirement witness")
 	}
 	controller := metav1.GetControllerOf(pod)
-	if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" ||
-		controller.Name != state.daemonSetName || controller.UID != state.daemonSetUID {
+	validController := controller != nil && controller.APIVersion == "apps/v1" && controller.Kind == "DaemonSet"
+	if state.Protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		validController = validController && controller.Name == "dra-driver-nvidia-gpu-persistent-agent" && controller.UID != ""
+	} else {
+		validController = validController && controller.Name == state.daemonSetName && controller.UID == state.daemonSetUID
+	}
+	if !validController {
 		return fmt.Errorf("retirement witness Pod owner does not match snapshot DaemonSet")
+	}
+	computeDomainUID := string(state.ComputeDomainUID)
+	if computeDomainUID == "" {
+		computeDomainUID = m.config.computeDomainUUID
 	}
 	evidence := &nvapi.ComputeDomainCliqueRetirementEvidence{
 		TypeMeta: metav1.TypeMeta{APIVersion: nvapi.SchemeGroupVersion.String(), Kind: nvapi.ComputeDomainCliqueRetirementEvidenceKind},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      nvapi.ComputeDomainCliqueRetirementEvidenceName(spec.SnapshotUID, spec.Index),
 			Namespace: m.config.podNamespace,
-			Labels: map[string]string{
-				nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel: m.config.computeDomainUUID,
-			},
+			Labels:    map[string]string{nvapi.ComputeDomainCliqueRetirementEvidenceComputeDomainLabel: computeDomainUID},
 		},
 		Spec: spec,
 	}
@@ -219,6 +329,12 @@ func (m *ComputeDomainCliqueSnapshotManager) PublishRetirementEvidence(ctx conte
 }
 
 func (m *ComputeDomainCliqueSnapshotManager) enqueue(obj any) {
+	if m.config.protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		if m.informer.HasSynced() {
+			m.reconcilePersistentSnapshots()
+		}
+		return
+	}
 	snapshot, ok := obj.(*nvapi.ComputeDomainCliqueSnapshot)
 	if !ok {
 		return
@@ -226,6 +342,85 @@ func (m *ComputeDomainCliqueSnapshotManager) enqueue(obj any) {
 	if err := m.consume(snapshot); err != nil {
 		klog.Errorf("rejecting ComputeDomainCliqueSnapshot %s/%s: %v", snapshot.Namespace, snapshot.Name, err)
 	}
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) reconcilePersistentSnapshots() {
+	var nonterminal []*nvapi.ComputeDomainCliqueSnapshot
+	var fenced []*nvapi.ComputeDomainCliqueSnapshot
+	for _, object := range m.informer.GetStore().List() {
+		snapshot, ok := object.(*nvapi.ComputeDomainCliqueSnapshot)
+		if !ok || snapshot.DeletionTimestamp != nil {
+			continue
+		}
+		switch snapshot.Status.Phase {
+		case nvapi.ComputeDomainCliqueSnapshotPhasePending, nvapi.ComputeDomainCliqueSnapshotPhaseActive, nvapi.ComputeDomainCliqueSnapshotPhaseRetiring:
+			nonterminal = append(nonterminal, snapshot)
+		case nvapi.ComputeDomainCliqueSnapshotPhaseFenced:
+			fenced = append(fenced, snapshot)
+		}
+	}
+	if len(nonterminal) > 1 {
+		klog.Errorf("persistent agent found %d nonterminal snapshots for clique %q; preserving the current child and refusing new state", len(nonterminal), m.config.cliqueID)
+		return
+	}
+	for _, snapshot := range fenced {
+		m.acceptFenced(snapshot)
+	}
+	if len(nonterminal) == 0 && len(fenced) == 0 {
+		m.acceptReleasedReservation()
+	}
+	if len(nonterminal) == 1 {
+		if err := m.consume(nonterminal[0]); err != nil {
+			klog.Errorf("rejecting persistent-agent ComputeDomainCliqueSnapshot %s/%s: %v", nonterminal[0].Namespace, nonterminal[0].Name, err)
+		}
+	}
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) acceptReleasedReservation() {
+	m.mu.Lock()
+	retired := m.retired
+	currentUID := m.currentSnapshotUID
+	m.mu.Unlock()
+	if retired.uid == "" || retired.uid != currentUID || m.config.cliqueID == "" {
+		return
+	}
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, cdclique.ReservationName(m.config.cliqueID), metav1.GetOptions{})
+	metrics.ObserveCliqueAPIAction(string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1), metrics.CliqueAPIResourceReservation, metrics.CliqueAPIOperationGet, metrics.CliqueAPIResultForError(err), false)
+	if err != nil {
+		klog.Errorf("preserving retired persistent-agent state until its released reservation is observable: %v", err)
+		return
+	}
+	if reservation.Status.Phase != nvapi.ComputeDomainCliqueReservationPhaseReleased ||
+		reservation.Status.ReleaseReason != nvapi.ComputeDomainCliqueReservationReleaseReasonVerifiedFence ||
+		reservation.Status.SnapshotUID != retired.uid || reservation.Status.FencedGeneration < retired.generation ||
+		reservation.Status.FencedHash != retired.hash {
+		klog.Errorf("preserving retired persistent-agent state because reservation %q lacks exact fence release evidence", reservation.Name)
+		return
+	}
+	m.resetRetiredSnapshot(retired.uid)
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) acceptFenced(snapshot *nvapi.ComputeDomainCliqueSnapshot) {
+	m.resetRetiredSnapshot(snapshot.UID)
+}
+
+func (m *ComputeDomainCliqueSnapshotManager) resetRetiredSnapshot(expectedUID types.UID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retired.uid == "" || m.retired.uid != m.currentSnapshotUID || (expectedUID != "" && expectedUID != m.currentSnapshotUID) {
+		return
+	}
+	m.currentSnapshotUID = ""
+	m.currentGeneration = 0
+	m.currentHash = ""
+	m.desired = controllerSnapshotIdentity{}
+	m.applied = controllerSnapshotIdentity{}
+	m.retired = controllerSnapshotIdentity{}
+	m.retirementStarted = false
 }
 
 func (m *ComputeDomainCliqueSnapshotManager) consume(snapshot *nvapi.ComputeDomainCliqueSnapshot) error {
@@ -300,7 +495,23 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 	if snapshot.Namespace != m.config.podNamespace {
 		return nil, fmt.Errorf("snapshot namespace %q does not match daemon namespace %q", snapshot.Namespace, m.config.podNamespace)
 	}
-	if snapshot.Spec.ComputeDomainUID != types.UID(m.config.computeDomainUUID) {
+	protocol := nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol)
+	daemonProtocol := m.config.protocol
+	if daemonProtocol == "" {
+		daemonProtocol = nvapi.ComputeDomainCliqueProtocolControllerV1
+	}
+	if protocol != daemonProtocol {
+		return nil, fmt.Errorf("snapshot protocol %q does not match daemon protocol %q", protocol, daemonProtocol)
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		if snapshot.Name != cdclique.SnapshotName(string(snapshot.Spec.ComputeDomainUID), snapshot.Spec.CliqueID) ||
+			snapshot.Labels[computeDomainLabelKey] != string(snapshot.Spec.ComputeDomainUID) ||
+			snapshot.Labels[computeDomainCliqueLabelKey] != snapshot.Spec.CliqueID ||
+			snapshot.Labels["resource.nvidia.com/computeDomainCliqueProtocol"] != string(protocol) {
+			return nil, fmt.Errorf("persistent-agent snapshot has invalid canonical scope")
+		}
+	}
+	if m.config.protocol != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 && snapshot.Spec.ComputeDomainUID != types.UID(m.config.computeDomainUUID) {
 		return nil, fmt.Errorf("snapshot scope does not match this daemon")
 	}
 	if m.config.cliqueID != "" && snapshot.Spec.CliqueID != m.config.cliqueID {
@@ -313,7 +524,11 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 		return nil, fmt.Errorf("snapshot capacity %d does not match daemon capacity %d", snapshot.Spec.Capacity, m.config.maxNodesPerIMEXDomain)
 	}
 	controller := metav1.GetControllerOf(snapshot)
-	if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" || controller.Name == "" || controller.UID == "" {
+	if protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		if controller != nil {
+			return nil, fmt.Errorf("persistent-agent snapshot must not have a controller owner")
+		}
+	} else if controller == nil || controller.APIVersion != "apps/v1" || controller.Kind != "DaemonSet" || controller.Name == "" || controller.UID == "" {
 		return nil, fmt.Errorf("snapshot DaemonSet owner identity is incomplete")
 	}
 	if snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhasePending || snapshot.Status.Phase == nvapi.ComputeDomainCliqueSnapshotPhaseFenced {
@@ -326,6 +541,22 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 	members, err := cdclique.ValidatePublishedState(snapshot)
 	if err != nil {
 		return nil, err
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
+		ctx := m.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		reservation, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomainCliqueReservations().Get(ctx, cdclique.ReservationName(snapshot.Spec.CliqueID), metav1.GetOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("read active physical clique reservation: %w", err)
+		}
+		if reservation.Spec.CliqueID != snapshot.Spec.CliqueID || reservation.Spec.ComputeDomainUID != snapshot.Spec.ComputeDomainUID ||
+			reservation.Status.Phase != nvapi.ComputeDomainCliqueReservationPhaseActive || reservation.Status.SnapshotUID != snapshot.UID ||
+			reservation.Status.ActivationGeneration <= 0 || reservation.Status.ActivationGeneration > snapshot.Status.Generation ||
+			len(reservation.Status.ActivationHash) != cdclique.HashHexLength || reservation.Status.FencedGeneration != 0 {
+			return nil, fmt.Errorf("active physical clique reservation does not authorize snapshot")
+		}
 	}
 	var self *nvapi.ComputeDomainCliqueMember
 	daemons := make([]*nvapi.ComputeDomainDaemonInfo, 0, len(members))
@@ -357,9 +588,10 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 	}
 
 	state := &ControllerSnapshotDesiredState{
-		daemonSetName: controller.Name,
-		daemonSetUID:  controller.UID,
-		Members:       daemons,
+		ComputeDomainUID: snapshot.Spec.ComputeDomainUID,
+		CliqueID:         snapshot.Spec.CliqueID,
+		Protocol:         protocol,
+		Members:          daemons,
 		Receipt: &nvapi.ComputeDomainCliqueSnapshotReceipt{
 			SnapshotUID:        snapshot.UID,
 			SnapshotGeneration: snapshot.Status.Generation,
@@ -368,6 +600,10 @@ func (m *ComputeDomainCliqueSnapshotManager) validate(snapshot *nvapi.ComputeDom
 			PodUID:             self.PodUID,
 			Index:              self.Index,
 		},
+	}
+	if controller != nil {
+		state.daemonSetName = controller.Name
+		state.daemonSetUID = controller.UID
 	}
 	if retiring {
 		reason := nvapi.ComputeDomainCliqueRetirementEvidenceReasonProcessExit

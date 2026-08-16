@@ -31,6 +31,28 @@ kind: ServiceAccount
 metadata:
   name: compute-domain-daemon-reader-service-account
   namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCDaemonReaderRoleName" . }}
+rules:
+- apiGroups: ["resource.nvidia.com"]
+  resources: ["computedomaincliquereservations"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCDaemonReaderBindingName" . }}
+subjects:
+- kind: ServiceAccount
+  name: compute-domain-daemon-reader-service-account
+  namespace: {{ include "dra-driver-nvidia-gpu.namespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "dra-driver-nvidia-gpu.controllerOwnedCDCDaemonReaderRoleName" . }}
+  apiGroup: rbac.authorization.k8s.io
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

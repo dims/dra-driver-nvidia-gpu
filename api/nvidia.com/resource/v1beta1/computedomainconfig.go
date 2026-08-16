@@ -81,6 +81,11 @@ func EffectiveComputeDomainCliqueProtocol(protocol ComputeDomainCliqueProtocol) 
 	return protocol
 }
 
+func IsControllerOwnedComputeDomainCliqueProtocol(protocol ComputeDomainCliqueProtocol) bool {
+	protocol = EffectiveComputeDomainCliqueProtocol(protocol)
+	return protocol == ComputeDomainCliqueProtocolControllerV1 || protocol == ComputeDomainCliqueProtocolPersistentAgentV1
+}
+
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // ComputeDomainChannelConfig holds the set of parameters for configuring an ComputeDomainChannel.
