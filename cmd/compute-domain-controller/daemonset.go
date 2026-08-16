@@ -63,10 +63,11 @@ type DaemonSetTemplateData struct {
 type DaemonSetManager struct {
 	sync.Mutex
 
-	config           *ManagerConfig
-	waitGroup        sync.WaitGroup
-	cancelContext    context.CancelFunc
-	getComputeDomain GetComputeDomainFunc
+	config                    *ManagerConfig
+	waitGroup                 sync.WaitGroup
+	cancelContext             context.CancelFunc
+	getComputeDomain          GetComputeDomainFunc
+	updateComputeDomainStatus UpdateComputeDomainStatusFunc
 
 	factory       informers.SharedInformerFactory
 	informer      cache.SharedIndexInformer
@@ -99,10 +100,11 @@ func NewDaemonSetManager(config *ManagerConfig, getComputeDomain GetComputeDomai
 	informer := factory.Apps().V1().DaemonSets().Informer()
 
 	m := &DaemonSetManager{
-		config:           config,
-		getComputeDomain: getComputeDomain,
-		factory:          factory,
-		informer:         informer,
+		config:                    config,
+		getComputeDomain:          getComputeDomain,
+		updateComputeDomainStatus: updateComputeDomainStatus,
+		factory:                   factory,
+		informer:                  informer,
 	}
 	m.resourceClaimTemplateManager = NewDaemonSetResourceClaimTemplateManager(config, getComputeDomain)
 
@@ -495,6 +497,26 @@ func (m *DaemonSetManager) onAddOrUpdate(ctx context.Context, obj any) error {
 		return fmt.Errorf("error getting ComputeDomain: %w", err)
 	}
 	if cd == nil {
+		return nil
+	}
+
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err != nil {
+		return fmt.Errorf("invalid ComputeDomain clique protocol: %w", err)
+	}
+	if protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		status := nvapi.ComputeDomainStatusNotReady
+		if int(d.Status.NumberReady) == cd.Spec.NumNodes {
+			status = nvapi.ComputeDomainStatusReady
+		}
+		if cd.Status.Status == status {
+			return nil
+		}
+		newCD := cd.DeepCopy()
+		newCD.Status.Status = status
+		if _, err := m.updateComputeDomainStatus(ctx, newCD); err != nil {
+			return fmt.Errorf("error updating controller-v1 ComputeDomain status: %w", err)
+		}
 		return nil
 	}
 

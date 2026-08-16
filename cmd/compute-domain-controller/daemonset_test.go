@@ -17,9 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -64,4 +66,78 @@ func TestValidateExistingDaemonSetNormalizesAPIServerDefaults(t *testing.T) {
 	spoof := ds.DeepCopy()
 	spoof.Spec.Template.Spec.Containers[0].Env[0].Name = "ATTACKER_CONTROLLED"
 	require.Error(t, validateExistingDaemonSet(spoof, cd, config))
+}
+
+func TestControllerOwnedDaemonSetOwnsAggregateStatus(t *testing.T) {
+	cd := &nvapi.ComputeDomain{ObjectMeta: metav1.ObjectMeta{
+		Name: "domain", Namespace: "workload", UID: types.UID("cd-uid"),
+		Annotations: map[string]string{
+			nvapi.ComputeDomainCliqueProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+		},
+	}, Spec: nvapi.ComputeDomainSpec{NumNodes: 2}}
+	cd.Status.Status = nvapi.ComputeDomainStatusNotReady
+
+	updates := 0
+	m := &DaemonSetManager{
+		getComputeDomain: func(string) (*nvapi.ComputeDomain, error) {
+			return cd, nil
+		},
+		updateComputeDomainStatus: func(_ context.Context, updated *nvapi.ComputeDomain) (*nvapi.ComputeDomain, error) {
+			updates++
+			cd = updated.DeepCopy()
+			return cd, nil
+		},
+	}
+	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		computeDomainLabelKey: string(cd.UID),
+	}}}
+
+	// The first complete DaemonSet makes the aggregate status Ready.
+	ds.Status.NumberReady = 2
+	require.NoError(t, m.onAddOrUpdate(context.Background(), ds))
+	require.Equal(t, nvapi.ComputeDomainStatusReady, cd.Status.Status)
+	require.Equal(t, 1, updates)
+
+	// A semantically identical event does not write status again.
+	require.NoError(t, m.onAddOrUpdate(context.Background(), ds))
+	require.Equal(t, 1, updates)
+
+	// Daemon degradation is observable and recovery restores Ready.
+	ds.Status.NumberReady = 1
+	require.NoError(t, m.onAddOrUpdate(context.Background(), ds))
+	require.Equal(t, nvapi.ComputeDomainStatusNotReady, cd.Status.Status)
+	require.Equal(t, 2, updates)
+
+	ds.Status.NumberReady = 2
+	require.NoError(t, m.onAddOrUpdate(context.Background(), ds))
+	require.Equal(t, nvapi.ComputeDomainStatusReady, cd.Status.Status)
+	require.Equal(t, 3, updates)
+}
+
+func TestLegacyDaemonSetDegradationDoesNotTakeOverNodeAggregateStatus(t *testing.T) {
+	cd := &nvapi.ComputeDomain{ObjectMeta: metav1.ObjectMeta{
+		UID: types.UID("legacy-uid"),
+		Annotations: map[string]string{
+			nvapi.ComputeDomainCliqueProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolLegacyV1),
+		},
+	}, Spec: nvapi.ComputeDomainSpec{NumNodes: 2}}
+	cd.Status.Status = nvapi.ComputeDomainStatusReady
+
+	updates := 0
+	m := &DaemonSetManager{
+		getComputeDomain: func(string) (*nvapi.ComputeDomain, error) {
+			return cd, nil
+		},
+		updateComputeDomainStatus: func(_ context.Context, updated *nvapi.ComputeDomain) (*nvapi.ComputeDomain, error) {
+			updates++
+			return updated, nil
+		},
+	}
+	ds := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		computeDomainLabelKey: string(cd.UID),
+	}}, Status: appsv1.DaemonSetStatus{NumberReady: 1}}
+
+	require.NoError(t, m.onAddOrUpdate(context.Background(), ds))
+	require.Equal(t, nvapi.ComputeDomainStatusReady, cd.Status.Status)
+	require.Zero(t, updates)
 }

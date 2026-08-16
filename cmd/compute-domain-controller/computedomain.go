@@ -463,6 +463,19 @@ func (m *ComputeDomainManager) calculateGlobalStatus(cd *nvapi.ComputeDomain) st
 		return nvapi.ComputeDomainStatusReady
 	}
 
+	// Controller-v1 does not populate the legacy ComputeDomain.Status.Nodes
+	// list. Its aggregate status is owned by the per-ComputeDomain DaemonSet
+	// handler, which observes the readiness probe backed by the local IMEX
+	// process. Preserve that value across unrelated ComputeDomain and condition
+	// updates instead of overwriting it with legacy node aggregation.
+	protocol, err := computeDomainCliqueProtocol(cd)
+	if err == nil && protocol == nvapi.ComputeDomainCliqueProtocolControllerV1 {
+		if cd.Status.Status == nvapi.ComputeDomainStatusReady {
+			return nvapi.ComputeDomainStatusReady
+		}
+		return nvapi.ComputeDomainStatusNotReady
+	}
+
 	// Mark the ComputeDomain as not ready if not enough nodes are present in the nodes list.
 	if len(cd.Status.Nodes) < cd.Spec.NumNodes {
 		return nvapi.ComputeDomainStatusNotReady

@@ -53,6 +53,31 @@ func TestCalculateGlobalStatusDriverManagedUnaffected(t *testing.T) {
 	require.Equal(t, nvapi.ComputeDomainStatusNotReady, m.calculateGlobalStatus(cd))
 }
 
+func TestCalculateGlobalStatusControllerOwnedPreservesDaemonStatus(t *testing.T) {
+	m := &ComputeDomainManager{
+		config: &ManagerConfig{
+			imexConfig: imex.Config{Mode: imex.ModeDriverManaged},
+		},
+	}
+
+	cd := &nvapi.ComputeDomain{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		nvapi.ComputeDomainCliqueProtocolAnnotation: string(nvapi.ComputeDomainCliqueProtocolControllerV1),
+	}}}
+	cd.Spec.NumNodes = 2
+
+	// Controller-v1 intentionally has no legacy Status.Nodes entries. The
+	// DaemonSet-owned aggregate value must survive every unrelated status
+	// update instead of being recalculated from that empty list.
+	cd.Status.Status = nvapi.ComputeDomainStatusReady
+	require.Equal(t, nvapi.ComputeDomainStatusReady, m.calculateGlobalStatus(cd))
+
+	cd.Status.Status = nvapi.ComputeDomainStatusNotReady
+	require.Equal(t, nvapi.ComputeDomainStatusNotReady, m.calculateGlobalStatus(cd))
+
+	cd.Status.Status = ""
+	require.Equal(t, nvapi.ComputeDomainStatusNotReady, m.calculateGlobalStatus(cd))
+}
+
 func TestSelectComputeDomainCliqueProtocol(t *testing.T) {
 	tests := []struct {
 		name      string
