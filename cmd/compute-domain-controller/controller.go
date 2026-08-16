@@ -223,7 +223,7 @@ func (c *Controller) Run(ctx context.Context) error {
 // that default is disabled. A legacy-only installation does not require the
 // alpha CRDs, installation marker, topology publishing, or leader election.
 func controllerOwnedStateRequired(ctx context.Context, config *Config) (bool, error) {
-	if featuregates.Enabled(featuregates.ControllerOwnedCDCliques) {
+	if featuregates.Enabled(featuregates.ControllerOwnedCDCliques) || featuregates.Enabled(featuregates.PersistentComputeDomainAgents) {
 		return true, nil
 	}
 	computeDomains, err := config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains("").List(ctx, metav1.ListOptions{})
@@ -231,7 +231,8 @@ func controllerOwnedStateRequired(ctx context.Context, config *Config) (bool, er
 		return false, fmt.Errorf("check persisted ComputeDomain protocols: %w", err)
 	}
 	for i := range computeDomains.Items {
-		if computeDomains.Items[i].Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation] == string(nvapi.ComputeDomainCliqueProtocolControllerV1) {
+		protocol := computeDomains.Items[i].Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation]
+		if protocol == string(nvapi.ComputeDomainCliqueProtocolControllerV1) || protocol == string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1) {
 			return true, nil
 		}
 	}

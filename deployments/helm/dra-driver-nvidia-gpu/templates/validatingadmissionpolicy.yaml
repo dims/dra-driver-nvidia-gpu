@@ -579,18 +579,18 @@ spec:
       request.operation != 'CREATE' ||
       !has(object.metadata.annotations) ||
       !('resource.nvidia.com/requestedComputeDomainCliqueProtocol' in object.metadata.annotations) ||
-      object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] != 'controller-v1' ||
+      !(object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] in ['controller-v1', 'persistent-agent-v1']) ||
       params != null &&
       params.rules.exists(r,
         r.apiGroups == ['controller-owned-cdc.resource.nvidia.com'] &&
         r.resources == ['canarynamespaces'] &&
         has(r.resourceNames) && object.metadata.namespace in r.resourceNames)
-    message: controller-v1 is an operator-controlled canary protocol and this namespace is not allowlisted by controllerOwnedCDCliques.canaryNamespaces
+    message: controller-owned protocols are operator-controlled canaries and this namespace is not allowlisted by controllerOwnedCDCliques.canaryNamespaces
   - expression: >-
       request.operation == 'CREATE' ?
         (!has(object.metadata.annotations) ||
          !('resource.nvidia.com/requestedComputeDomainCliqueProtocol' in object.metadata.annotations) ||
-         object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] in ['legacy-v1', 'controller-v1']) :
+         object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] in ['legacy-v1', 'controller-v1', 'persistent-agent-v1']) :
         ((!has(oldObject.metadata.annotations) ||
           !('resource.nvidia.com/requestedComputeDomainCliqueProtocol' in oldObject.metadata.annotations)) ?
            (!has(object.metadata.annotations) ||
@@ -599,7 +599,7 @@ spec:
             'resource.nvidia.com/requestedComputeDomainCliqueProtocol' in object.metadata.annotations &&
             object.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol'] ==
             oldObject.metadata.annotations['resource.nvidia.com/requestedComputeDomainCliqueProtocol']))
-    message: requestedComputeDomainCliqueProtocol must be legacy-v1 or controller-v1 and is immutable after creation
+    message: requestedComputeDomainCliqueProtocol must be legacy-v1, controller-v1, or persistent-agent-v1 and is immutable after creation
   - expression: >-
       request.operation != 'CREATE' ||
       !has(object.metadata.annotations) ||
@@ -608,8 +608,8 @@ spec:
   - expression: >-
       !has(object.metadata.annotations) ||
       !('resource.nvidia.com/computeDomainCliqueProtocol' in object.metadata.annotations) ||
-      object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol'] in ['legacy-v1', 'controller-v1']
-    message: the ComputeDomain clique protocol must be legacy-v1 or controller-v1
+      object.metadata.annotations['resource.nvidia.com/computeDomainCliqueProtocol'] in ['legacy-v1', 'controller-v1', 'persistent-agent-v1']
+    message: the ComputeDomain clique protocol must be legacy-v1, controller-v1, or persistent-agent-v1
   - expression: >-
       request.operation == 'CREATE' ||
       (has(oldObject.metadata.annotations) &&

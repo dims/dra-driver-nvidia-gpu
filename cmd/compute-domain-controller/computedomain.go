@@ -519,6 +519,7 @@ func (m *ComputeDomainManager) addFinalizer(ctx context.Context, cd *nvapi.Compu
 		protocol, err := selectComputeDomainCliqueProtocol(
 			cd,
 			featuregates.Enabled(featuregates.ControllerOwnedCDCliques),
+			featuregates.Enabled(featuregates.PersistentComputeDomainAgents),
 			m.config.controllerOwnedCDCliquesAvailable,
 		)
 		if err != nil {
@@ -543,7 +544,7 @@ func (m *ComputeDomainManager) addFinalizer(ctx context.Context, cd *nvapi.Compu
 	return nil
 }
 
-func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnabled, snapshotAPIAvailable bool) (nvapi.ComputeDomainCliqueProtocol, error) {
+func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnabled, persistentAgentEnabled, snapshotAPIAvailable bool) (nvapi.ComputeDomainCliqueProtocol, error) {
 	requested := nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueRequestedProtocolAnnotation])
 	if requested != "" {
 		if err := nvapi.ValidateComputeDomainCliqueProtocol(requested); err != nil {
@@ -553,17 +554,17 @@ func selectComputeDomainCliqueProtocol(cd *nvapi.ComputeDomain, controllerEnable
 
 	// A marker-less object which already has our finalizer predates protocol
 	// selection and must remain legacy. Only a newly admitted object can opt
-	// into controller-v1.
-	if slices.Contains(cd.Finalizers, computeDomainFinalizer) || requested != nvapi.ComputeDomainCliqueProtocolControllerV1 {
+	// into a controller-owned protocol.
+	if slices.Contains(cd.Finalizers, computeDomainFinalizer) || (requested != nvapi.ComputeDomainCliqueProtocolControllerV1 && requested != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1) {
 		return nvapi.ComputeDomainCliqueProtocolLegacyV1, nil
 	}
 	if cd.Spec.NumNodes <= 0 {
-		return "", fmt.Errorf("controller-v1 requires spec.numNodes to declare the complete expected Node set")
+		return "", fmt.Errorf("%s requires spec.numNodes to declare the complete expected Node set", requested)
 	}
-	if !controllerEnabled || !snapshotAPIAvailable {
-		return "", fmt.Errorf("controller-v1 was requested but the ControllerOwnedCDCliques feature gate and snapshot API are not both available")
+	if !snapshotAPIAvailable || (requested == nvapi.ComputeDomainCliqueProtocolControllerV1 && !controllerEnabled) || (requested == nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 && !persistentAgentEnabled) {
+		return "", fmt.Errorf("%s was requested but its feature gate and the snapshot API are not both available", requested)
 	}
-	return nvapi.ComputeDomainCliqueProtocolControllerV1, nil
+	return requested, nil
 }
 
 func computeDomainCliqueProtocol(cd *nvapi.ComputeDomain) (nvapi.ComputeDomainCliqueProtocol, error) {

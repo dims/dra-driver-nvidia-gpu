@@ -41,6 +41,7 @@ func TestComputeDomainCliqueSnapshotSchemeRoundTrip(t *testing.T) {
 			ComputeDomainUID: types.UID("compute-domain-uid"),
 			CliqueID:         "clique-0",
 			Capacity:         18,
+			Protocol:         ComputeDomainCliqueProtocolPersistentAgentV1,
 		},
 		Status: ComputeDomainCliqueSnapshotStatus{
 			Phase:      ComputeDomainCliqueSnapshotPhaseActive,
@@ -89,6 +90,11 @@ func TestComputeDomainCliqueSnapshotSchemeRoundTrip(t *testing.T) {
 			assertSchemeRoundTrip(t, test.in)
 		})
 	}
+}
+
+func TestComputeDomainCliqueSnapshotProtocolCompatibility(t *testing.T) {
+	require.Equal(t, ComputeDomainCliqueProtocolControllerV1, EffectiveComputeDomainCliqueSnapshotProtocol(""))
+	require.Equal(t, ComputeDomainCliqueProtocolPersistentAgentV1, EffectiveComputeDomainCliqueSnapshotProtocol(ComputeDomainCliqueProtocolPersistentAgentV1))
 }
 
 func TestComputeDomainCliqueReservationSchemeRoundTrip(t *testing.T) {

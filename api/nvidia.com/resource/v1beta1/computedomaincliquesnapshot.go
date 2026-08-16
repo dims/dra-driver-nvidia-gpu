@@ -93,6 +93,19 @@ type ComputeDomainCliqueSnapshotSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1024
 	Capacity int `json:"capacity"`
+	// Protocol selects the daemon provider. Empty is the historical spelling
+	// of controller-v1 for snapshots created before this field existed.
+	// +kubebuilder:validation:Enum=controller-v1;persistent-agent-v1
+	Protocol ComputeDomainCliqueProtocol `json:"protocol,omitempty"`
+}
+
+// EffectiveComputeDomainCliqueSnapshotProtocol preserves old snapshots while
+// keeping the general marker-less ComputeDomain default as legacy-v1.
+func EffectiveComputeDomainCliqueSnapshotProtocol(protocol ComputeDomainCliqueProtocol) ComputeDomainCliqueProtocol {
+	if protocol == "" {
+		return ComputeDomainCliqueProtocolControllerV1
+	}
+	return protocol
 }
 
 type ComputeDomainCliqueSnapshotStatus struct {

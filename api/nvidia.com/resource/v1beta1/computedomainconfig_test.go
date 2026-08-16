@@ -37,6 +37,11 @@ func TestComputeDomainCliqueProtocolCompatibility(t *testing.T) {
 	daemon.DomainID = "domain"
 	daemon.Protocol = ComputeDomainCliqueProtocolControllerV1
 	require.NoError(t, daemon.Validate())
+
+	channel.Protocol = ComputeDomainCliqueProtocolPersistentAgentV1
+	require.NoError(t, channel.Validate())
+	require.Equal(t, ComputeDomainCliqueProtocolControllerV1, EffectiveComputeDomainCliqueSnapshotProtocol(""))
+	require.Equal(t, ComputeDomainCliqueProtocolPersistentAgentV1, EffectiveComputeDomainCliqueSnapshotProtocol(ComputeDomainCliqueProtocolPersistentAgentV1))
 }
 
 func TestComputeDomainDaemonModeCompatibility(t *testing.T) {

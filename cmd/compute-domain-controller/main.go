@@ -275,9 +275,10 @@ func newApp() *cli.App {
 				// ComputeDomainClique objects in host-managed mode, so these gates
 				// are meaningless (and their defaults would otherwise conflict).
 				if err := featuregates.FeatureGates().SetFromMap(map[string]bool{
-					string(featuregates.IMEXDaemonsWithDNSNames):  false,
-					string(featuregates.ComputeDomainCliques):     false,
-					string(featuregates.ControllerOwnedCDCliques): false,
+					string(featuregates.IMEXDaemonsWithDNSNames):       false,
+					string(featuregates.ComputeDomainCliques):          false,
+					string(featuregates.ControllerOwnedCDCliques):      false,
+					string(featuregates.PersistentComputeDomainAgents): false,
 				}); err != nil {
 					return fmt.Errorf("error forcing feature gates for hostManaged IMEX: %w", err)
 				}

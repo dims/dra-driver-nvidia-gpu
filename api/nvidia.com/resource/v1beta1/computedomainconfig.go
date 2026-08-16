@@ -33,8 +33,9 @@ type ComputeDomainCliqueProtocol string
 type ComputeDomainDaemonMode string
 
 const (
-	ComputeDomainCliqueProtocolLegacyV1     ComputeDomainCliqueProtocol = "legacy-v1"
-	ComputeDomainCliqueProtocolControllerV1 ComputeDomainCliqueProtocol = "controller-v1"
+	ComputeDomainCliqueProtocolLegacyV1          ComputeDomainCliqueProtocol = "legacy-v1"
+	ComputeDomainCliqueProtocolControllerV1      ComputeDomainCliqueProtocol = "controller-v1"
+	ComputeDomainCliqueProtocolPersistentAgentV1 ComputeDomainCliqueProtocol = "persistent-agent-v1"
 
 	ComputeDomainDaemonModePerDomain       ComputeDomainDaemonMode = "PerDomain"
 	ComputeDomainDaemonModePersistentAgent ComputeDomainDaemonMode = "PersistentAgent"
@@ -55,7 +56,7 @@ const (
 // is accepted only as the backward-compatible spelling of legacy-v1.
 func ValidateComputeDomainCliqueProtocol(protocol ComputeDomainCliqueProtocol) error {
 	switch protocol {
-	case "", ComputeDomainCliqueProtocolLegacyV1, ComputeDomainCliqueProtocolControllerV1:
+	case "", ComputeDomainCliqueProtocolLegacyV1, ComputeDomainCliqueProtocolControllerV1, ComputeDomainCliqueProtocolPersistentAgentV1:
 		return nil
 	default:
 		return fmt.Errorf("unknown compute domain clique protocol %q", protocol)

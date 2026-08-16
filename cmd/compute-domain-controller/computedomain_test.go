@@ -80,17 +80,20 @@ func TestCalculateGlobalStatusControllerOwnedPreservesDaemonStatus(t *testing.T)
 
 func TestSelectComputeDomainCliqueProtocol(t *testing.T) {
 	tests := []struct {
-		name      string
-		requested string
-		finalized bool
-		gate      bool
-		api       bool
-		want      nvapi.ComputeDomainCliqueProtocol
-		wantErr   bool
+		name           string
+		requested      string
+		finalized      bool
+		gate           bool
+		persistentGate bool
+		api            bool
+		want           nvapi.ComputeDomainCliqueProtocol
+		wantErr        bool
 	}{
 		{name: "markerless remains legacy", want: nvapi.ComputeDomainCliqueProtocolLegacyV1},
 		{name: "explicit legacy remains legacy", requested: string(nvapi.ComputeDomainCliqueProtocolLegacyV1), gate: true, api: true, want: nvapi.ComputeDomainCliqueProtocolLegacyV1},
 		{name: "explicit controller canary", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), gate: true, api: true, want: nvapi.ComputeDomainCliqueProtocolControllerV1},
+		{name: "explicit persistent-agent canary", requested: string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1), persistentGate: true, api: true, want: nvapi.ComputeDomainCliqueProtocolPersistentAgentV1},
+		{name: "persistent-agent request fails when gate is off", requested: string(nvapi.ComputeDomainCliqueProtocolPersistentAgentV1), api: true, wantErr: true},
 		{name: "controller request fails when gate is off", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), api: true, wantErr: true},
 		{name: "controller request fails when API is absent", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), gate: true, wantErr: true},
 		{name: "old finalized object cannot switch protocols", requested: string(nvapi.ComputeDomainCliqueProtocolControllerV1), finalized: true, gate: true, api: true, want: nvapi.ComputeDomainCliqueProtocolLegacyV1},
@@ -105,7 +108,7 @@ func TestSelectComputeDomainCliqueProtocol(t *testing.T) {
 			if test.finalized {
 				cd.Finalizers = []string{computeDomainFinalizer}
 			}
-			got, err := selectComputeDomainCliqueProtocol(cd, test.gate, test.api)
+			got, err := selectComputeDomainCliqueProtocol(cd, test.gate, test.persistentGate, test.api)
 			if test.wantErr {
 				require.Error(t, err)
 				return
@@ -123,7 +126,7 @@ func TestSelectComputeDomainCliqueProtocolAllowsDomainAcrossMultipleCliques(t *t
 		}},
 		Spec: nvapi.ComputeDomainSpec{NumNodes: 144},
 	}
-	protocol, err := selectComputeDomainCliqueProtocol(cd, true, true)
+	protocol, err := selectComputeDomainCliqueProtocol(cd, true, false, true)
 	require.NoError(t, err)
 	require.Equal(t, nvapi.ComputeDomainCliqueProtocolControllerV1, protocol)
 }

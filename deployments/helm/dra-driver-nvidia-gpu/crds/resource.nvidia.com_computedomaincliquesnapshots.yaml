@@ -73,6 +73,14 @@ spec:
                 x-kubernetes-validations:
                 - message: computeDomainUID must not be empty
                   rule: self != ''
+              protocol:
+                description: |-
+                  Protocol selects the daemon provider. Empty is the historical spelling
+                  of controller-v1 for snapshots created before this field existed.
+                enum:
+                - controller-v1
+                - persistent-agent-v1
+                type: string
             required:
             - capacity
             - cliqueID

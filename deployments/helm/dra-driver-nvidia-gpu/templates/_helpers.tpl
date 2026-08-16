@@ -444,4 +444,16 @@ implementation.
 {{- if and $enabled (include "dra-driver-nvidia-gpu.hostManagedIMEX" .) -}}
   {{- fail "featureGates.PersistentComputeDomainAgents=true is incompatible with resources.computeDomains.imex.mode=hostManaged" -}}
 {{- end -}}
+{{- if and $enabled (.Capabilities.APIVersions.Has "security.openshift.io/v1/SecurityContextConstraints") -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true is not supported on OpenShift in this alpha" -}}
+{{- end -}}
+{{- if and $enabled (not .Values.kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires kubeletPlugin.containers.computeDomains.gpuCliqueLabelEnabled=true" -}}
+{{- end -}}
+{{- if and $enabled (not .Values.controller.leaderElection.enabled) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires controller.leaderElection.enabled=true" -}}
+{{- end -}}
+{{- if and $enabled (and (hasKey .Values.featureGates "CrashOnNVLinkFabricErrors") (not .Values.featureGates.CrashOnNVLinkFabricErrors)) -}}
+  {{- fail "featureGates.PersistentComputeDomainAgents=true requires featureGates.CrashOnNVLinkFabricErrors=true" -}}
+{{- end -}}
 {{- end -}}
