@@ -621,7 +621,7 @@ func TestApplyComputeDomainDaemonConfigHostManagedRejected(t *testing.T) {
 
 func TestApplyPersistentAgentDaemonConfig(t *testing.T) {
 	old := featuregates.Enabled(featuregates.PersistentComputeDomainAgents)
-	require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{string(featuregates.PersistentComputeDomainAgents): true}))
+	require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{string(featuregates.PersistentComputeDomainAgents): false}))
 	t.Cleanup(func() {
 		require.NoError(t, featuregates.FeatureGates().SetFromMap(map[string]bool{string(featuregates.PersistentComputeDomainAgents): old}))
 	})

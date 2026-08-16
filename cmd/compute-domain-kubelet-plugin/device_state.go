@@ -831,9 +831,9 @@ func (s *DeviceState) applyComputeDomainDaemonConfig(ctx context.Context, config
 }
 
 func (s *DeviceState) applyPersistentAgentDaemonConfig(ctx context.Context, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
-	if !featuregates.Enabled(featuregates.PersistentComputeDomainAgents) {
-		return nil, permanentError{fmt.Errorf("persistent agent claim requires feature gate %s", featuregates.PersistentComputeDomainAgents)}
-	}
+	// The mode is persisted in the allocated claim. New requests are gated by
+	// the controller and chart, but kubelet must continue preparing an existing
+	// installation agent after the admission gate is disabled.
 	if claim.Namespace != s.config.flags.namespace {
 		return nil, permanentError{fmt.Errorf("persistent agent claim namespace %q does not match driver namespace %q", claim.Namespace, s.config.flags.namespace)}
 	}
