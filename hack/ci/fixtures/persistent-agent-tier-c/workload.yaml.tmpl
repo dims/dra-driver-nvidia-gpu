@@ -1,0 +1,39 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${WORKLOAD_NAME}
+  namespace: ${TRIAL_NAMESPACE}
+  labels:
+    resource.nvidia.com/scale-promotion-trial: ${TRIAL_ID}
+spec:
+  completions: ${EXPECTED_PODS}
+  parallelism: ${EXPECTED_PODS}
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        resource.nvidia.com/scale-promotion-trial: ${TRIAL_ID}
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        ${TIER_C_NODE_SELECTOR_KEY}: "${TIER_C_NODE_SELECTOR_VALUE}"
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                resource.nvidia.com/scale-promotion-trial: ${TRIAL_ID}
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: workload
+        image: ${WORKLOAD_IMAGE}
+        command:
+        - /agnhost
+        - pause
+        resources:
+          claims:
+          - name: compute-domain-channel
+      resourceClaims:
+      - name: compute-domain-channel
+        resourceClaimTemplateName: ${CHANNEL_TEMPLATE_NAME}

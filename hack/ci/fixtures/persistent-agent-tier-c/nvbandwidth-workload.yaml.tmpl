@@ -1,0 +1,76 @@
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: ${WORKLOAD_NAME}
+  namespace: ${TRIAL_NAMESPACE}
+  labels:
+    resource.nvidia.com/scale-promotion-trial: ${TRIAL_ID}
+spec:
+  slotsPerWorker: ${NVB_GPUS_PER_NODE}
+  launcherCreationPolicy: WaitForWorkersReady
+  runPolicy:
+    cleanPodPolicy: Running
+  sshAuthMountPath: /home/mpiuser/.ssh
+  mpiReplicaSpecs:
+    Launcher:
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            resource.nvidia.com/scale-promotion-launcher: ${TRIAL_ID}
+        spec:
+          containers:
+          - name: mpi-launcher
+            image: ${NVB_IMAGE}
+            securityContext:
+              runAsUser: 1000
+            command:
+            - sh
+            - -c
+            - |
+              exec mpirun \
+                --show-progress \
+                --bind-to core \
+                --map-by ppr:${NVB_GPUS_PER_NODE}:node \
+                -np ${NVB_NUM_RANKS} \
+                --report-bindings \
+                nvbandwidth \
+                --verbose \
+                --testSamples ${NVB_REPS_PER_BENCHMARK} \
+                --bufferSize ${NVB_BUFSIZE_PER_BENCHMARK_REP} \
+                -t multinode_device_to_device_memcpy_read_ce
+    Worker:
+      replicas: ${EXPECTED_PODS}
+      template:
+        metadata:
+          labels:
+            resource.nvidia.com/scale-promotion-trial: ${TRIAL_ID}
+        spec:
+          nodeSelector:
+            ${TIER_C_NODE_SELECTOR_KEY}: "${TIER_C_NODE_SELECTOR_VALUE}"
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels:
+                    resource.nvidia.com/scale-promotion-trial: ${TRIAL_ID}
+                topologyKey: kubernetes.io/hostname
+          containers:
+          - name: mpi-worker
+            image: ${NVB_IMAGE}
+            securityContext:
+              runAsUser: 1000
+            command:
+            - /usr/sbin/sshd
+            args:
+            - -De
+            - -f
+            - /home/mpiuser/.sshd_config
+            resources:
+              limits:
+                nvidia.com/gpu: ${NVB_GPUS_PER_NODE}
+              claims:
+              - name: compute-domain-channel
+          resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: ${CHANNEL_TEMPLATE_NAME}

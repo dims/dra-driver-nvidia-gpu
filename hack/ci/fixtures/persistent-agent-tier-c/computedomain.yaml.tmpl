@@ -1,0 +1,12 @@
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: ${COMPUTE_DOMAIN_NAME}
+  namespace: ${TRIAL_NAMESPACE}
+  labels:
+    resource.nvidia.com/scale-promotion-trial: ${TRIAL_ID}
+spec:
+  numNodes: ${EXPECTED_PODS}
+  channel:
+    resourceClaimTemplate:
+      name: ${CHANNEL_TEMPLATE_NAME}

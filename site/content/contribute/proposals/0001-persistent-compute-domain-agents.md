@@ -161,7 +161,7 @@ This does not prove that an unrecorded historical IMEX process is dead. The firs
 
 Persistent agents remove the largest startup fan-out: per-domain daemon claims and Pods. The clique protocol's first-formation work for `N` selected Nodes across `C` physical cliques is exactly `N + 5*C` confirmed writes in the healthy path: `N` Node attestations plus, per clique, one reservation create, one snapshot create, one snapshot finalizer update, one reservation activation-status update, and one Active snapshot status update. The additional reservation validation GET makes the clique action count `N + 6*C`. A complete controller accounting for `D` ComputeDomains also includes one readiness-status write and its live GET per domain, for `N + 5*C + D` writes and `N + 6*C + 2*D` actions. Reads and idempotent actions remain separate from confirmed writes.
 
-The controller uses one shared Node informer, indexed lookups by ComputeDomain, clique, Node, Pod UID, claim, and template, and keyed serialization for reservation creation and aggregate status. The current claim-attestation caches are cluster-wide. A disposable real-API gate measures controller HTTP and watch bytes, exact writes, conflicts, throttling, Active, and receipt-backed Ready at 18, 144, and 280x18. Cache memory, full-Node update behavior on real Nodes, scheduler and kubelet work, and end-to-end T0-T3 remain explicit pre-beta measurements.
+The controller uses one shared Node informer, indexed lookups by ComputeDomain, clique, Node, Pod UID, claim, and template, and keyed serialization for reservation creation and aggregate status. The current claim-attestation caches are cluster-wide. A disposable real-API gate measures controller HTTP and watch bytes, exact writes, conflicts, throttling, Active, and receipt-backed Ready at 18, 144, and 280x18. The Tier C runner separately collects exact workload Pod, reserved claim, timestamped kubelet NodePrepare, container Ready, and optional audit/data-plane evidence on real schedulable Nodes. The Tier D runner repeats the 280x18 virtual-node control-plane profile over digest-pinned stable Kubernetes patch images with version-matched clients and samples control-plane resource use. Local Kind has passed this matrix on the currently supported v1.34, v1.35, and v1.36 minors. Current two-Node Krusty availability can validate the real Tier C path directionally, but cannot supply the required 18/144-node end-to-end samples.
 
 ## Security boundary
 
@@ -199,13 +199,15 @@ Before merge:
 - Helm default compatibility and feature-on validation;
 - real API-server admission tests, including teardown, second-install denial, and agent Pod-bound token writes;
 - disposable real-API 18/144/280x18 formation with exact write, 409/429, watch-byte, Active, Ready, and steady-state no-op assertions;
+- Kind validation of the T0-T3 analyzer, artifact schema, and promotion guards;
+- executable real-node Tier C and multi-version virtual-node Tier D runners;
 - allocator, hash, and indexed-reconcile benchmarks.
 
 Before widening the alpha:
 
 - genuine-fabric 2-node formation, IMEX connectivity, retirement, reboot evidence, and exact-ID reuse;
-- 18-node and 144-node clique shapes;
-- 280x18 informer/API-byte and T0-T3 convergence evidence;
+- 18-node and 144-node scheduler/kubelet/container/IMEX T0-T3 comparisons across supported capable stable Kubernetes minors;
+- oldest/newest-capable-minor 280x18 informer/API-byte/control-plane profiles, paired with the largest available genuine-node run;
 - planned agent maintenance and unplanned same-boot replacement exercises;
 - gate-disable retirement with both healthy and quarantined members;
 - clean decommission followed by legacy reuse.
