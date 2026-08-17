@@ -120,8 +120,8 @@ type PersistentAgentManager struct {
 	reservationMu         sync.RWMutex
 	validatedReservations map[string]nvapi.ComputeDomainCliqueReservationSpec
 	validatedActivations  map[string]types.UID
-	reservationLocksMu    sync.Mutex
-	reservationLocks      map[string]*sync.Mutex
+	keyedLocksMu          sync.Mutex
+	keyedLocks            map[string]*sync.Mutex
 	liveAttestationCheck  func(*corev1.Node) bool
 	formationWarningsMu   sync.Mutex
 	formationWarnings     map[string]struct{}
@@ -242,7 +242,7 @@ func NewPersistentAgentManager(config *ManagerConfig) *PersistentAgentManager {
 		pendingScopes:         make(map[string]snapshotScope),
 		validatedReservations: make(map[string]nvapi.ComputeDomainCliqueReservationSpec),
 		validatedActivations:  make(map[string]types.UID),
-		reservationLocks:      make(map[string]*sync.Mutex),
+		keyedLocks:            make(map[string]*sync.Mutex),
 		formationWarnings:     make(map[string]struct{}),
 		formationEventSink:    config.formationEventSink,
 		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
@@ -728,6 +728,9 @@ func (m *PersistentAgentManager) updatePersistentComputeDomainStatusForKey(ctx c
 	if !ok || nvapi.EffectiveComputeDomainCliqueSnapshotProtocol(snapshot.Spec.Protocol) != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
 		return nil
 	}
+	lock := m.keyedLock("compute-domain-status/" + string(snapshot.Spec.ComputeDomainUID))
+	lock.Lock()
+	defer lock.Unlock()
 	owners, err := m.computeDomainInformer.GetIndexer().ByIndex("uid", string(snapshot.Spec.ComputeDomainUID))
 	if err != nil || len(owners) != 1 {
 		return err
@@ -745,17 +748,25 @@ func (m *PersistentAgentManager) updatePersistentComputeDomainStatusForKey(ctx c
 		return nil
 	}
 	live, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(owner.Namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+	observeCliqueAPIAction(metrics.CliqueAPIResourceComputeDomain, metrics.CliqueAPIOperationGet, err, nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
 	if err != nil {
 		return err
 	}
 	if live.UID != owner.UID {
 		return fmt.Errorf("ComputeDomain identity changed while updating persistent-agent status")
 	}
+	if live.Status.Status == desired {
+		return m.computeDomainInformer.GetStore().Update(live)
+	}
 	updated := live.DeepCopy()
 	updated.Status.Status = desired
-	_, err = m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(owner.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+	result, err := m.config.clientsets.Nvidia.ResourceV1beta1().ComputeDomains(owner.Namespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+	observeCliqueAPIAction(metrics.CliqueAPIResourceComputeDomain, metrics.CliqueAPIOperationStatusUpdate, err, nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
 	if err == nil {
 		metrics.ObserveComputeDomainStatus(string(owner.UID), desired)
+		if cacheErr := m.computeDomainInformer.GetStore().Update(result); cacheErr != nil {
+			return cacheErr
+		}
 	}
 	return err
 }
@@ -1016,6 +1027,9 @@ func (m *PersistentAgentManager) createSnapshotForPodSet(ctx context.Context, na
 	}
 	if err == nil {
 		m.recordWrite(namespace+"/"+name, created.ResourceVersion)
+		if cacheErr := m.snapshotInformer.GetStore().Add(created); cacheErr != nil {
+			return cacheErr
+		}
 		m.pendingMu.Lock()
 		delete(m.pendingScopes, namespace+"/"+name)
 		m.pendingMu.Unlock()
@@ -1041,7 +1055,7 @@ func (m *PersistentAgentManager) reservePhysicalClique(ctx context.Context, owne
 	// Serialize only callers for this physical clique. Different cliques keep
 	// reconciling concurrently, while the normal first-formation path performs
 	// one Create instead of racing into an avoidable AlreadyExists plus GET.
-	lock := m.reservationLock(reservation.Name)
+	lock := m.keyedLock("reservation/" + reservation.Name)
 	lock.Lock()
 	defer lock.Unlock()
 	if m.reservationMatchesMemo(reservation.Name, reservation.Spec) {
@@ -1072,13 +1086,13 @@ func (m *PersistentAgentManager) reservePhysicalClique(ctx context.Context, owne
 	return m.validateAndRememberReservation(existing, reservation.Spec)
 }
 
-func (m *PersistentAgentManager) reservationLock(name string) *sync.Mutex {
-	m.reservationLocksMu.Lock()
-	defer m.reservationLocksMu.Unlock()
-	lock := m.reservationLocks[name]
+func (m *PersistentAgentManager) keyedLock(name string) *sync.Mutex {
+	m.keyedLocksMu.Lock()
+	defer m.keyedLocksMu.Unlock()
+	lock := m.keyedLocks[name]
 	if lock == nil {
 		lock = &sync.Mutex{}
-		m.reservationLocks[name] = lock
+		m.keyedLocks[name] = lock
 	}
 	return lock
 }

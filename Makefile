@@ -274,6 +274,10 @@ test-persistent-agent-admission:
 test-persistent-agent-scale:
 	bash hack/ci/persistent-agent-scale-test.sh
 
+.PHONY: test-persistent-agent-real-api-scale
+test-persistent-agent-real-api-scale:
+	bash hack/ci/persistent-agent-real-api-scale-test.sh
+
 # Run the Go/Ginkgo e2e suite against the current kubectl context. Assumes
 # the cluster already has GPU Operator (minimal mode) + the DRA driver
 # installed. The -tags=e2e build tag keeps this out of `make test`.

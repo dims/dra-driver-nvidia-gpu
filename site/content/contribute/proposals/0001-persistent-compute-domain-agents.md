@@ -159,9 +159,9 @@ This does not prove that an unrecorded historical IMEX process is dead. The firs
 
 ## Scaling model
 
-Persistent agents remove the largest startup fan-out: per-domain daemon claims and Pods. The remaining first-formation mutations for a clique with `N` members are approximately `N + 4`: `N` Node attestations, one reservation create, one snapshot create, one finalizer update, and one Active status update. Reads and idempotent actions are measured separately from confirmed writes.
+Persistent agents remove the largest startup fan-out: per-domain daemon claims and Pods. The clique protocol's first-formation work for `N` selected Nodes across `C` physical cliques is exactly `N + 5*C` confirmed writes in the healthy path: `N` Node attestations plus, per clique, one reservation create, one snapshot create, one snapshot finalizer update, one reservation activation-status update, and one Active snapshot status update. The additional reservation validation GET makes the clique action count `N + 6*C`. A complete controller accounting for `D` ComputeDomains also includes one readiness-status write and its live GET per domain, for `N + 5*C + D` writes and `N + 6*C + 2*D` actions. Reads and idempotent actions remain separate from confirmed writes.
 
-The controller uses one shared Node informer, indexed lookups by ComputeDomain, clique, Node, Pod UID, claim, and template, and keyed reservation serialization. The current claim-attestation caches are cluster-wide; API bytes, cache memory, full-Node update conflicts, and 18/144/280x18 convergence remain explicit pre-beta measurements.
+The controller uses one shared Node informer, indexed lookups by ComputeDomain, clique, Node, Pod UID, claim, and template, and keyed serialization for reservation creation and aggregate status. The current claim-attestation caches are cluster-wide. A disposable real-API gate measures controller HTTP and watch bytes, exact writes, conflicts, throttling, Active, and receipt-backed Ready at 18, 144, and 280x18. Cache memory, full-Node update behavior on real Nodes, scheduler and kubelet work, and end-to-end T0-T3 remain explicit pre-beta measurements.
 
 ## Security boundary
 
@@ -198,6 +198,7 @@ Before merge:
 - exact CLI parsing for `run --persistent-agent` and `check --persistent-agent`;
 - Helm default compatibility and feature-on validation;
 - real API-server admission tests, including teardown, second-install denial, and agent Pod-bound token writes;
+- disposable real-API 18/144/280x18 formation with exact write, 409/429, watch-byte, Active, Ready, and steady-state no-op assertions;
 - allocator, hash, and indexed-reconcile benchmarks.
 
 Before widening the alpha:

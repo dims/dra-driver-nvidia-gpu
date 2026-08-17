@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ type persistentAgentHarness struct {
 	manager    *PersistentAgentManager
 	nvidia     *nvfake.Clientset
 	observed   []observedFakeAPIAction
+	observedMu sync.Mutex
 	cd         *nvapi.ComputeDomain
 	daemonSet  *appsv1.DaemonSet
 	key        string
@@ -146,6 +148,8 @@ func newPersistentAgentHarness(t *testing.T, expectedNodes int) *persistentAgent
 
 	objectReaction := clienttesting.ObjectReaction(nvidia.Tracker())
 	nvidia.PrependReactor("*", "*", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		h.observedMu.Lock()
+		defer h.observedMu.Unlock()
 		if objectAction, ok := action.(interface{ GetObject() runtime.Object }); ok && (action.GetVerb() == "create" || action.GetVerb() == "update") {
 			accessor, accessorErr := apiMeta.Accessor(objectAction.GetObject())
 			require.NoError(t, accessorErr)
@@ -416,6 +420,7 @@ func TestPersistentAgentExpectedSetFormationActionSequence(t *testing.T) {
 	require.Empty(t, snapshot.Finalizers)
 
 	actionsBeforeIncompleteReconcile := len(h.observed)
+	h.manager.pendingScopes[h.key] = snapshotScope{computeDomainUID: string(h.cd.UID), cliqueID: h.cliqueID}
 	require.NoError(t, h.manager.reconcile(context.Background(), h.key))
 	require.Len(t, h.observed, actionsBeforeIncompleteReconcile, "an incomplete expected set must not issue an API call")
 
@@ -505,6 +510,28 @@ func TestPersistentAgentExpectedSetUsesSharedStateMachine(t *testing.T) {
 		require.NoError(t, h.manager.podInformer.GetStore().Update(pod))
 	}
 	require.True(t, h.manager.persistentComputeDomainReady(h.cd))
+	const concurrentStatusReconciles = 16
+	errors := make(chan error, concurrentStatusReconciles)
+	var group sync.WaitGroup
+	group.Add(concurrentStatusReconciles)
+	for range concurrentStatusReconciles {
+		go func() {
+			defer group.Done()
+			errors <- h.manager.updatePersistentComputeDomainStatusForKey(context.Background(), h.key)
+		}()
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	statusActions := make([]observedFakeAPIAction, 0, 2)
+	for _, action := range h.observed {
+		if action.resource == "computedomains" {
+			statusActions = append(statusActions, action)
+		}
+	}
+	require.Equal(t, []string{"get:computedomains", "update:computedomains/status"}, fakeActionNames(statusActions), "concurrent clique completions must coalesce to one domain status transition")
 	require.Equal(t, 3, countFakeMutations(h.observed, "computedomaincliquesnapshots"))
 	require.Equal(t, 2, countFakeMutations(h.observed, "computedomaincliquereservations"))
 	for _, action := range h.observed {

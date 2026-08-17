@@ -28,11 +28,12 @@ import (
 )
 
 const (
-	CliqueAPIResourceSnapshot    = "snapshot"
-	CliqueAPIResourceReservation = "reservation"
-	CliqueAPIResourceEvidence    = "retirement_evidence"
-	CliqueAPIResourceNode        = "node"
-	CliqueAPIResourcePod         = "pod"
+	CliqueAPIResourceSnapshot      = "snapshot"
+	CliqueAPIResourceReservation   = "reservation"
+	CliqueAPIResourceEvidence      = "retirement_evidence"
+	CliqueAPIResourceNode          = "node"
+	CliqueAPIResourcePod           = "pod"
+	CliqueAPIResourceComputeDomain = "compute_domain"
 
 	CliqueAPIOperationCreate             = "create"
 	CliqueAPIOperationDelete             = "delete"
@@ -86,11 +87,11 @@ var (
 		[]string{"protocol"},
 	)
 	cliqueAPIActions = metrics.NewCounterVec(
-		&metrics.CounterOpts{Namespace: "nvidia_dra", Name: "cdc_api_actions_total", Help: "Persistent-agent clique API calls, including successful no-mutation outcomes such as AlreadyExists."},
+		&metrics.CounterOpts{Namespace: "nvidia_dra", Name: "cdc_api_actions_total", Help: "Persistent-agent controller API calls, including successful no-mutation outcomes such as AlreadyExists."},
 		[]string{"protocol", "resource", "operation", "result"},
 	)
 	cliqueWrites = metrics.NewCounterVec(
-		&metrics.CounterOpts{Namespace: "nvidia_dra", Name: "cdc_api_writes_total", Help: "Confirmed persistent-agent clique API mutations. AlreadyExists and failed requests are not writes."},
+		&metrics.CounterOpts{Namespace: "nvidia_dra", Name: "cdc_api_writes_total", Help: "Confirmed persistent-agent controller API mutations. AlreadyExists and failed requests are not writes."},
 		[]string{"protocol", "resource", "operation"},
 	)
 )

@@ -62,6 +62,8 @@ func TestCliqueAPIActionsSeparateAttemptsFromConfirmedWrites(t *testing.T) {
 	ObserveCliqueAPIAction(protocol, CliqueAPIResourceSnapshot, CliqueAPIOperationDelete, CliqueAPIResultSuccess, true)
 	ObserveCliqueAPIAction(protocol, CliqueAPIResourceSnapshot, CliqueAPIOperationDelete, CliqueAPIResultNotFound, false)
 	ObserveCliqueAPIAction(protocol, CliqueAPIResourceNode, CliqueAPIOperationAttestationUpdate, CliqueAPIResultSuccess, true)
+	ObserveCliqueAPIAction(protocol, CliqueAPIResourceComputeDomain, CliqueAPIOperationGet, CliqueAPIResultSuccess, false)
+	ObserveCliqueAPIAction(protocol, CliqueAPIResourceComputeDomain, CliqueAPIOperationStatusUpdate, CliqueAPIResultSuccess, true)
 
 	body := scrapeCliqueMetrics(t)
 	for _, expected := range []string{
@@ -75,6 +77,7 @@ func TestCliqueAPIActionsSeparateAttemptsFromConfirmedWrites(t *testing.T) {
 		`nvidia_dra_cdc_api_actions_total{operation="status_update",protocol="persistent-agent-v1",resource="snapshot",result="conflict"} 1`,
 		`nvidia_dra_cdc_api_actions_total{operation="status_update",protocol="persistent-agent-v1",resource="snapshot",result="throttled"} 1`,
 		`nvidia_dra_cdc_api_actions_total{operation="delete",protocol="persistent-agent-v1",resource="snapshot",result="not_found"} 1`,
+		`nvidia_dra_cdc_api_actions_total{operation="get",protocol="persistent-agent-v1",resource="compute_domain",result="success"} 1`,
 		`nvidia_dra_cdc_api_writes_total{operation="create",protocol="persistent-agent-v1",resource="reservation"} 1`,
 		`nvidia_dra_cdc_api_writes_total{operation="create",protocol="persistent-agent-v1",resource="snapshot"} 1`,
 		`nvidia_dra_cdc_api_writes_total{operation="finalizer_add",protocol="persistent-agent-v1",resource="snapshot"} 1`,
@@ -82,6 +85,7 @@ func TestCliqueAPIActionsSeparateAttemptsFromConfirmedWrites(t *testing.T) {
 		`nvidia_dra_cdc_api_writes_total{operation="status_update",protocol="persistent-agent-v1",resource="snapshot"} 1`,
 		`nvidia_dra_cdc_api_writes_total{operation="delete",protocol="persistent-agent-v1",resource="snapshot"} 1`,
 		`nvidia_dra_cdc_api_writes_total{operation="attestation_update",protocol="persistent-agent-v1",resource="node"} 1`,
+		`nvidia_dra_cdc_api_writes_total{operation="status_update",protocol="persistent-agent-v1",resource="compute_domain"} 1`,
 	} {
 		require.Contains(t, body, expected)
 	}
