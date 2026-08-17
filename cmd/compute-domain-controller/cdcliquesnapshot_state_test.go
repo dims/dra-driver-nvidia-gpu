@@ -489,7 +489,9 @@ func TestPersistentAgentExpectedSetUsesSharedStateMachine(t *testing.T) {
 		object, exists, err := h.manager.podInformer.GetStore().GetByKey(snapshot.Namespace + "/" + member.PodName)
 		require.NoError(t, err)
 		require.True(t, exists)
-		pod := object.(*corev1.Pod).DeepCopy()
+		pod, ok := object.(*corev1.Pod)
+		require.True(t, ok)
+		pod = pod.DeepCopy()
 		receipt, err := json.Marshal(nvapi.ComputeDomainCliqueSnapshotReceipt{
 			SnapshotUID: snapshot.UID, SnapshotGeneration: snapshot.Status.Generation, SnapshotHash: snapshot.Status.Hash,
 			NodeUID: member.NodeUID, PodUID: member.PodUID, Index: member.Index,

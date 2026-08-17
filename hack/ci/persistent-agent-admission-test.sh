@@ -63,6 +63,23 @@ helm template "${RELEASE_NAME}" "${REPO_ROOT}/deployments/helm/dra-driver-nvidia
   | kubectl apply --dry-run=server -f - > /dev/null
 echo "PASS: legacy-only ResourceSlice policy compiles"
 
+# The default controller performs a read-only durable-state probe even when
+# persistent admission is disabled. Prove the ordinary chart grants exactly
+# that read and no persistent mutation authority.
+kubectl apply -f "${REPO_ROOT}/deployments/helm/dra-driver-nvidia-gpu/crds/resource.nvidia.com_computedomaincliquereservations.yaml" > /dev/null
+kubectl wait --for=condition=Established crd/computedomaincliquereservations.resource.nvidia.com > /dev/null
+helm template "${RELEASE_NAME}" "${REPO_ROOT}/deployments/helm/dra-driver-nvidia-gpu" \
+  --namespace "${TEST_NAMESPACE}" --api-versions resource.k8s.io/v1 \
+  --set resources.gpus.enabled=false \
+  --show-only templates/rbac-controller.yaml \
+  > "${TMP_DIR}/default-controller-rbac.yaml"
+kubectl apply -f "${TMP_DIR}/default-controller-rbac.yaml" > /dev/null
+DEFAULT_CONTROLLER_SUBJECT="system:serviceaccount:${TEST_NAMESPACE}:${RELEASE_NAME}-dra-driver-nvidia-gpu-service-account-controller"
+test "$(kubectl auth can-i list computedomaincliquereservations.resource.nvidia.com --as="${DEFAULT_CONTROLLER_SUBJECT}")" = "yes"
+test "$(kubectl auth can-i create computedomaincliquereservations.resource.nvidia.com --as="${DEFAULT_CONTROLLER_SUBJECT}")" = "no"
+kubectl delete -f "${TMP_DIR}/default-controller-rbac.yaml" > /dev/null
+echo "PASS: default controller can probe reservations without persistent write authority"
+
 HELM_ARGS=(
   "${RELEASE_NAME}"
   "${REPO_ROOT}/deployments/helm/dra-driver-nvidia-gpu"
@@ -281,6 +298,9 @@ echo "PASS: controller atomic retirement cleanup"
 # Exercise the persistent agent's only write permission with a real
 # Pod-bound ServiceAccount token. This proves the token UID/Node checks and
 # narrow metadata diff against an API server, which fake clients cannot do.
+# Remove the API-only Node used above; it has no kubelet and must not count as
+# a schedulable DaemonSet target.
+kubectl delete node "${NODE_NAME}" > /dev/null
 kubectl create -f - > /dev/null <<EOF
 apiVersion: apps/v1
 kind: DaemonSet
@@ -297,13 +317,25 @@ spec:
         resource.nvidia.com/persistentComputeDomainAgent: "true"
     spec:
       serviceAccountName: compute-domain-daemon-reader-service-account
+      tolerations:
+      - operator: Exists
       containers:
       - name: pause
         image: registry.k8s.io/pause:3.10
 EOF
-kubectl rollout status daemonset/dra-driver-nvidia-gpu-persistent-agent -n "${TEST_NAMESPACE}" --timeout=60s > /dev/null
+if ! kubectl rollout status daemonset/dra-driver-nvidia-gpu-persistent-agent -n "${TEST_NAMESPACE}" --timeout=120s > /dev/null; then
+  kubectl get pods -n "${TEST_NAMESPACE}" -o wide >&2
+  kubectl describe daemonset/dra-driver-nvidia-gpu-persistent-agent -n "${TEST_NAMESPACE}" >&2
+  exit 1
+fi
 AGENT_POD="$(kubectl get pods -n "${TEST_NAMESPACE}" -l resource.nvidia.com/persistentComputeDomainAgent=true -o jsonpath='{.items[0].metadata.name}')"
 test -n "${AGENT_POD}"
+AGENT_POD_UID="$(kubectl get pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" -o jsonpath='{.metadata.uid}')"
+AGENT_NODE_NAME="$(kubectl get pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" -o jsonpath='{.spec.nodeName}')"
+test -n "${AGENT_POD_UID}"
+test -n "${AGENT_NODE_NAME}"
+test "$(kubectl get pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" -o jsonpath='{.metadata.ownerReferences[0].kind}')" = "DaemonSet"
+test "$(kubectl get pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" -o jsonpath='{.metadata.ownerReferences[0].name}')" = "dra-driver-nvidia-gpu-persistent-agent"
 kubectl create -f - > /dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -315,17 +347,27 @@ spec:
   - name: pause
     image: registry.k8s.io/pause:3.10
 EOF
-AGENT_TOKEN="$(kubectl create token compute-domain-daemon-reader-service-account -n "${TEST_NAMESPACE}" \
-  --bound-object-kind Pod --bound-object-name "${AGENT_POD}" --duration=10m)"
 AGENT_KUBECONFIG="${TMP_DIR}/persistent-agent.kubeconfig"
 APISERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 kubectl config set-cluster admission-test --server="${APISERVER}" --insecure-skip-tls-verify=true --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
-kubectl config set-credentials persistent-agent --token="${AGENT_TOKEN}" --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
 kubectl config set-context persistent-agent --cluster=admission-test --user=persistent-agent --namespace="${TEST_NAMESPACE}" --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
 kubectl config use-context persistent-agent --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
 AGENT_KUBECTL=(kubectl --kubeconfig="${AGENT_KUBECONFIG}")
+for _ in $(seq 1 30); do
+  AGENT_TOKEN="$(kubectl create token compute-domain-daemon-reader-service-account -n "${TEST_NAMESPACE}" \
+    --bound-object-kind Pod --bound-object-name "${AGENT_POD}" --duration=10m)"
+  kubectl config set-credentials persistent-agent --token="${AGENT_TOKEN}" --kubeconfig="${AGENT_KUBECONFIG}" > /dev/null
+  TOKEN_POD_UID="$("${AGENT_KUBECTL[@]}" auth whoami -o jsonpath='{.status.userInfo.extra.authentication\.kubernetes\.io/pod-uid[0]}')"
+  TOKEN_NODE_NAME="$("${AGENT_KUBECTL[@]}" auth whoami -o jsonpath='{.status.userInfo.extra.authentication\.kubernetes\.io/node-name[0]}')"
+  if [ "${TOKEN_POD_UID}" = "${AGENT_POD_UID}" ] && [ "${TOKEN_NODE_NAME}" = "${AGENT_NODE_NAME}" ]; then
+    break
+  fi
+  sleep 1
+done
 test "$("${AGENT_KUBECTL[@]}" auth whoami -o jsonpath='{.status.userInfo.username}')" = \
   "system:serviceaccount:${TEST_NAMESPACE}:compute-domain-daemon-reader-service-account"
+test "${TOKEN_POD_UID}" = "${AGENT_POD_UID}"
+test "${TOKEN_NODE_NAME}" = "${AGENT_NODE_NAME}"
 
 "${AGENT_KUBECTL[@]}" patch pod "${AGENT_POD}" -n "${TEST_NAMESPACE}" --type=merge \
   -p '{"metadata":{"annotations":{"resource.nvidia.com/computeDomainCliqueSnapshotApplied":"{\"snapshotUID\":\"snapshot-a\"}"}}}' > /dev/null

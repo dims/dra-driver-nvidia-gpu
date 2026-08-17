@@ -15,10 +15,17 @@ rules:
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomains/status"]
   verbs: ["update"]
-{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomaincliquereservations"]
-  verbs: ["get", "list", "watch", "create", "delete"]
+  verbs:
+  - get
+  - list
+  {{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
+  - watch
+  - create
+  - delete
+  {{- end }}
+{{- if .Values.persistentComputeDomainAgents.admissionEnabled }}
 - apiGroups: ["resource.nvidia.com"]
   resources: ["computedomaincliquereservations/status"]
   verbs: ["get", "update", "patch"]

@@ -52,7 +52,7 @@ import (
 
 const (
 	DriverName                                 = "compute-domain.nvidia.com"
-	persistentAgentInstallationPolicyName      = "persistent-compute-domain-agents.dra-driver-nvidia-gpu"
+	persistentAgentInstallationPolicyName      = "persistent-agent-installation.dra-driver-nvidia-gpu"
 	persistentAgentInstallationAnnotation      = "resource.nvidia.com/persistent-agent-installation"
 	persistentAgentControlNamespaceAnnotation  = "resource.nvidia.com/persistent-agent-control-namespace"
 	persistentAgentControllerSubjectAnnotation = "resource.nvidia.com/persistent-agent-controller-subject"

@@ -32,7 +32,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -794,7 +793,7 @@ func (m *PersistentAgentManager) persistentComputeDomainReady(owner *nvapi.Compu
 		if len(expected) == 0 || len(snapshot.Status.Members) != len(expected) {
 			return false
 		}
-		provider, err := m.daemonProviderFor(snapshot.Namespace, owner, nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
+		provider, err := m.daemonProviderFor(snapshot.Namespace, nvapi.ComputeDomainCliqueProtocolPersistentAgentV1)
 		if err != nil || provider.daemonSet == nil {
 			return false
 		}
@@ -981,7 +980,7 @@ func (m *PersistentAgentManager) createSnapshotForPodSet(ctx context.Context, na
 	if err != nil || !persistentAgentProtocol(protocol) {
 		return err
 	}
-	provider, err := m.daemonProviderFor(namespace, owner, protocol)
+	provider, err := m.daemonProviderFor(namespace, protocol)
 	if err != nil {
 		return err
 	}
@@ -1210,7 +1209,7 @@ func (m *PersistentAgentManager) updateSnapshot(ctx context.Context, snapshot *n
 		return fmt.Errorf("persistent-agent ComputeDomain is deleting or lacks a positive expected Node count")
 	}
 	expectedSetReady := m.expectedSetReady(string(snapshot.Spec.ComputeDomainUID), owner.Spec.NumNodes)
-	provider, err := m.daemonProviderFor(snapshot.Namespace, owner, protocol)
+	provider, err := m.daemonProviderFor(snapshot.Namespace, protocol)
 	if err != nil {
 		return err
 	}
@@ -1576,25 +1575,7 @@ func snapshotEverPublished(snapshot *nvapi.ComputeDomainCliqueSnapshot) bool {
 	return false
 }
 
-func (m *PersistentAgentManager) daemonSetFor(namespace string, owner *nvapi.ComputeDomain) (*appsv1.DaemonSet, error) {
-	daemonSets, err := m.daemonSetLister.DaemonSets(namespace).List(labels.SelectorFromSet(labels.Set{computeDomainLabelKey: string(owner.UID)}))
-	if err != nil {
-		return nil, err
-	}
-	if len(daemonSets) == 0 {
-		return nil, nil
-	}
-	if len(daemonSets) != 1 {
-		return nil, fmt.Errorf("found %d DaemonSets for ComputeDomain %s", len(daemonSets), owner.UID)
-	}
-	ds := daemonSets[0]
-	if err := validateExistingDaemonSet(ds, owner, m.config); err != nil {
-		return nil, err
-	}
-	return ds, nil
-}
-
-func (m *PersistentAgentManager) daemonProviderFor(namespace string, owner *nvapi.ComputeDomain, protocol nvapi.ComputeDomainCliqueProtocol) (snapshotDaemonProvider, error) {
+func (m *PersistentAgentManager) daemonProviderFor(namespace string, protocol nvapi.ComputeDomainCliqueProtocol) (snapshotDaemonProvider, error) {
 	provider := snapshotDaemonProvider{protocol: protocol}
 	if protocol != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
 		return provider, fmt.Errorf("unsupported snapshot daemon protocol %q", protocol)

@@ -19,6 +19,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -35,6 +37,12 @@ import (
 type testResourceLock struct {
 	createErr error
 	updateErr error
+}
+
+func TestPersistentAgentInstallationNameMatchesChart(t *testing.T) {
+	helpers, err := os.ReadFile(filepath.Join("..", "..", "deployments", "helm", "dra-driver-nvidia-gpu", "templates", "_helpers.tpl"))
+	require.NoError(t, err)
+	require.Contains(t, string(helpers), "{{- define \"dra-driver-nvidia-gpu.persistentAgentInstallationName\" -}}\n"+persistentAgentInstallationPolicyName+"\n")
 }
 
 func TestValidatePersistentAgentInstallation(t *testing.T) {
