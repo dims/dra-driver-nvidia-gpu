@@ -267,6 +267,13 @@ e2e-gcp-nvkind:
 test-persistent-agent-admission:
 	bash hack/ci/persistent-agent-admission-test.sh
 
+# Run deterministic 18/144/280x18 persistent-agent scale accounting and
+# directional controller benchmarks. Set ARTIFACTS to retain the evidence in a
+# caller-owned location.
+.PHONY: test-persistent-agent-scale
+test-persistent-agent-scale:
+	bash hack/ci/persistent-agent-scale-test.sh
+
 # Run the Go/Ginkgo e2e suite against the current kubectl context. Assumes
 # the cluster already has GPU Operator (minimal mode) + the DRA driver
 # installed. The -tags=e2e build tag keeps this out of `make test`.

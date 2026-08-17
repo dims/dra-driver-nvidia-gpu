@@ -427,6 +427,7 @@ type attestationCoreClient struct {
 	nodes      map[string]*corev1.Node
 	pods       map[string]*corev1.Pod
 	podListErr error
+	nodeUpdate func(*corev1.Node)
 }
 
 func (c *attestationCoreClient) CoreV1() coretyped.CoreV1Interface {
@@ -538,6 +539,9 @@ func (n *attestationNodes) Update(_ context.Context, node *corev1.Node, _ metav1
 	defer n.client.mu.Unlock()
 	if n.client.nodes[node.Name] == nil {
 		return nil, apierrors.NewNotFound(corev1.Resource("nodes"), node.Name)
+	}
+	if n.client.nodeUpdate != nil {
+		n.client.nodeUpdate(node)
 	}
 	n.client.nodes[node.Name] = node.DeepCopy()
 	return node.DeepCopy(), nil
