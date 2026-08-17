@@ -262,6 +262,11 @@ func rejectLegacyComputeDomains(ctx context.Context, config *Config) error {
 	}
 	for i := range computeDomains.Items {
 		cd := &computeDomains.Items[i]
+		// The controller must run to finish a legacy deletion; treating the
+		// terminating object as a competing provider deadlocks that deletion.
+		if cd.DeletionTimestamp != nil {
+			continue
+		}
 		protocol := nvapi.EffectiveComputeDomainCliqueProtocol(nvapi.ComputeDomainCliqueProtocol(cd.Annotations[nvapi.ComputeDomainCliqueProtocolAnnotation]))
 		if protocol != nvapi.ComputeDomainCliqueProtocolPersistentAgentV1 {
 			return fmt.Errorf("cannot enable persistent agents while legacy ComputeDomain %s/%s exists; retire every per-domain daemon before switching the installation provider", cd.Namespace, cd.Name)

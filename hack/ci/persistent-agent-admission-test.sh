@@ -80,6 +80,21 @@ test "$(kubectl auth can-i create computedomaincliquereservations.resource.nvidi
 kubectl delete -f "${TMP_DIR}/default-controller-rbac.yaml" > /dev/null
 echo "PASS: default controller can probe reservations without persistent write authority"
 
+# The legacy kubelet path performs the same read-only reservation check before
+# it forms a per-domain daemon. Keep that read available in a plain install,
+# without granting reservation mutation authority.
+helm template "${RELEASE_NAME}" "${REPO_ROOT}/deployments/helm/dra-driver-nvidia-gpu" \
+  --namespace "${TEST_NAMESPACE}" --api-versions resource.k8s.io/v1 \
+  --set resources.gpus.enabled=false \
+  --show-only templates/rbac-kubeletplugin.yaml \
+  > "${TMP_DIR}/default-kubelet-rbac.yaml"
+kubectl apply -f "${TMP_DIR}/default-kubelet-rbac.yaml" > /dev/null
+DEFAULT_KUBELET_SUBJECT="system:serviceaccount:${TEST_NAMESPACE}:${RELEASE_NAME}-dra-driver-nvidia-gpu-service-account-kubeletplugin"
+test "$(kubectl auth can-i get computedomaincliquereservations.resource.nvidia.com --as="${DEFAULT_KUBELET_SUBJECT}")" = "yes"
+test "$(kubectl auth can-i create computedomaincliquereservations.resource.nvidia.com --as="${DEFAULT_KUBELET_SUBJECT}")" = "no"
+kubectl delete -f "${TMP_DIR}/default-kubelet-rbac.yaml" > /dev/null
+echo "PASS: default kubelet can check reservations without persistent write authority"
+
 HELM_ARGS=(
   "${RELEASE_NAME}"
   "${REPO_ROOT}/deployments/helm/dra-driver-nvidia-gpu"

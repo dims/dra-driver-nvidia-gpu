@@ -114,6 +114,25 @@ func TestGateDisabledStartsPersistentManagersOnlyForDurableState(t *testing.T) {
 	require.True(t, required)
 }
 
+func TestRejectLegacyComputeDomainsAllowsDeletionToFinish(t *testing.T) {
+	now := metav1.Now()
+	deleting := &nvapi.ComputeDomain{ObjectMeta: metav1.ObjectMeta{
+		Name:              "deleting-legacy",
+		Namespace:         "workload",
+		UID:               types.UID("deleting-legacy-uid"),
+		DeletionTimestamp: &now,
+	}}
+	config := &Config{clientsets: pkgflags.ClientSets{Nvidia: nvfake.NewSimpleClientset(deleting)}}
+	require.NoError(t, rejectLegacyComputeDomains(context.Background(), config))
+
+	active := deleting.DeepCopy()
+	active.Name = "active-legacy"
+	active.UID = types.UID("active-legacy-uid")
+	active.DeletionTimestamp = nil
+	config.clientsets.Nvidia = nvfake.NewSimpleClientset(deleting, active)
+	require.ErrorContains(t, rejectLegacyComputeDomains(context.Background(), config), "active-legacy")
+}
+
 func (*testResourceLock) Get(context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
 	return nil, nil, errors.New("not implemented")
 }
