@@ -561,7 +561,7 @@ The JSON result also records deterministic trial-cluster bootstrap p50/p95 95%
 confidence intervals, seed, and repetition count.
 
 When `promotion_run=false`, this is directional or harness-validation evidence
-only. The current two-Node Krusty environment can exercise the real scheduler,
+only. The current two-Node AWS EKS environment can exercise the real scheduler,
 kubelet NodePrepareResources, container readiness, persistent agent, and IMEX,
 but it cannot satisfy the required 18/144-node sample sizes. Kind cannot supply
 real kubelet/IMEX Tier C evidence at all.
