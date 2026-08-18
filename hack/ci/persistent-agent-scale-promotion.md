@@ -145,7 +145,33 @@ across all four GPU pairs, and aggregate T0–T3 was 6.0s p50 / 19.0s p95 with
 NodePrepare at 5.18s p50. This confirms the real path directionally; it does
 not change the 18/144-node promotion requirement.
 
+The committed auto-discovery path was subsequently reverified from a clean
+checkout: the source record reported `auto:compute-domains-container`, the
+kubelet-plugin log was nonempty, exact T2 evidence and nvbandwidth passed, and
+cleanup was automatic. Five matched legacy trials on the same hardware also
+passed. Their directional p50 comparison was:
+
+| Stage | legacy-v1 | persistent-agent-v1 |
+|---|---:|---:|
+| NodePrepare, T2-T1 | 11.26s | 5.18s |
+| Total, T3-T0 | 13.0s | 6.0s |
+
+This result supports the expected mechanism—the warm agent removes most of the
+per-domain NodePrepare delay—but ten Pods per provider are not a promotion
+sample. Do not claim p95/p99 from it. Audit T0, measured clock skew,
+controlled cache state, and environment-specific observability were recorded
+as unavailable rather than synthesized. No mandatory two-Node QA remains;
+repeat it only for a specific regression or to validate newly available
+evidence collection.
+
 ## 3. Tier C promotion run when 18/144 Nodes are available
+
+The current two-Node cluster needs 16 additional simultaneously schedulable,
+fabric-compatible Nodes to run the 18-Node milestone. Full Tier C requires 142
+additional Nodes, for 144 total. The same 144-Node fleet can run both shapes by
+selecting 18 Nodes for the smaller case; separate 18- and 144-Node clusters are
+not required. Spare Nodes outside the required physical-clique/fabric shape do
+not count.
 
 Use the same runner with one physical clique per trial:
 

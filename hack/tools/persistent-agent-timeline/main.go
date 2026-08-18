@@ -304,8 +304,14 @@ func buildTimelines(opts options, pods []pod, claims []claim, prepares []prepare
 		if selectedPrepare.Namespace != selectedClaim.Metadata.Namespace || selectedPrepare.Name != selectedClaim.Metadata.Name {
 			return nil, fmt.Errorf("claim identity mismatch for UID %s", selectedClaim.Metadata.UID)
 		}
-		if t1.After(selectedPrepare.Timestamp) || selectedPrepare.Timestamp.After(t3) || t0.After(t1) {
+		if t1.After(selectedPrepare.Timestamp) || selectedPrepare.Timestamp.Truncate(time.Second).After(t3) || t0.After(t1) {
 			return nil, fmt.Errorf("invalid T0-T3 ordering for Pod %s/%s: %s %s %s %s", item.Metadata.Namespace, item.Metadata.Name, t0, t1, selectedPrepare.Timestamp, t3)
+		}
+		// Pod condition timestamps have one-second precision. When T2 falls in
+		// the recorded T3 second, preserve ordering and report the unobservable
+		// readiness interval conservatively as zero instead of a negative value.
+		if t3.Before(selectedPrepare.Timestamp) {
+			t3 = selectedPrepare.Timestamp
 		}
 
 		result = append(result, timeline{

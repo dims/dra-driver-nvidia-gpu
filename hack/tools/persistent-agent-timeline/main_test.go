@@ -117,6 +117,34 @@ func TestInvalidOrderingFails(t *testing.T) {
 	}
 }
 
+func TestPrepareInReadyTimestampSecondIsAccepted(t *testing.T) {
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	pods := []pod{testPod(base)}
+	claims := []claim{testClaim()}
+	prepares := []prepareRecord{{Timestamp: base.Add(3500 * time.Millisecond), Namespace: "trial", Name: "channel", UID: "claim"}}
+	opts := options{trialID: "trial", provider: "legacy-v1", shape: "1x1", expectedPods: 1, allowCreationTimestampT0: true}
+
+	timelines, err := buildTimelines(opts, pods, claims, prepares, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := timelines[0]; !got.T3.Equal(got.T2) || got.ReadinessMS != 0 || got.TotalMS != 3500 {
+		t.Fatalf("same-second T3 was not normalized: %+v", got)
+	}
+}
+
+func TestPrepareAfterReadyTimestampSecondFails(t *testing.T) {
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	pods := []pod{testPod(base)}
+	claims := []claim{testClaim()}
+	prepares := []prepareRecord{{Timestamp: base.Add(4 * time.Second), Namespace: "trial", Name: "channel", UID: "claim"}}
+	opts := options{trialID: "trial", provider: "legacy-v1", shape: "1x1", expectedPods: 1, allowCreationTimestampT0: true}
+
+	if _, err := buildTimelines(opts, pods, claims, prepares, nil); err == nil {
+		t.Fatal("expected T2 in a later second than T3 to fail")
+	}
+}
+
 func TestFirstSuccessfulPrepareIsT2(t *testing.T) {
 	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
 	pods := []pod{testPod(base)}
