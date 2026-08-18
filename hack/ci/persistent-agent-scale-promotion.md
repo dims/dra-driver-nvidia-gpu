@@ -6,11 +6,11 @@ deliberately aligned with the environments currently available:
 | Environment | What it can prove now | What it cannot prove |
 |---|---|---|
 | Local Kind on the development machine | Timeline analyzer, artifact schema, promotion guards, real API/informer/workqueue behavior, and a v1.34 280×18 virtual-node control-plane profile | Real `NodePrepareResources`, containers using NVIDIA devices, NVML, IMEX, or genuine T0–T3 |
-| Current Krusty, two GB200 Nodes in one real clique | Scheduler, real kubelet `NodePrepareResources`, container readiness, persistent agent, IMEX/nvbandwidth, retirement, and directional two-node T0–T3 | The required 18- and 144-node sample sizes or a 5,040-node control plane |
+| Current AWS EKS `yljtrxpmzu`, two GB200 Nodes in one real clique | Scheduler, real kubelet `NodePrepareResources`, container readiness, persistent agent, IMEX/nvbandwidth, retirement, and directional two-node T0–T3 | The required 18- and 144-node sample sizes or a 5,040-node control plane |
 | Future 18/144 capable fleet | Tier C promotion evidence | Tier D 5,040-node pressure unless paired with the virtual control-plane rig |
 
 The scripts refuse to promote a two-node result. Do not override that boundary
-or merge Kind and Krusty numbers into one synthetic result.
+or merge Kind and real-hardware numbers into one synthetic result.
 
 ## 1. Local validation available now
 
@@ -67,7 +67,7 @@ matched v1.34.8/v1.35.5/v1.36.1 matrix on 2026-08-17:
 Those timings are observational single runs. QA must independently reproduce
 the matrix; exact counts and zero conflicts/throttling are the hard assertions.
 
-## 2. Krusty two-node Tier C mini-run
+## 2. AWS EKS two-node Tier C mini-run
 
 Start from the pristine-cluster and signed-source requirements in the existing
 persistent-agent QA handoff. Install one provider at a time. The legacy and
@@ -102,7 +102,7 @@ NVB_GPUS_PER_NODE=2 \
   make test-persistent-agent-tier-c
 ```
 
-`creationTimestamp` is an explicit fallback because the present Krusty
+`creationTimestamp` is an explicit fallback because the present AWS EKS
 workflow does not expose an apiserver audit log to the test runner. The result
 is directional and must say so. If an audit JSONL export becomes available,
 set `TIER_C_T0_MODE=audit` and `TIER_C_AUDIT_LOG=/path/to/audit.jsonl`.
@@ -138,7 +138,7 @@ optional override for unusual installations.
 Five two-node trials are useful for finding harness or correctness defects.
 They are not enough for p95/p99 or promotion.
 
-The independent 2026-08-17 Krusty checkpoint completed all five persistent-
+The independent 2026-08-17 AWS EKS checkpoint completed all five persistent-
 agent trials on two real GB200 Nodes after the evidence-check fixes: every
 trial reached Active/Ready, every nvbandwidth hook passed at about 825 GB/s
 across all four GPU pairs, and aggregate T0–T3 was 6.0s p50 / 19.0s p95 with
@@ -200,7 +200,7 @@ namespace, ID, and artifact directory. It must collect the environment-specific
 controller, scheduler, etcd, queue, API Priority and Fairness, and component
 CPU/memory evidence that cannot be reached portably from every cluster. A
 promotion run refuses to proceed without this executable hook; a directional
-Krusty mini-run may omit it and will still retain the generic apiserver metrics,
+two-node AWS EKS mini-run may omit it and will still retain the generic apiserver metrics,
 driver logs, Events, and best-effort `kubectl top` output.
 
 Run the profiles separately on every supported stable Kubernetes minor which
@@ -247,7 +247,7 @@ its published SHA-256, and saves its version with each result. The top-level
 `matrix.csv` must show zero conflicts and throttling at every version.
 
 This virtual-node result is paired with, not substituted for, the largest real
-Tier C/Krusty run. The final promotion decision needs both.
+Tier C real-hardware run. The final promotion decision needs both.
 
 ## 5. Hard stops and cleanup
 
