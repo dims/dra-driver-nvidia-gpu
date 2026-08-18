@@ -17,12 +17,16 @@ or merge Kind and real-hardware numbers into one synthetic result.
 Run the analyzer unit tests and shell checks:
 
 ```bash
-go test ./hack/tools/persistent-agent-timeline -count=1
+go test ./hack/tools/persistent-agent-timeline ./hack/tools/persistent-agent-comparison -count=1
 shellcheck \
   hack/ci/persistent-agent-tier-c-test.sh \
   hack/ci/persistent-agent-tier-c-kind-smoke-test.sh \
   hack/ci/persistent-agent-tier-c-nvbandwidth.sh \
-  hack/ci/persistent-agent-tier-d-test.sh
+  hack/ci/persistent-agent-tier-d-test.sh \
+  hack/ci/persistent-agent-two-node-performance.sh \
+  hack/ci/persistent-agent-two-node-performance-smoke-test.sh \
+  hack/ci/persistent-agent-two-node-smoke.sh
+make test-persistent-agent-two-node-performance-smoke
 ```
 
 Run the Kind Tier C smoke. It uses real Pod conditions but synthetic claims and
@@ -67,11 +71,88 @@ matched v1.34.8/v1.35.5/v1.36.1 matrix on 2026-08-17:
 Those timings are observational single runs. QA must independently reproduce
 the matrix; exact counts and zero conflicts/throttling are the hard assertions.
 
-## 2. AWS EKS two-node Tier C mini-run
+## 2. Main versus latest-branch two-Node performance study
+
+This study has exactly two subjects:
+
+- `M`: an actual, clean, pinned upstream `main` checkout and its image/chart;
+- `B`: the clean, GPG-signed tip of the persistent-agent branch.
+
+Do not substitute the branch with its feature gate disabled for `M`. The
+runner knows that actual `main` has no persisted clique-protocol annotation and
+requires that annotation to remain absent. It requires
+`persistent-agent-v1` only for `B`.
+
+The orchestrator runs four balanced blocks (`M,B`, `B,M`, `M,B`, `B,M`). Each
+arm in each block gets two excluded warm-ups, 25 cold-domain lifecycle cycles,
+and 25 warm-workload cycles. That produces 100 measured cold cycles and 100
+measured warm cycles per subject. Every cold cycle records T0–T3 plus D0–D4,
+keeps watches active through teardown, and refuses manual cleanup. Every cycle
+runs a cheap `nvidia-smi` device smoke; the default cadence runs the heavier
+nvbandwidth check on the first, middle, and final measured cycle of each
+session.
+
+Three executable environment-specific hooks are mandatory:
+
+- `PERF_MAIN_INSTALL_HOOK` installs the exact source and image supplied in
+  `PERF_SOURCE_WORKTREE`, `PERF_SOURCE_SHA`, and `PERF_DRIVER_IMAGE` and waits
+  for the ordinary main driver to be Ready;
+- `PERF_BRANCH_INSTALL_HOOK` follows the guarded persistent-agent installation
+  procedure and waits for the controller, kubelet plugin, and exactly one
+  agent on each selected Node to be Ready;
+- `PERF_DECOMMISSION_HOOK` fully retires provider state and removes the driver,
+  CRDs/admission objects when applicable, Node protocol metadata, and the
+  leader-election Lease. It must leave the shared MPI Operator installed.
+
+Each hook also receives `PERF_ACTION`, `PERF_ARM`, `PERF_BLOCK`,
+`PERF_DRIVER_NAMESPACE`, and `PERF_SESSION_ARTIFACTS`. Save rendered manifests,
+Helm values, image-build provenance, runtime image IDs, and cleanup proof in
+that artifact directory. A hook failure is a hard stop: the orchestrator
+preserves the installation and does not attempt an automatic decommission.
+
+First run the five-cycle pilot:
+
+```bash
+ARTIFACTS=/path/to/artifacts/main-vs-branch-pilot \
+PERF_PILOT=true \
+PERF_MAIN_WORKTREE=/path/to/clean/main \
+PERF_MAIN_SHA=$(git -C /path/to/clean/main rev-parse HEAD) \
+PERF_BRANCH_WORKTREE="$PWD" \
+PERF_MAIN_DRIVER_IMAGE='<main image identity>' \
+PERF_BRANCH_DRIVER_IMAGE='<branch image identity>' \
+PERF_MAIN_INSTALL_HOOK=/path/to/install-main.sh \
+PERF_BRANCH_INSTALL_HOOK=/path/to/install-branch.sh \
+PERF_DECOMMISSION_HOOK=/path/to/decommission-driver.sh \
+PERF_NODE_SELECTOR='scale-promotion.nvidia.com/tier-c=true' \
+NVB_GPUS_PER_NODE=2 \
+  make test-persistent-agent-two-node-performance
+```
+
+The pilot deliberately does not enforce performance thresholds. Inspect exact
+source/image identities, measured/warm-up separation, `lifecycle.json`, watch
+scope, nvbandwidth, and pristine decommission evidence before the full run.
+Then repeat without `PERF_PILOT=true`; the full run enforces the documented
+20% cold improvement, 5% warm non-regression, paired block confidence
+interval, no branch per-domain DaemonSet creation, D0–D4 bound, sample counts,
+and first-to-last-quartile drift.
+
+On the first installation of each arm the orchestrator also samples driver Pod
+CPU/memory with `kubectl top --containers` every five seconds for 15 minutes.
+The pilot caps this at ten seconds. If metrics.k8s.io or authorization is not
+available, the artifact is explicitly marked unavailable rather than treated
+as zero. Override `PERF_IDLE_SECONDS` or `PERF_IDLE_SAMPLE_SECONDS` only before
+the run and record the reason.
+
+The final outputs are `manifest.csv`, raw block/session/cycle artifacts, and
+`comparison/{comparison.json,comparison.csv,report.md}`. Client-visible watch
+bytes are not presented as total apiserver bytes. Two-Node repetition remains
+directional evidence and does not replace the 18/144-Node Tier C gate.
+
+## 3. AWS EKS two-node Tier C mini-run
 
 Start from the pristine-cluster and signed-source requirements in the existing
-persistent-agent QA handoff. Install one provider at a time. The legacy and
-persistent-agent fleets cannot coexist on the same Nodes.
+persistent-agent QA handoff. Install one subject at a time. Actual main and the
+persistent-agent branch cannot coexist on the same Nodes.
 
 Label exactly the two intended GB200 Nodes with an ordinary test-selection
 label. This is not the persistent-agent isolation label; the runner applies and
@@ -107,17 +188,18 @@ workflow does not expose an apiserver audit log to the test runner. The result
 is directional and must say so. If an audit JSONL export becomes available,
 set `TIER_C_T0_MODE=audit` and `TIER_C_AUDIT_LOG=/path/to/audit.jsonl`.
 
-For the matching legacy sample, fully retire and decommission the persistent
-fleet first. Install the gate-off legacy provider, prove there are zero
-persistent-agent Pods, and run the same command with:
+For the matching main sample, fully retire and decommission the persistent
+fleet first. Install the exact pinned upstream-main source/image, prove there
+are zero persistent-agent Pods, and run the same command with:
 
 ```bash
-TIER_C_PROVIDER=legacy-v1
+TIER_C_PROVIDER=main
+TIER_C_SOURCE_WORKTREE=/path/to/clean/pinned-main
 ```
 
 Keep Kubernetes version, worker Nodes, image digests, image cache state,
 nvbandwidth parameters, controller limits, and workload template identical.
-The runner rejects a legacy trial if a persistent-agent Pod remains anywhere in
+The runner rejects a main trial if a persistent-agent Pod remains anywhere in
 the driver namespace.
 
 The output contains raw Pods, claims, Nodes, snapshots, reservations, Events,
@@ -148,23 +230,11 @@ not change the 18/144-node promotion requirement.
 The committed auto-discovery path was subsequently reverified from a clean
 checkout: the source record reported `auto:compute-domains-container`, the
 kubelet-plugin log was nonempty, exact T2 evidence and nvbandwidth passed, and
-cleanup was automatic. Five matched legacy trials on the same hardware also
-passed. Their directional p50 comparison was:
+cleanup was automatic. Earlier comparison timing is retained only in the
+historical work log and is not an upstream-main baseline. New comparative
+claims must come from the two-subject M/B harness above.
 
-| Stage | legacy-v1 | persistent-agent-v1 |
-|---|---:|---:|
-| NodePrepare, T2-T1 | 11.26s | 5.18s |
-| Total, T3-T0 | 13.0s | 6.0s |
-
-This result supports the expected mechanism—the warm agent removes most of the
-per-domain NodePrepare delay—but ten Pods per provider are not a promotion
-sample. Do not claim p95/p99 from it. Audit T0, measured clock skew,
-controlled cache state, and environment-specific observability were recorded
-as unavailable rather than synthesized. No mandatory two-Node QA remains;
-repeat it only for a specific regression or to validate newly available
-evidence collection.
-
-## 3. Tier C promotion run when 18/144 Nodes are available
+## 4. Tier C promotion run when 18/144 Nodes are available
 
 The current two-Node cluster needs 16 additional simultaneously schedulable,
 fabric-compatible Nodes to run the 18-Node milestone. Full Tier C requires 142
@@ -188,8 +258,9 @@ TIER_C_OBSERVABILITY_SCRIPT=/path/to/cluster-specific-metrics-collector.sh
 
 For the persistent run also set `TIER_C_PROFILE=persistent-warm` and provide
 `TIER_C_FLEET_WARMUP_FILE` containing the separately measured fleet install-to-
-Ready interval. For legacy use `TIER_C_PROFILE=legacy-default` and
-`TIER_C_PROFILE=legacy-tuned` in separate clean runs. Run every profile once
+Ready interval. For actual main use `TIER_C_PROVIDER=main` with
+`TIER_C_PROFILE=main-default` and `TIER_C_PROFILE=main-tuned` in separate clean
+runs. Run every profile once
 with `TIER_C_CACHE_STATE=warm` and once with `cold`; prepare the image cache
 outside the runner and record the exact procedure. The runner records these
 claims but does not pretend to flush a runtime's image cache itself.
@@ -215,7 +286,7 @@ Thirty trials permit p50/p95 reporting. Do not claim p99 without several
 hundred samples. Report fleet installation separately from warm workload
 formation.
 
-## 4. Tier D final matrix
+## 5. Tier D final matrix
 
 The final control-plane command must name digest-pinned stable patch images for
 the supported capable Kubernetes minors. Do not use `latest`, a prerelease, or
@@ -249,7 +320,7 @@ its published SHA-256, and saves its version with each result. The top-level
 This virtual-node result is paired with, not substituted for, the largest real
 Tier C real-hardware run. The final promotion decision needs both.
 
-## 5. Hard stops and cleanup
+## 6. Hard stops and cleanup
 
 Stop and preserve the fixture on any of these:
 

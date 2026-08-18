@@ -279,7 +279,7 @@ test-persistent-agent-real-api-scale:
 	bash hack/ci/persistent-agent-real-api-scale-test.sh
 
 # Run T0-T3 collection on an already-installed, schedulable capable cluster.
-# Current Krusty can run a directional 1x2 trial; promotion requires 1x18 and
+# Current AWS EKS can run a directional 1x2 trial; promotion requires 1x18 and
 # 1x144 with audit T0, at least 30 trials, and a real data-plane script.
 .PHONY: test-persistent-agent-tier-c
 test-persistent-agent-tier-c:
@@ -288,6 +288,17 @@ test-persistent-agent-tier-c:
 .PHONY: test-persistent-agent-tier-c-kind-smoke
 test-persistent-agent-tier-c-kind-smoke:
 	bash hack/ci/persistent-agent-tier-c-kind-smoke-test.sh
+
+# Run the balanced two-Node comparison between an actual pinned main checkout
+# and the latest signed persistent-agent branch. Install/decommission hooks and
+# source/image identities are mandatory; see the execution guide.
+.PHONY: test-persistent-agent-two-node-performance
+test-persistent-agent-two-node-performance:
+	bash hack/ci/persistent-agent-two-node-performance.sh
+
+.PHONY: test-persistent-agent-two-node-performance-smoke
+test-persistent-agent-two-node-performance-smoke:
+	bash hack/ci/persistent-agent-two-node-performance-smoke-test.sh
 
 # Run the 280x18 virtual-node control-plane profile over an explicit stable
 # Kubernetes Kind image matrix. The default v1.34 run is a local harness check;

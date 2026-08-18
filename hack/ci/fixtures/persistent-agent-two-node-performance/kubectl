@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Synthetic kubectl used only by the orchestration smoke test.
+set -o errexit
+set -o nounset
+set -o pipefail
+
+case "${1:-}" in
+  version)
+    printf '%s\n' 'serverVersion:' '  gitVersion: v1.34.0-smoke'
+    ;;
+  get)
+    case "${2:-}" in
+      nodes) printf '%s\n' '{"apiVersion":"v1","kind":"NodeList","items":[]}' ;;
+      pods) printf '%s\n' '{"apiVersion":"v1","kind":"PodList","items":[]}' ;;
+      *) printf '%s\n' '{"items":[]}' ;;
+    esac
+    ;;
+  *)
+    echo "ERROR: unexpected smoke kubectl invocation: $*" >&2
+    exit 1
+    ;;
+esac

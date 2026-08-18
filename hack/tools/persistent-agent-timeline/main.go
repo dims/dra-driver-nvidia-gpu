@@ -185,7 +185,7 @@ func parseFlags() options {
 	flag.StringVar(&opts.auditPath, "audit-log", "", "optional apiserver audit JSONL")
 	flag.StringVar(&opts.outputDir, "output-dir", "", "output directory")
 	flag.StringVar(&opts.trialID, "trial-id", "", "stable trial identity")
-	flag.StringVar(&opts.provider, "provider", "", "legacy-v1 or persistent-agent-v1")
+	flag.StringVar(&opts.provider, "provider", "", "main, legacy-v1, or persistent-agent-v1")
 	flag.StringVar(&opts.shape, "shape", "", "shape label, for example 2x1 or 1x18")
 	flag.IntVar(&opts.expectedPods, "expected-pods", 0, "exact expected workload Pod count")
 	flag.BoolVar(&opts.allowCreationTimestampT0, "allow-creation-timestamp-t0", false, "allow Pod creationTimestamp when audit ResponseComplete is unavailable")
