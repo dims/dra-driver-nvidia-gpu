@@ -38,6 +38,23 @@ done
 mkdir -p "${ARTIFACTS}"
 export KUBECONFIG="${ARTIFACTS}/kubeconfig"
 
+jq -n '{apiVersion:"v1",kind:"PodList",items:[
+  {metadata:{name:"old-prefix",labels:{"dra-driver-nvidia-gpu-component":"kubelet-plugin"}},spec:{containers:[{name:"compute-domains"}]}},
+  {metadata:{name:"override-prefix",labels:{"nvidia-dra-driver-gpu-component":"kubelet-plugin"}},spec:{containers:[{name:"compute-domains"}]}},
+  {metadata:{name:"unrelated"},spec:{containers:[{name:"other"}]}}
+]}' \
+  | jq -f "${SCRIPT_DIR}/fixtures/persistent-agent-tier-c/kubelet-pods.jq" \
+  > "${ARTIFACTS}/kubelet-discovery.json"
+jq -e '.items | length == 2 and ([.[] | .metadata.name] | sort) == ["old-prefix","override-prefix"]' \
+  "${ARTIFACTS}/kubelet-discovery.json" > /dev/null
+
+jq -n '{items:[{spec:{computeDomainUID:"cd-uid"},status:{phase:"Active",members:[{index:0},{index:1}],assignments:[{index:0,state:"Bound"},{index:1,state:"Bound"}]}}]}' \
+  > "${ARTIFACTS}/snapshots-valid.json"
+test "$(jq --arg uid cd-uid --argjson members 2 -f "${SCRIPT_DIR}/fixtures/persistent-agent-tier-c/validate-active-snapshots.jq" "${ARTIFACTS}/snapshots-valid.json")" = "0"
+jq '.items[0].status.members = [{index:0}]' "${ARTIFACTS}/snapshots-valid.json" \
+  > "${ARTIFACTS}/snapshots-invalid.json"
+test "$(jq --arg uid cd-uid --argjson members 2 -f "${SCRIPT_DIR}/fixtures/persistent-agent-tier-c/validate-active-snapshots.jq" "${ARTIFACTS}/snapshots-invalid.json")" = "1"
+
 cleanup() {
   kind export logs "${ARTIFACTS}/kind-logs" --name "${KIND_CLUSTER_NAME}" > /dev/null 2>&1 || true
   kind delete cluster --name "${KIND_CLUSTER_NAME}" > /dev/null 2>&1 || true

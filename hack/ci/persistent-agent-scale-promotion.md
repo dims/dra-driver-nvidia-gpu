@@ -128,8 +128,22 @@ intervals. The result records the bootstrap seed and repetition count. Confirm
 the nvbandwidth log reports `multinode_device_to_device_memcpy_read_ce` and no
 error/failure marker.
 
+By default the runner discovers kubelet-plugin Pods by their `compute-domains`
+container in the configured driver namespace. It does not hard-code the Helm
+component-label prefix because that key changes with `nameOverride`. Preflight
+requires exactly one Ready matching Pod on every selected Node, so an empty log
+collection cannot silently proceed. `TIER_C_KUBELET_SELECTOR` remains an
+optional override for unusual installations.
+
 Five two-node trials are useful for finding harness or correctness defects.
 They are not enough for p95/p99 or promotion.
+
+The independent 2026-08-17 Krusty checkpoint completed all five persistent-
+agent trials on two real GB200 Nodes after the evidence-check fixes: every
+trial reached Active/Ready, every nvbandwidth hook passed at about 825 GB/s
+across all four GPU pairs, and aggregate T0–T3 was 6.0s p50 / 19.0s p95 with
+NodePrepare at 5.18s p50. This confirms the real path directionally; it does
+not change the 18/144-node promotion requirement.
 
 ## 3. Tier C promotion run when 18/144 Nodes are available
 

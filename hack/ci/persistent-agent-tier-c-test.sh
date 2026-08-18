@@ -33,7 +33,10 @@ TIER_C_TRIALS="${TIER_C_TRIALS:-1}"
 TIER_C_PROMOTION_RUN="${TIER_C_PROMOTION_RUN:-false}"
 TIER_C_NODE_SELECTOR="${TIER_C_NODE_SELECTOR:-}"
 TIER_C_DRIVER_NAMESPACE="${TIER_C_DRIVER_NAMESPACE:-nvidia-dra-driver-gpu}"
-TIER_C_KUBELET_SELECTOR="${TIER_C_KUBELET_SELECTOR:-dra-driver-nvidia-gpu-component=kubelet-plugin}"
+# Empty means discover Pods with the compute-domains container in the driver
+# namespace. Helm's component label key changes with nameOverride, so it is not
+# a stable default. Set this only to override discovery for an unusual install.
+TIER_C_KUBELET_SELECTOR="${TIER_C_KUBELET_SELECTOR:-}"
 TIER_C_AGENT_SELECTOR="${TIER_C_AGENT_SELECTOR:-resource.nvidia.com/persistentComputeDomainAgent=true}"
 TIER_C_TIMEOUT_SECONDS="${TIER_C_TIMEOUT_SECONDS:-1800}"
 TIER_C_RETIRE_TIMEOUT_SECONDS="${TIER_C_RETIRE_TIMEOUT_SECONDS:-600}"
@@ -210,6 +213,22 @@ fi
 
 agent_payload="$(kubectl get pods -n "${TIER_C_DRIVER_NAMESPACE}" -l "${TIER_C_AGENT_SELECTOR}" -o json 2>/dev/null || printf '{"items":[]}')"
 agent_count="$(jq '.items | length' <<<"${agent_payload}")"
+kubelet_pods_json() {
+  if [[ -n "${TIER_C_KUBELET_SELECTOR}" ]]; then
+    kubectl get pods -A -l "${TIER_C_KUBELET_SELECTOR}" -o json
+  else
+    kubectl get pods -n "${TIER_C_DRIVER_NAMESPACE}" -o json
+  fi | jq -f "${FIXTURE_DIR}/kubelet-pods.jq"
+}
+
+kubelet_payload="$(kubelet_pods_json)"
+for node in "${SELECTED_NODES[@]}"; do
+  kubelet_on_node="$(jq --arg node "${node}" '[.items[] | select(.spec.nodeName == $node and any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length' <<<"${kubelet_payload}")"
+  if (( kubelet_on_node != 1 )); then
+    echo "ERROR: Node ${node} has ${kubelet_on_node} Ready compute-domain kubelet-plugin Pods, want exactly one" >&2
+    exit 1
+  fi
+done
 if [[ "${TIER_C_PROVIDER}" == "persistent-agent-v1" ]]; then
   for node in "${SELECTED_NODES[@]}"; do
     agent_on_node="$(jq --arg node "${node}" '[.items[] | select(.spec.nodeName == $node and any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length' <<<"${agent_payload}")"
@@ -248,6 +267,7 @@ fi
   echo "profile=${TIER_C_PROFILE}"
   echo "cache_state=${TIER_C_CACHE_STATE}"
   echo "node_selector=${TIER_C_NODE_SELECTOR}"
+  echo "kubelet_selector=${TIER_C_KUBELET_SELECTOR:-auto:compute-domains-container}"
   echo "workload_template=${TIER_C_WORKLOAD_TEMPLATE}"
   echo "data_plane_script=${TIER_C_DATA_PLANE_SCRIPT:-none}"
   echo "observability_script=${TIER_C_OBSERVABILITY_SCRIPT:-none}"
@@ -310,7 +330,7 @@ collect_kubelet_logs() {
   while IFS=$'\t' read -r namespace pod; do
     kubectl logs -n "${namespace}" "${pod}" -c compute-domains --timestamps --since-time="${since_time}" >> "${destination}" 2>/dev/null || true
     kubectl logs -n "${namespace}" "${pod}" -c compute-domains --previous --timestamps --since-time="${since_time}" >> "${destination}" 2>/dev/null || true
-  done < <(kubectl get pods -A -l "${TIER_C_KUBELET_SELECTOR}" -o json | jq -r '.items[] | [.metadata.namespace,.metadata.name] | @tsv')
+  done < <(kubelet_pods_json | jq -r '.items[] | [.metadata.namespace,.metadata.name] | @tsv')
 }
 
 collect_driver_logs() {
@@ -464,7 +484,7 @@ for ((trial = 1; trial <= TIER_C_TRIALS; trial++)); do
   fi
   if [[ "${TIER_C_PROVIDER}" == "persistent-agent-v1" ]]; then
     snapshot_count="$(jq --arg uid "${cd_uid}" '[.items[] | select(.spec.computeDomainUID == $uid and .status.phase == "Active")] | length' "${trial_dir}/snapshots.json")"
-    invalid_snapshot_count="$(jq --arg uid "${cd_uid}" --argjson members "${members}" '[.items[] | select(.spec.computeDomainUID == $uid and (.status.phase != "Active" or .status.memberCount != $members))] | length' "${trial_dir}/snapshots.json")"
+    invalid_snapshot_count="$(jq --arg uid "${cd_uid}" --argjson members "${members}" -f "${FIXTURE_DIR}/validate-active-snapshots.jq" "${trial_dir}/snapshots.json")"
     reservation_count="$(jq --arg uid "${cd_uid}" '[.items[] | select(.spec.computeDomainUID == $uid and .status.phase == "Active")] | length' "${trial_dir}/reservations.json")"
     if (( snapshot_count != cliques || invalid_snapshot_count != 0 || reservation_count != cliques )); then
       echo "ERROR: observed ${snapshot_count} Active snapshots, ${invalid_snapshot_count} malformed snapshots, and ${reservation_count} Active reservations; want ${cliques}/0/${cliques}" >&2
