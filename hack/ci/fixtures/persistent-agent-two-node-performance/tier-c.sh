@@ -25,10 +25,10 @@ jq -n \
 
 if [[ "${TIER_C_SCENARIO}" == "cold-domain" ]]; then
   jq -nc --argjson trials "${TIER_C_TRIALS}" '
-    range(1; $trials+1) | {trialID:("smoke-"+tostring),cycleClass:"measured",fenceMS:1000,finalizationMS:1200,reuseReadyMS:1300}' \
+    range(1; $trials+1) | {measurementVersion:"watch-receipt-v1",trialID:("smoke-"+tostring),cycleClass:"measured",fenceMS:1000,finalizationMS:1200,reuseReadyMS:1300}' \
     > "${ARTIFACTS}/lifecycle.jsonl"
 else
-  printf '%s\n' '{"trialID":"retirement","cycleClass":"retirement","fenceMS":1000,"finalizationMS":1200,"reuseReadyMS":1300}' \
+  printf '%s\n' '{"measurementVersion":"watch-receipt-v1","trialID":"retirement","cycleClass":"retirement","fenceMS":1000,"finalizationMS":1200,"reuseReadyMS":1300}' \
     > "${ARTIFACTS}/lifecycle.jsonl"
 fi
 

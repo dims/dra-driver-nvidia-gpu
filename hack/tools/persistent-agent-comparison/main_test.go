@@ -66,7 +66,7 @@ func TestPairedReportPassesAndAttributesDaemonSetChurn(t *testing.T) {
 				encoder := json.NewEncoder(lifecycleFile)
 				if scenario == "cold-domain" {
 					for trial := 1; trial <= 25; trial++ {
-						if err := encoder.Encode(lifecycle{TrialID: fmt.Sprintf("b%d-%s-cold-%03d", block, arm, trial), CycleClass: "measured", FenceMS: 1000, FinalizationMS: 1200, ReuseReadyMS: 1300}); err != nil {
+						if err := encoder.Encode(lifecycle{MeasurementVersion: "watch-receipt-v1", TrialID: fmt.Sprintf("b%d-%s-cold-%03d", block, arm, trial), CycleClass: "measured", FenceMS: 1000, FinalizationMS: 1200, ReuseReadyMS: 1300}); err != nil {
 							t.Fatal(err)
 						}
 					}
@@ -76,6 +76,9 @@ func TestPairedReportPassesAndAttributesDaemonSetChurn(t *testing.T) {
 				}
 				if arm == "M" && scenario == "cold-domain" {
 					if err := os.WriteFile(filepath.Join(directory, "daemonset-watch.json"), []byte(`{"type":"ADDED"}`), 0o644); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(directory, "daemonset-watch-receipts.json"), []byte(`{"observedAtEpochMS":1,"type":"ADDED"}`), 0o644); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -129,5 +132,14 @@ func TestManifestRejectsThirdArm(t *testing.T) {
 	}
 	if _, err := readManifest(path); err == nil {
 		t.Fatal("expected third arm to be rejected")
+	}
+}
+
+func TestValidateLifecycleMeasurement(t *testing.T) {
+	if err := validateLifecycleMeasurement(lifecycle{}); err == nil {
+		t.Fatal("expected a polling-version lifecycle to be rejected")
+	}
+	if err := validateLifecycleMeasurement(lifecycle{MeasurementVersion: watchReceiptMeasurementVersion}); err != nil {
+		t.Fatalf("watch-receipt lifecycle was rejected: %v", err)
 	}
 }

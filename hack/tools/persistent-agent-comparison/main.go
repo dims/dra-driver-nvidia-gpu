@@ -69,12 +69,15 @@ type timeline struct {
 }
 
 type lifecycle struct {
-	TrialID        string  `json:"trialID"`
-	CycleClass     string  `json:"cycleClass"`
-	ReuseReadyMS   float64 `json:"reuseReadyMS"`
-	FenceMS        float64 `json:"fenceMS"`
-	FinalizationMS float64 `json:"finalizationMS"`
+	MeasurementVersion string  `json:"measurementVersion"`
+	TrialID            string  `json:"trialID"`
+	CycleClass         string  `json:"cycleClass"`
+	ReuseReadyMS       float64 `json:"reuseReadyMS"`
+	FenceMS            float64 `json:"fenceMS"`
+	FinalizationMS     float64 `json:"finalizationMS"`
 }
+
+const watchReceiptMeasurementVersion = "watch-receipt-v1"
 
 type statistics struct {
 	Count        int     `json:"count"`
@@ -267,6 +270,9 @@ func buildReport(opts options, rows []manifestRow) (report, error) {
 		}
 		for _, item := range lifecycles {
 			if item.CycleClass == "measured" {
+				if err := validateLifecycleMeasurement(item); err != nil {
+					return report{}, fmt.Errorf("%s: %w", row.LifecyclePath, err)
+				}
 				b.lifecycles = append(b.lifecycles, item)
 			}
 		}
@@ -510,6 +516,13 @@ func acceptanceChecks(result report) []check {
 		)
 	}
 	return checks
+}
+
+func validateLifecycleMeasurement(item lifecycle) error {
+	if item.MeasurementVersion != watchReceiptMeasurementVersion {
+		return fmt.Errorf("D0-D4 measurement version %q, want %s", item.MeasurementVersion, watchReceiptMeasurementVersion)
+	}
+	return nil
 }
 
 func readLifecycle(path string) ([]lifecycle, error) {

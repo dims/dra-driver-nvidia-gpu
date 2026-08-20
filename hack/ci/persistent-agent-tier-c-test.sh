@@ -208,6 +208,8 @@ mkdir -p "${ARTIFACTS}"
 
 CURRENT_NAMESPACE=""
 WATCH_PIDS=()
+WATCH_PROCESSOR_PIDS=()
+WATCH_FIFOS=()
 
 stop_watches() {
   local pid
@@ -215,7 +217,15 @@ stop_watches() {
     kill "${pid}" > /dev/null 2>&1 || true
     wait "${pid}" > /dev/null 2>&1 || true
   done
+  # Killing the kubectl producers closes their FIFOs. Let tee and jq consume
+  # the final complete event before inspecting the receipt files.
+  for pid in "${WATCH_PROCESSOR_PIDS[@]:-}"; do
+    wait "${pid}" > /dev/null 2>&1 || true
+  done
+  rm -f "${WATCH_FIFOS[@]:-}"
   WATCH_PIDS=()
+  WATCH_PROCESSOR_PIDS=()
+  WATCH_FIFOS=()
 }
 
 now_epoch_ms() {
@@ -487,32 +497,44 @@ run_data_plane_for_cycle() {
   esac
 }
 
+start_timestamped_watch() {
+  local destination="$1"
+  local receipts="${destination%.json}-receipts.json"
+  local fifo="${destination}.fifo"
+  shift
+
+  rm -f "${fifo}"
+  mkfifo "${fifo}"
+  WATCH_FIFOS+=("${fifo}")
+  "$@" --watch --output-watch-events -o json > "${fifo}" 2> "${destination}.error" &
+  WATCH_PIDS+=("$!")
+  (
+    tee "${destination}" < "${fifo}" |
+      jq --unbuffered -c '{observedAtEpochMS: ((now * 1000) | floor), type: .type, object: .object}'
+  ) > "${receipts}" 2>> "${destination}.error" &
+  WATCH_PROCESSOR_PIDS+=("$!")
+}
+
 start_trial_watches() {
   local directory="$1"
   local namespace="$2"
   local selector="$3"
   local cd_uid="$4"
 
-  kubectl get pods -n "${namespace}" -l "${selector}" --watch --output-watch-events -o json > "${directory}/pod-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get resourceclaims -n "${namespace}" --watch --output-watch-events -o json > "${directory}/claim-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get computedomains -n "${namespace}" --watch --output-watch-events -o json > "${directory}/computedomain-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get daemonsets -A -l "resource.nvidia.com/computeDomain=${cd_uid}" --watch --output-watch-events -o json > "${directory}/daemonset-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get pods -A -l "resource.nvidia.com/computeDomain=${cd_uid}" --watch --output-watch-events -o json > "${directory}/driver-pod-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get resourceclaimtemplates -A -l "resource.nvidia.com/computeDomain=${cd_uid}" --watch --output-watch-events -o json > "${directory}/template-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get computedomaincliquesnapshots -n "${TIER_C_DRIVER_NAMESPACE}" -l "resource.nvidia.com/computeDomain=${cd_uid}" --watch --output-watch-events -o json > "${directory}/snapshot-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get computedomaincliquereservations -l "resource.nvidia.com/computeDomain=${cd_uid}" --watch --output-watch-events -o json > "${directory}/reservation-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get computedomaincliqueretirementevidences -n "${TIER_C_DRIVER_NAMESPACE}" -l "resource.nvidia.com/computeDomain=${cd_uid}" --watch --output-watch-events -o json > "${directory}/retirement-evidence-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
-  kubectl get nodes -l "${TIER_C_NODE_SELECTOR}" --watch --output-watch-events -o json > "${directory}/node-watch.json" 2>&1 &
-  WATCH_PIDS+=("$!")
+  # Each watch event gets a local receipt timestamp before it is written. The
+  # API objects only expose whole-second transition timestamps, while polling
+  # a dozen resources serially makes the measured result depend on kubectl and
+  # network latency. D1-D3 are derived from these receipt timestamps instead.
+  start_timestamped_watch "${directory}/pod-watch.json" kubectl get pods -n "${namespace}" -l "${selector}"
+  start_timestamped_watch "${directory}/claim-watch.json" kubectl get resourceclaims -n "${namespace}"
+  start_timestamped_watch "${directory}/computedomain-watch.json" kubectl get computedomains -n "${namespace}"
+  start_timestamped_watch "${directory}/daemonset-watch.json" kubectl get daemonsets -A -l "resource.nvidia.com/computeDomain=${cd_uid}"
+  start_timestamped_watch "${directory}/driver-pod-watch.json" kubectl get pods -A -l "resource.nvidia.com/computeDomain=${cd_uid}"
+  start_timestamped_watch "${directory}/template-watch.json" kubectl get resourceclaimtemplates -A -l "resource.nvidia.com/computeDomain=${cd_uid}"
+  start_timestamped_watch "${directory}/snapshot-watch.json" kubectl get computedomaincliquesnapshots -n "${TIER_C_DRIVER_NAMESPACE}" -l "resource.nvidia.com/computeDomain=${cd_uid}"
+  start_timestamped_watch "${directory}/reservation-watch.json" kubectl get computedomaincliquereservations -l "resource.nvidia.com/computeDomain=${cd_uid}"
+  start_timestamped_watch "${directory}/retirement-evidence-watch.json" kubectl get computedomaincliqueretirementevidences -n "${TIER_C_DRIVER_NAMESPACE}" -l "resource.nvidia.com/computeDomain=${cd_uid}"
+  start_timestamped_watch "${directory}/node-watch.json" kubectl get nodes -l "${TIER_C_NODE_SELECTOR}"
 }
 
 capture_object_inventory() {
@@ -562,6 +584,69 @@ cleanup_workload() {
   return 1
 }
 
+retirement_inventory_clean() {
+  local directory="$1"
+  local namespace="$2"
+  local compute_domain_name="$3"
+  local cd_uid="$4"
+  local inventory="${directory}/.retirement-inventory"
+  local -a pids=()
+  local failed=false
+
+  mkdir -p "${inventory}"
+  kubectl get pods,resourceclaims -n "${namespace}" -o json > "${inventory}/workload.json" 2> "${inventory}/workload.error" &
+  pids+=("$!")
+  kubectl get daemonsets,pods,resourceclaimtemplates -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json > "${inventory}/scoped.json" 2> "${inventory}/scoped.error" &
+  pids+=("$!")
+  kubectl get nodes -o json > "${inventory}/nodes.json" 2> "${inventory}/nodes.error" &
+  pids+=("$!")
+  (
+    if kubectl get computedomain -n "${namespace}" "${compute_domain_name}" -o json > "${inventory}/computedomain.json" 2> "${inventory}/computedomain.error"; then
+      exit 0
+    fi
+    if rg -qi 'notfound|not found' "${inventory}/computedomain.error"; then
+      printf '{}\n' > "${inventory}/computedomain.json"
+      exit 0
+    fi
+    exit 1
+  ) &
+  pids+=("$!")
+  if [[ "${TIER_C_PROVIDER}" == "persistent-agent-v1" ]]; then
+    kubectl get computedomaincliquesnapshots,computedomaincliqueretirementevidences -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json > "${inventory}/namespaced-protocol.json" 2> "${inventory}/namespaced-protocol.error" &
+    pids+=("$!")
+    kubectl get computedomaincliquereservations -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json > "${inventory}/reservations.json" 2> "${inventory}/reservations.error" &
+    pids+=("$!")
+  fi
+
+  local pid
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      failed=true
+    fi
+  done
+  if [[ "${failed}" == "true" ]]; then
+    cat "${inventory}"/*.error >&2
+    return 2
+  fi
+
+  local workload scoped domains routes protocol=0
+  workload="$(jq '.items | length' "${inventory}/workload.json")"
+  scoped="$(jq '.items | length' "${inventory}/scoped.json")"
+  domains="$(jq 'if .metadata.uid then 1 else 0 end' "${inventory}/computedomain.json")"
+  routes="$(jq --arg uid "${cd_uid}" '[.items[] | select(
+    .metadata.labels["resource.nvidia.com/computeDomain"] == $uid or
+    .metadata.labels["resource.nvidia.com/persistentAgentComputeDomain"] == $uid or
+    (.metadata.annotations["resource.nvidia.com/computeDomainAttestation"] // "" | contains($uid))
+  )] | length' "${inventory}/nodes.json")"
+  if [[ "${TIER_C_PROVIDER}" == "persistent-agent-v1" ]]; then
+    protocol="$((
+      $(jq '.items | length' "${inventory}/namespaced-protocol.json") +
+      $(jq '.items | length' "${inventory}/reservations.json")
+    ))"
+  fi
+  [[ "${workload}" == "0" && "${scoped}" == "0" && "${domains}" == "0" && "${routes}" == "0" && "${protocol}" == "0" ]]
+}
+
 retire_domain() {
   local directory="$1"
   local namespace="$2"
@@ -569,8 +654,8 @@ retire_domain() {
   local cd_uid="$4"
   local workload_manifest="$5"
   local delete_namespace="$6"
-  local deadline d0_ms d1_ms=0 d2_ms=0 d3_ms=0 d4_ms=0
-  local d0_time d1_time="" d2_time="" d3_time="" d4_time="" d2_source=""
+  local deadline d0_ms d1_ms d2_ms d3_ms d4_ms=0
+  local d0_time d1_time d2_time d3_time d4_time="" d2_source
 
   kubectl delete -f "${workload_manifest}" --ignore-not-found --wait=false > "${directory}/cleanup.log" 2>&1 || true
   kubectl delete computedomain -n "${namespace}" "${compute_domain_name}" --ignore-not-found --wait=false >> "${directory}/cleanup.log" 2>&1
@@ -579,85 +664,72 @@ retire_domain() {
 
   deadline=$((SECONDS + TIER_C_RETIRE_TIMEOUT_SECONDS))
   while (( SECONDS < deadline )); do
-    local pods claims cds routes isolation daemonsets daemonpods templates snapshots reservations evidence
-    pods="$(kubectl get pods -n "${namespace}" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 1)"
-    claims="$(kubectl get resourceclaims -n "${namespace}" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 1)"
-    if (( d1_ms == 0 )) && [[ "${pods}" == "0" && "${claims}" == "0" ]]; then
-      d1_ms="$(now_epoch_ms)"
-      d1_time="$(now_rfc3339_ns)"
+    # Provider watches drive D1-D3. Do not add measurement pressure by polling
+    # the entire retirement inventory while the fence protocol is still
+    # running; one parallel live confirmation after the CD delete event is the
+    # D4 reuse-ready proof.
+    if ! rg -q '"type":"DELETED"' "${directory}/computedomain-watch-receipts.json" 2> /dev/null; then
+      sleep 0.25
+      continue
     fi
-
-    if (( d2_ms == 0 )); then
-      if [[ "${TIER_C_PROVIDER}" == "persistent-agent-v1" ]]; then
-        snapshots="$(kubectl get computedomaincliquesnapshots -n "${TIER_C_DRIVER_NAMESPACE}" -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json)"
-        reservations="$(kubectl get computedomaincliquereservations -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json)"
-        if jq -e '.items | length > 0 and all(.[]; .status.phase == "Fenced")' <<<"${snapshots}" > /dev/null; then
-          d2_ms="$(now_epoch_ms)"
-          d2_time="$(now_rfc3339_ns)"
-          d2_source="snapshot-fenced"
-        elif jq -e '.items | length > 0 and all(.[]; .status.phase == "Released")' <<<"${reservations}" > /dev/null; then
-          d2_ms="$(now_epoch_ms)"
-          d2_time="$(now_rfc3339_ns)"
-          d2_source="reservation-released"
-        fi
-      else
-        daemonsets="$(kubectl get daemonsets -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 1)"
-        daemonpods="$(kubectl get pods -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 1)"
-        if [[ "${daemonsets}" == "0" && "${daemonpods}" == "0" ]]; then
-          d2_ms="$(now_epoch_ms)"
-          d2_time="$(now_rfc3339_ns)"
-          d2_source="per-domain-daemon-gone"
-        fi
-      fi
-    fi
-
-    if kubectl get computedomain -n "${namespace}" "${compute_domain_name}" -o name > "${directory}/retirement-computedomain.txt" 2> "${directory}/retirement-computedomain.error"; then
-      cds=1
-    elif rg -qi 'notfound|not found' "${directory}/retirement-computedomain.error"; then
-      cds=0
-    else
-      cat "${directory}/retirement-computedomain.error" >&2
-      return 1
-    fi
-    if (( d3_ms == 0 )) && [[ "${cds}" == "0" ]]; then
-      d3_ms="$(now_epoch_ms)"
-      d3_time="$(now_rfc3339_ns)"
-      if (( d2_ms == 0 )); then
-        # The controller cannot remove its finalizer before its provider-specific
-        # fence/delete contract completes. Keep the timing conservative when a
-        # short-lived Fenced/Released object fell between polling observations.
-        d2_ms="${d3_ms}"
-        d2_time="${d3_time}"
-        d2_source="compute-domain-finalizer-complete"
-      fi
-    fi
-
-    routes="$(kubectl get nodes -o json | jq --arg uid "${cd_uid}" '[.items[] | select(.metadata.labels["resource.nvidia.com/computeDomain"] == $uid)] | length')"
-    isolation="$(kubectl get nodes -o json | jq --arg uid "${cd_uid}" '[.items[] | select(.metadata.labels["resource.nvidia.com/persistentAgentComputeDomain"] == $uid)] | length')"
-    daemonsets="$(kubectl get daemonsets -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 1)"
-    daemonpods="$(kubectl get pods -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 1)"
-    templates="$(kubectl get resourceclaimtemplates -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 1)"
-    if [[ "${TIER_C_PROVIDER}" == "persistent-agent-v1" ]]; then
-      snapshots="$(kubectl get computedomaincliquesnapshots -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json | jq '.items | length')"
-      reservations="$(kubectl get computedomaincliquereservations -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json | jq '.items | length')"
-      evidence="$(kubectl get computedomaincliqueretirementevidences -A -l "resource.nvidia.com/computeDomain=${cd_uid}" -o json | jq '.items | length')"
-    else
-      snapshots=0
-      reservations=0
-      evidence=0
-    fi
-    if (( d3_ms != 0 )) && [[ "${routes}" == "0" && "${isolation}" == "0" && "${daemonsets}" == "0" && "${daemonpods}" == "0" && "${templates}" == "0" && "${snapshots}" == "0" && "${reservations}" == "0" && "${evidence}" == "0" ]]; then
+    if retirement_inventory_clean "${directory}" "${namespace}" "${compute_domain_name}" "${cd_uid}"; then
       d4_ms="$(now_epoch_ms)"
       d4_time="$(now_rfc3339_ns)"
       break
+    elif (( $? == 2 )); then
+      return 1
     fi
     sleep 0.25
   done
 
-  if (( d1_ms == 0 || d2_ms == 0 || d3_ms == 0 || d4_ms == 0 )); then
-    echo "ERROR: retirement did not reach D0-D4 in ${namespace}: D1=${d1_ms} D2=${d2_ms} D3=${d3_ms} D4=${d4_ms}" >&2
+  if (( d4_ms == 0 )); then
+    echo "ERROR: retirement did not reach reuse-ready D4 in ${namespace}" >&2
     return 1
   fi
+
+  stop_watches
+  local pod_deleted_ms claim_deleted_ms
+  pod_deleted_ms="$(all_objects_deleted_watch_observation_ms "${directory}/pod-watch-receipts.json")"
+  claim_deleted_ms="$(all_objects_deleted_watch_observation_ms "${directory}/claim-watch-receipts.json")"
+  d1_ms="$(max_epoch_ms "${pod_deleted_ms}" "${claim_deleted_ms}")"
+  d3_ms="$(all_objects_deleted_watch_observation_ms "${directory}/computedomain-watch-receipts.json")"
+  if [[ "${TIER_C_PROVIDER}" == "persistent-agent-v1" ]]; then
+    d2_ms="$(all_objects_transition_watch_observation_ms "${directory}/snapshot-watch-receipts.json" Active Fenced)"
+    d2_source="snapshot-fenced-watch"
+    if (( d2_ms == 0 )); then
+      d2_ms="$(all_objects_transition_watch_observation_ms "${directory}/reservation-watch-receipts.json" Active Released)"
+      d2_source="reservation-released-watch"
+    fi
+  else
+    local daemonset_deleted_ms driver_pod_deleted_ms
+    daemonset_deleted_ms="$(all_objects_deleted_watch_observation_ms "${directory}/daemonset-watch-receipts.json")"
+    driver_pod_deleted_ms="$(all_objects_deleted_watch_observation_ms "${directory}/driver-pod-watch-receipts.json")"
+    if (( daemonset_deleted_ms != 0 && driver_pod_deleted_ms != 0 )); then
+      d2_ms="$(max_epoch_ms "${daemonset_deleted_ms}" "${driver_pod_deleted_ms}")"
+    else
+      d2_ms=0
+    fi
+    d2_source="per-domain-daemon-gone-watch"
+  fi
+  # Workloads may already be absent when retiring the shared warm-domain
+  # fixture. Receipt can also precede the delete command response. Preserve
+  # the accepted-request D0 contract and monotonic intervals in both cases.
+  d1_ms="$(max_epoch_ms "${d0_ms}" "${d1_ms}")"
+  if [[ "${TIER_C_SCENARIO}" == "cold-domain" ]] && (( pod_deleted_ms == 0 || claim_deleted_ms == 0 )); then
+    echo "ERROR: timestamped watches did not capture complete workload retirement in ${namespace}: Pods=${pod_deleted_ms} Claims=${claim_deleted_ms}" >&2
+    return 1
+  fi
+  if (( d2_ms == 0 || d3_ms == 0 )); then
+    echo "ERROR: timestamped watches did not capture complete retirement D2/D3 in ${namespace}: D2=${d2_ms} D3=${d3_ms}" >&2
+    return 1
+  fi
+  d2_ms="$(max_epoch_ms "${d0_ms}" "${d2_ms}")"
+  d3_ms="$(max_epoch_ms "${d2_ms}" "${d3_ms}")"
+  d4_ms="$(max_epoch_ms "${d3_ms}" "${d4_ms}")"
+  d1_time="$(epoch_ms_to_rfc3339_ns "${d1_ms}")"
+  d2_time="$(epoch_ms_to_rfc3339_ns "${d2_ms}")"
+  d3_time="$(epoch_ms_to_rfc3339_ns "${d3_ms}")"
+  d4_time="$(epoch_ms_to_rfc3339_ns "${d4_ms}")"
 
   jq -n \
     --arg trialID "${TRIAL_ID}" --arg arm "${TIER_C_ARM}" --arg provider "${TIER_C_PROVIDER}" \
@@ -666,7 +738,7 @@ retire_domain() {
     --arg d0 "${d0_time}" --arg d1 "${d1_time}" --arg d2 "${d2_time}" --arg d3 "${d3_time}" --arg d4 "${d4_time}" \
     --arg d2Source "${d2_source}" \
     --argjson d0MS "${d0_ms}" --argjson d1MS "${d1_ms}" --argjson d2MS "${d2_ms}" --argjson d3MS "${d3_ms}" --argjson d4MS "${d4_ms}" \
-    '{trialID:$trialID,arm:$arm,provider:$provider,scenario:$scenario,cycleClass:$cycleClass,cycle:$cycle,block:$block,d2Source:$d2Source,
+    '{measurementVersion:"watch-receipt-v1",trialID:$trialID,arm:$arm,provider:$provider,scenario:$scenario,cycleClass:$cycleClass,cycle:$cycle,block:$block,d2Source:$d2Source,
       d0:$d0,d1:$d1,d2:$d2,d3:$d3,d4:$d4,
       workloadGoneMS:($d1MS-$d0MS),fenceMS:($d2MS-$d0MS),finalizationMS:($d3MS-$d0MS),reuseReadyMS:($d4MS-$d0MS)}' \
     > "${directory}/lifecycle.json"
@@ -880,6 +952,8 @@ if [[ "${TIER_C_SCENARIO}" == "warm-workload" ]]; then
   TRIAL_ID="${session_id}-retirement"
   CYCLE_CLASS="retirement"
   CYCLE_NUMBER=0
+  start_trial_watches "${retirement_dir}" "${TRIAL_NAMESPACE}" "${pod_selector}" "${shared_cd_uid}"
+  sleep 1
   retire_domain "${retirement_dir}" "${TRIAL_NAMESPACE}" "${COMPUTE_DOMAIN_NAME}" "${shared_cd_uid}" "${shared_workload_manifest:-${trial_dir}/workload.yaml}" true
   CURRENT_NAMESPACE=""
 fi

@@ -57,6 +57,22 @@ wait_for_computedomain_ready tooling-smoke domain 5 0
 [[ "$(<"${MOCK_STATE_DIR}/computedomain-gets")" == "3" ]]
 unset MOCK_COMPUTEDOMAIN_READY_ON
 
+cat > "${TMP_DIR}/watch.json" <<'EOF'
+{"observedAtEpochMS":1000,"type":"ADDED","object":{"metadata":{"uid":"a"},"status":{"phase":"Active"}}}
+{"observedAtEpochMS":1100,"type":"ADDED","object":{"metadata":{"uid":"b"},"status":{"phase":"Active"}}}
+{"observedAtEpochMS":2100,"type":"MODIFIED","object":{"metadata":{"uid":"a"},"status":{"phase":"Fenced"}}}
+{"observedAtEpochMS":2300,"type":"MODIFIED","object":{"metadata":{"uid":"b"},"status":{"phase":"Fenced"}}}
+{"observedAtEpochMS":2500,"type":"DELETED","object":{"metadata":{"uid":"a"},"status":{"phase":"Fenced"}}}
+{"observedAtEpochMS":2700,"type":"DELETED","object":{"metadata":{"uid":"b"},"status":{"phase":"Fenced"}}}
+EOF
+[[ "$(all_objects_transition_watch_observation_ms "${TMP_DIR}/watch.json" Active Fenced)" == "2300" ]]
+[[ "$(all_objects_deleted_watch_observation_ms "${TMP_DIR}/watch.json")" == "2700" ]]
+head -n 3 "${TMP_DIR}/watch.json" > "${TMP_DIR}/incomplete-watch.json"
+[[ "$(all_objects_transition_watch_observation_ms "${TMP_DIR}/incomplete-watch.json" Active Fenced)" == "0" ]]
+[[ "$(all_objects_deleted_watch_observation_ms "${TMP_DIR}/incomplete-watch.json")" == "0" ]]
+[[ "$(max_epoch_ms 2300 2500)" == "2500" ]]
+[[ "$(epoch_ms_to_rfc3339_ns 1000)" == "1970-01-01T00:00:01.000Z" ]]
+
 for smoke_case in success completed notfound; do
   MOCK_SMOKE_CASE="${smoke_case}" \
   TIER_C_TRIAL_NAMESPACE=tooling-smoke \

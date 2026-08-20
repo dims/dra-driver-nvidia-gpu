@@ -80,3 +80,48 @@ kubectl_logs_with_retry() {
   rm -f "${output_file}" "${error_file}"
   return 1
 }
+
+all_objects_deleted_watch_observation_ms() {
+  local path="$1"
+  jq -s -r '
+    ([.[] | .object.metadata.uid] | unique) as $observed
+    | ([.[] | select(.type == "DELETED") | .object.metadata.uid] | unique) as $deleted
+    | if ($observed | length) == 0 or ($observed - $deleted | length) != 0 then 0
+      else [.[] | select(.type == "DELETED") | .observedAtEpochMS] | max
+      end
+  ' "${path}"
+}
+
+all_objects_transition_watch_observation_ms() {
+  local path="$1"
+  local from_phase="$2"
+  local to_phase="$3"
+  jq -s -r --arg from "${from_phase}" --arg to "${to_phase}" '
+    ([.[] | select(.object.status.phase == $from) | .object.metadata.uid] | unique) as $from_objects
+    | ([.[] | select(.object.status.phase == $to) | .object.metadata.uid] | unique) as $to_objects
+    | if ($from_objects | length) == 0 or ($from_objects - $to_objects | length) != 0 then 0
+      else [.[] | select(.object.status.phase == $to) | {uid: .object.metadata.uid, observed: .observedAtEpochMS}]
+        | group_by(.uid)
+        | map([.[].observed] | min)
+        | max
+      end
+  ' "${path}"
+}
+
+epoch_ms_to_rfc3339_ns() {
+  python3 - "$1" <<'PY'
+import datetime
+import sys
+
+value = int(sys.argv[1]) / 1000
+print(datetime.datetime.fromtimestamp(value, datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+PY
+}
+
+max_epoch_ms() {
+  if (( $1 > $2 )); then
+    echo "$1"
+  else
+    echo "$2"
+  fi
+}

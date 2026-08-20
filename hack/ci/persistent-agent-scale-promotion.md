@@ -100,6 +100,18 @@ runs a cheap `nvidia-smi` device smoke; the default cadence runs the heavier
 nvbandwidth check on the first, middle, and final measured cycle of each
 session.
 
+D0 is the accepted delete request. D1–D3 use millisecond receipt timestamps
+attached to the already-running Pod, claim, provider-state, and ComputeDomain
+watches; D4 is a parallel live inventory proving the domain, routes, templates,
+claims, and provider objects are absent. Do not replace this with serial
+`kubectl get` polling: command and network latency then becomes part of the
+measurement, and the persistent-agent arm has more safety objects to inspect.
+Raw `*-watch.json` remains unchanged for event/byte accounting; local timing
+metadata is kept separately in `*-watch-receipts.json`.
+The comparison tool accepts only `measurementVersion: watch-receipt-v1`
+lifecycle records so results from the older polling observer cannot be mixed
+into a promotion report.
+
 Three executable environment-specific hooks are mandatory:
 
 - `PERF_MAIN_INSTALL_HOOK` installs the exact source and image supplied in
