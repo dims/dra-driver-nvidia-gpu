@@ -156,6 +156,21 @@ Then repeat without `PERF_PILOT=true`; the full run enforces the documented
 interval, no branch per-domain DaemonSet creation, D0–D4 bound, sample counts,
 and first-to-last-quartile drift.
 
+To confirm a retirement-only harness or controller fix without rerunning warm
+workload, use the same mandatory source/image/hook variables and add:
+
+```bash
+PERF_RETIREMENT_CONFIRMATION=true \
+PERF_TRIALS=6 \
+PERF_WARMUPS=2 \
+  make test-persistent-agent-two-node-performance
+```
+
+This mode is exactly one balanced block, runs only `cold-domain` for M and B,
+does not enforce promotion thresholds, and writes the twelve measured rows to
+`comparison/retirement-confirmation.csv`. It is a fix-confirmation shortcut,
+not promotion evidence; the complete balanced run remains mandatory.
+
 On the first installation of each arm the orchestrator also samples driver Pod
 CPU/memory with `kubectl top --containers` every five seconds for 15 minutes.
 The pilot caps this at ten seconds. If metrics.k8s.io or authorization is not

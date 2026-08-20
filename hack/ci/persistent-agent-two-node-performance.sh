@@ -43,6 +43,7 @@ PERF_TRIALS="${PERF_TRIALS:-25}"
 PERF_WARMUPS="${PERF_WARMUPS:-2}"
 PERF_PILOT="${PERF_PILOT:-false}"
 PERF_ENFORCE="${PERF_ENFORCE:-true}"
+PERF_RETIREMENT_CONFIRMATION="${PERF_RETIREMENT_CONFIRMATION:-false}"
 PERF_DRIVER_NAMESPACE="${PERF_DRIVER_NAMESPACE:-nvidia-dra-driver-gpu}"
 PERF_MAIN_DRIVER_IMAGE="${PERF_MAIN_DRIVER_IMAGE:-}"
 PERF_BRANCH_DRIVER_IMAGE="${PERF_BRANCH_DRIVER_IMAGE:-}"
@@ -102,6 +103,10 @@ if (( PERF_IDLE_SAMPLE_SECONDS < 1 )); then
   echo "ERROR: PERF_IDLE_SAMPLE_SECONDS must be positive" >&2
   exit 1
 fi
+if [[ "${PERF_PILOT}" == "true" && "${PERF_RETIREMENT_CONFIRMATION}" == "true" ]]; then
+  echo "ERROR: PERF_PILOT and PERF_RETIREMENT_CONFIRMATION are mutually exclusive" >&2
+  exit 1
+fi
 if [[ "${PERF_PILOT}" == "true" ]]; then
   PERF_BLOCKS=1
   PERF_TRIALS=5
@@ -111,6 +116,14 @@ if [[ "${PERF_PILOT}" == "true" ]]; then
   fi
 elif [[ "${PERF_PILOT}" != "false" ]]; then
   echo "ERROR: PERF_PILOT must be true or false" >&2
+  exit 1
+fi
+if [[ "${PERF_RETIREMENT_CONFIRMATION}" == "true" ]]; then
+  PERF_BLOCKS=1
+  PERF_ENFORCE=false
+  PERF_IDLE_SECONDS=0
+elif [[ "${PERF_RETIREMENT_CONFIRMATION}" != "false" ]]; then
+  echo "ERROR: PERF_RETIREMENT_CONFIRMATION must be true or false" >&2
   exit 1
 fi
 if [[ "${PERF_ENFORCE}" != "true" && "${PERF_ENFORCE}" != "false" ]]; then
@@ -168,6 +181,7 @@ kubectl get nodes -l "${PERF_NODE_SELECTOR}" -o yaml > "${ARTIFACTS}/source/node
   echo "blocks=${PERF_BLOCKS}"
   echo "trials_per_block=${PERF_TRIALS}"
   echo "warmups_per_install=${PERF_WARMUPS}"
+  echo "retirement_confirmation=${PERF_RETIREMENT_CONFIRMATION}"
   echo "node_selector=${PERF_NODE_SELECTOR}"
   echo "t0_mode=${PERF_T0_MODE}"
 } > "${ARTIFACTS}/source/run.txt"
@@ -340,7 +354,9 @@ run_arm() {
     capture_idle_usage "${arm_dir}/idle"
   fi
 
-  if (( block % 2 == 1 )); then
+  if [[ "${PERF_RETIREMENT_CONFIRMATION}" == "true" ]]; then
+    run_scenario "${block}" "${arm}" "${provider}" cold-domain "${source_worktree}" "${arm_dir}/cold-domain"
+  elif (( block % 2 == 1 )); then
     run_scenario "${block}" "${arm}" "${provider}" cold-domain "${source_worktree}" "${arm_dir}/cold-domain"
     run_scenario "${block}" "${arm}" "${provider}" warm-workload "${source_worktree}" "${arm_dir}/warm-workload"
   else
@@ -361,6 +377,24 @@ for ((block = 1; block <= PERF_BLOCKS; block++)); do
     run_arm "${block}" M
   fi
 done
+
+if [[ "${PERF_RETIREMENT_CONFIRMATION}" == "true" ]]; then
+  confirmation="${ARTIFACTS}/comparison/retirement-confirmation.csv"
+  printf '%s\n' 'block,arm,trial_id,d2_source,fence_ms,finalization_ms,reuse_ready_ms,measurement_version' > "${confirmation}"
+  while IFS=, read -r block arm scenario _ lifecycle _; do
+    [[ "${scenario}" == "cold-domain" ]] || continue
+    jq -r --arg block "${block}" --arg arm "${arm}" '
+      select(.cycleClass == "measured")
+      | [$block, $arm, .trialID, .d2Source, .fenceMS, .finalizationMS, .reuseReadyMS, .measurementVersion]
+      | @csv
+    ' "${lifecycle}" >> "${confirmation}"
+  done < <(tail -n +2 "${manifest}")
+  failed=false
+  trap - EXIT
+  echo "PASS: main versus latest-branch retirement confirmation run"
+  echo "Raw D0-D4: ${confirmation}"
+  exit 0
+fi
 
 comparison_args=(
   --manifest "${manifest}"

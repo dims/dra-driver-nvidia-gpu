@@ -57,4 +57,28 @@ jq -e '.passed == true and .expectedBlocks == 1 and .expectedTrialsPerBlock == 5
   "${TMP_DIR}/artifacts/comparison/comparison.json" > /dev/null
 test "$(wc -l < "${TMP_DIR}/artifacts/manifest.csv" | tr -d ' ')" = 5
 test "$(wc -l < "${TMP_DIR}/artifacts/installations.csv" | tr -d ' ')" = 3
+
+PATH="${TMP_DIR}/bin:${PATH}" \
+ARTIFACTS="${TMP_DIR}/retirement-confirmation" \
+PERF_RETIREMENT_CONFIRMATION=true \
+PERF_TRIALS=6 \
+PERF_WARMUPS=2 \
+PERF_MAIN_WORKTREE="${TMP_DIR}/main" \
+PERF_MAIN_SHA="${main_sha}" \
+PERF_MAIN_REF=HEAD \
+PERF_BRANCH_WORKTREE="${TMP_DIR}/branch" \
+PERF_BRANCH_SHA="${branch_sha}" \
+PERF_BRANCH_REF=HEAD \
+PERF_MAIN_DRIVER_IMAGE=main@sha256:smoke \
+PERF_BRANCH_DRIVER_IMAGE=branch@sha256:smoke \
+PERF_MAIN_INSTALL_HOOK="${FIXTURES}/hook.sh" \
+PERF_BRANCH_INSTALL_HOOK="${FIXTURES}/hook.sh" \
+PERF_DECOMMISSION_HOOK="${FIXTURES}/hook.sh" \
+PERF_TIER_C_RUNNER="${FIXTURES}/tier-c.sh" \
+PERF_NODE_SELECTOR=scale-promotion.nvidia.com/tier-c=true \
+  bash "${SCRIPT_DIR}/persistent-agent-two-node-performance.sh"
+
+test "$(wc -l < "${TMP_DIR}/retirement-confirmation/manifest.csv" | tr -d ' ')" = 3
+test "$(wc -l < "${TMP_DIR}/retirement-confirmation/comparison/retirement-confirmation.csv" | tr -d ' ')" = 13
+test "$(wc -l < "${TMP_DIR}/retirement-confirmation/installations.csv" | tr -d ' ')" = 3
 echo "PASS: two-Node performance orchestration smoke"
