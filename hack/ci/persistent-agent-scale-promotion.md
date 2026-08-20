@@ -19,7 +19,9 @@ Run the analyzer unit tests and shell checks:
 ```bash
 go test ./hack/tools/persistent-agent-timeline ./hack/tools/persistent-agent-comparison -count=1
 shellcheck \
+  hack/ci/persistent-agent-tier-c-lib.sh \
   hack/ci/persistent-agent-tier-c-test.sh \
+  hack/ci/persistent-agent-tier-c-tooling-smoke-test.sh \
   hack/ci/persistent-agent-tier-c-kind-smoke-test.sh \
   hack/ci/persistent-agent-tier-c-nvbandwidth.sh \
   hack/ci/persistent-agent-tier-d-test.sh \
@@ -28,6 +30,12 @@ shellcheck \
   hack/ci/persistent-agent-two-node-smoke.sh
 make test-persistent-agent-two-node-performance-smoke
 ```
+
+The smoke target includes regressions for long MPIJob-derived names, transient
+log collection failures, and workload Pods completing while the device smoke
+is in progress. The real Tier C runner waits separately for the ComputeDomain
+to become Ready and keeps the default 1 KiB nvbandwidth payload alive for 2,000
+samples so that status convergence can be observed before MPI cleanup.
 
 Run the Kind Tier C smoke. It uses real Pod conditions but synthetic claims and
 NodePrepare timestamps, so its generated README labels the result correctly:

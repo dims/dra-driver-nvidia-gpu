@@ -298,6 +298,7 @@ test-persistent-agent-two-node-performance:
 
 .PHONY: test-persistent-agent-two-node-performance-smoke
 test-persistent-agent-two-node-performance-smoke:
+	bash hack/ci/persistent-agent-tier-c-tooling-smoke-test.sh
 	bash hack/ci/persistent-agent-two-node-performance-smoke-test.sh
 
 # Run the 280x18 virtual-node control-plane profile over an explicit stable

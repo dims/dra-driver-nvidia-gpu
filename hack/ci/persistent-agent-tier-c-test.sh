@@ -23,6 +23,8 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 FIXTURE_DIR="${SCRIPT_DIR}/fixtures/persistent-agent-tier-c"
+# shellcheck source=hack/ci/persistent-agent-tier-c-lib.sh
+source "${SCRIPT_DIR}/persistent-agent-tier-c-lib.sh"
 TIER_C_SOURCE_WORKTREE="${TIER_C_SOURCE_WORKTREE:-${REPO_ROOT}}"
 SHORT_SHA="$(git -C "${TIER_C_SOURCE_WORKTREE}" rev-parse --short=12 HEAD)"
 HARNESS_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
@@ -45,7 +47,10 @@ TIER_C_DRIVER_NAMESPACE="${TIER_C_DRIVER_NAMESPACE:-nvidia-dra-driver-gpu}"
 TIER_C_KUBELET_SELECTOR="${TIER_C_KUBELET_SELECTOR:-}"
 TIER_C_AGENT_SELECTOR="${TIER_C_AGENT_SELECTOR:-resource.nvidia.com/persistentComputeDomainAgent=true}"
 TIER_C_TIMEOUT_SECONDS="${TIER_C_TIMEOUT_SECONDS:-1800}"
+TIER_C_COMPUTE_DOMAIN_READY_TIMEOUT_SECONDS="${TIER_C_COMPUTE_DOMAIN_READY_TIMEOUT_SECONDS:-120}"
 TIER_C_RETIRE_TIMEOUT_SECONDS="${TIER_C_RETIRE_TIMEOUT_SECONDS:-600}"
+TIER_C_LOG_RETRY_ATTEMPTS="${TIER_C_LOG_RETRY_ATTEMPTS:-3}"
+TIER_C_LOG_RETRY_DELAY_SECONDS="${TIER_C_LOG_RETRY_DELAY_SECONDS:-2}"
 TIER_C_T0_MODE="${TIER_C_T0_MODE:-creationTimestamp}"
 TIER_C_AUDIT_LOG="${TIER_C_AUDIT_LOG:-}"
 TIER_C_CLOCK_SKEW_FILE="${TIER_C_CLOCK_SKEW_FILE:-}"
@@ -62,7 +67,7 @@ TIER_C_POD_SELECTOR_TEMPLATE="${TIER_C_POD_SELECTOR_TEMPLATE:-resource.nvidia.co
 TIER_C_WORKLOAD_IMAGE="${TIER_C_WORKLOAD_IMAGE:-registry.k8s.io/e2e-test-images/agnhost:2.53}"
 KEEP_FAILED_FIXTURE="${KEEP_FAILED_FIXTURE:-true}"
 
-for tool in date envsubst git go jq kubectl python3 tee yq; do
+for tool in date envsubst git go jq kubectl python3 rg tee yq; do
   if ! command -v "${tool}" > /dev/null 2>&1; then
     echo "ERROR: ${tool} is required" >&2
     exit 1
@@ -85,7 +90,7 @@ export EXPECTED_PODS
 NVB_IMAGE="${NVB_IMAGE:-ghcr.io/nvidia/k8s-samples:nvbandwidth-6dc12f17}"
 NVB_GPUS_PER_NODE="${NVB_GPUS_PER_NODE:-1}"
 NVB_NUM_RANKS="${NVB_NUM_RANKS:-$((EXPECTED_PODS * NVB_GPUS_PER_NODE))}"
-NVB_REPS_PER_BENCHMARK="${NVB_REPS_PER_BENCHMARK:-5}"
+NVB_REPS_PER_BENCHMARK="${NVB_REPS_PER_BENCHMARK:-2000}"
 NVB_BUFSIZE_PER_BENCHMARK_REP="${NVB_BUFSIZE_PER_BENCHMARK_REP:-1024}"
 export NVB_IMAGE NVB_GPUS_PER_NODE NVB_NUM_RANKS NVB_REPS_PER_BENCHMARK NVB_BUFSIZE_PER_BENCHMARK_REP
 
@@ -99,6 +104,18 @@ if [[ ! "${TIER_C_WARMUP_TRIALS}" =~ ^[0-9]+$ ]]; then
 fi
 if [[ ! "${TIER_C_BLOCK}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: TIER_C_BLOCK must be zero or positive" >&2
+  exit 1
+fi
+if [[ ! "${TIER_C_COMPUTE_DOMAIN_READY_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: TIER_C_COMPUTE_DOMAIN_READY_TIMEOUT_SECONDS must be positive" >&2
+  exit 1
+fi
+if [[ ! "${TIER_C_LOG_RETRY_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: TIER_C_LOG_RETRY_ATTEMPTS must be positive" >&2
+  exit 1
+fi
+if [[ ! "${TIER_C_LOG_RETRY_DELAY_SECONDS}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: TIER_C_LOG_RETRY_DELAY_SECONDS must be zero or positive" >&2
   exit 1
 fi
 case "${TIER_C_SCENARIO}" in
@@ -326,6 +343,11 @@ fi
   echo "workload_image=${TIER_C_WORKLOAD_IMAGE}"
   echo "nvbandwidth_image=${NVB_IMAGE}"
   echo "nvbandwidth_gpus_per_node=${NVB_GPUS_PER_NODE}"
+  echo "nvbandwidth_reps_per_benchmark=${NVB_REPS_PER_BENCHMARK}"
+  echo "nvbandwidth_buffer_size_per_rep=${NVB_BUFSIZE_PER_BENCHMARK_REP}"
+  echo "computedomain_ready_timeout_seconds=${TIER_C_COMPUTE_DOMAIN_READY_TIMEOUT_SECONDS}"
+  echo "log_retry_attempts=${TIER_C_LOG_RETRY_ATTEMPTS}"
+  echo "log_retry_delay_seconds=${TIER_C_LOG_RETRY_DELAY_SECONDS}"
   echo "data_plane_script=${TIER_C_DATA_PLANE_SCRIPT:-none}"
   echo "data_plane_cadence=${TIER_C_DATA_PLANE_CADENCE}"
   echo "smoke_script=${TIER_C_SMOKE_SCRIPT:-none}"
@@ -385,10 +407,15 @@ collect_kubelet_logs() {
   local since_time="$1"
   local destination="$2"
   : > "${destination}"
+  : > "${destination}.error"
   local pod namespace
   while IFS=$'\t' read -r namespace pod; do
-    kubectl logs -n "${namespace}" "${pod}" -c compute-domains --timestamps --since-time="${since_time}" >> "${destination}" 2>/dev/null || true
-    kubectl logs -n "${namespace}" "${pod}" -c compute-domains --previous --timestamps --since-time="${since_time}" >> "${destination}" 2>/dev/null || true
+    kubectl_logs_with_retry "${TIER_C_LOG_RETRY_ATTEMPTS}" "${TIER_C_LOG_RETRY_DELAY_SECONDS}" \
+      -n "${namespace}" "${pod}" -c compute-domains --timestamps --since-time="${since_time}" \
+      >> "${destination}" 2>> "${destination}.error" || true
+    kubectl_logs_with_retry "${TIER_C_LOG_RETRY_ATTEMPTS}" "${TIER_C_LOG_RETRY_DELAY_SECONDS}" \
+      -n "${namespace}" "${pod}" -c compute-domains --previous --timestamps --since-time="${since_time}" \
+      >> "${destination}" 2>> "${destination}.error" || true
   done < <(kubelet_pods_json | jq -r '.items[] | [.metadata.namespace,.metadata.name] | @tsv')
 }
 
@@ -398,12 +425,16 @@ collect_driver_logs() {
   mkdir -p "${destination}"
   local pod container
   while IFS=$'\t' read -r pod container; do
-    kubectl logs -n "${TIER_C_DRIVER_NAMESPACE}" "${pod}" -c "${container}" \
+    kubectl_logs_with_retry "${TIER_C_LOG_RETRY_ATTEMPTS}" "${TIER_C_LOG_RETRY_DELAY_SECONDS}" \
+      -n "${TIER_C_DRIVER_NAMESPACE}" "${pod}" -c "${container}" \
       --timestamps --since-time="${since_time}" \
-      > "${destination}/${pod}-${container}.log" 2>&1 || true
-    kubectl logs -n "${TIER_C_DRIVER_NAMESPACE}" "${pod}" -c "${container}" \
+      > "${destination}/${pod}-${container}.log" \
+      2> "${destination}/${pod}-${container}.log.error" || true
+    kubectl_logs_with_retry "${TIER_C_LOG_RETRY_ATTEMPTS}" "${TIER_C_LOG_RETRY_DELAY_SECONDS}" \
+      -n "${TIER_C_DRIVER_NAMESPACE}" "${pod}" -c "${container}" \
       --previous --timestamps --since-time="${since_time}" \
-      > "${destination}/${pod}-${container}.previous.log" 2>&1 || true
+      > "${destination}/${pod}-${container}.previous.log" \
+      2> "${destination}/${pod}-${container}.previous.log.error" || true
   done < <(kubectl get pods -n "${TIER_C_DRIVER_NAMESPACE}" -o json | jq -r '.items[] | .metadata.name as $pod | .spec.containers[].name | [$pod,.] | @tsv')
 }
 
@@ -651,7 +682,7 @@ provider_slug="${TIER_C_PROVIDER%-v1}"
 arm_slug="$(tr '[:upper:]' '[:lower:]' <<<"${TIER_C_ARM}" | tr -cd 'a-z0-9-')"
 scenario_slug="${TIER_C_SCENARIO//-}"
 session_id="pa-${arm_slug:-x}-b${TIER_C_BLOCK}-${provider_slug}-${scenario_slug}-${SHORT_SHA}-$$"
-session_id="${session_id:0:52}"
+session_id="$(truncate_dns_label "${session_id}" 52)"
 base_dir="${ARTIFACTS}/${TIER_C_PROVIDER}/${TIER_C_SHAPE}"
 TOTAL_TRIALS=$((TIER_C_WARMUP_TRIALS + TIER_C_TRIALS))
 shared_cd_uid=""
@@ -661,9 +692,9 @@ if [[ "${TIER_C_SCENARIO}" == "warm-workload" ]]; then
   TRIAL_ID="${session_id}"
   TRIAL_NAMESPACE="${session_id}"
   COMPUTE_DOMAIN_NAME="cd-${session_id}"
-  COMPUTE_DOMAIN_NAME="${COMPUTE_DOMAIN_NAME:0:63}"
+  COMPUTE_DOMAIN_NAME="$(truncate_dns_label "${COMPUTE_DOMAIN_NAME}" 63)"
   CHANNEL_TEMPLATE_NAME="channel-${session_id}"
-  CHANNEL_TEMPLATE_NAME="${CHANNEL_TEMPLATE_NAME:0:63}"
+  CHANNEL_TEMPLATE_NAME="$(truncate_dns_label "${CHANNEL_TEMPLATE_NAME}" 63)"
   WORKLOAD_NAME="setup"
   WORKLOAD_IMAGE="${TIER_C_WORKLOAD_IMAGE}"
   export TRIAL_ID TRIAL_NAMESPACE COMPUTE_DOMAIN_NAME CHANNEL_TEMPLATE_NAME WORKLOAD_NAME WORKLOAD_IMAGE
@@ -699,16 +730,17 @@ for ((cycle = 1; cycle <= TOTAL_TRIALS; cycle++)); do
   fi
   cycle_id="$(printf '%03d' "${CYCLE_NUMBER}")"
   TRIAL_ID="${session_id}-${CYCLE_CLASS:0:1}${cycle_id}"
-  TRIAL_ID="${TRIAL_ID:0:63}"
+  TRIAL_ID="$(truncate_dns_label "${TRIAL_ID}" 63)"
   if [[ "${TIER_C_SCENARIO}" == "cold-domain" ]]; then
     TRIAL_NAMESPACE="${TRIAL_ID}"
     COMPUTE_DOMAIN_NAME="cd-${TRIAL_ID}"
-    COMPUTE_DOMAIN_NAME="${COMPUTE_DOMAIN_NAME:0:63}"
+    COMPUTE_DOMAIN_NAME="$(truncate_dns_label "${COMPUTE_DOMAIN_NAME}" 63)"
     CHANNEL_TEMPLATE_NAME="channel-${TRIAL_ID}"
-    CHANNEL_TEMPLATE_NAME="${CHANNEL_TEMPLATE_NAME:0:63}"
+    CHANNEL_TEMPLATE_NAME="$(truncate_dns_label "${CHANNEL_TEMPLATE_NAME}" 63)"
   fi
   WORKLOAD_NAME="workload-${TRIAL_ID}"
-  WORKLOAD_NAME="${WORKLOAD_NAME:0:63}"
+  # MPI Operator appends -worker-<index>; 52 leaves room through index 999.
+  WORKLOAD_NAME="$(truncate_dns_label "${WORKLOAD_NAME}" 52)"
   WORKLOAD_IMAGE="${TIER_C_WORKLOAD_IMAGE}"
   export TRIAL_ID TRIAL_NAMESPACE COMPUTE_DOMAIN_NAME CHANNEL_TEMPLATE_NAME WORKLOAD_NAME WORKLOAD_IMAGE CYCLE_CLASS CYCLE_NUMBER
   # shellcheck disable=SC2016 # envsubst needs the literal variable name.
@@ -751,6 +783,9 @@ for ((cycle = 1; cycle <= TOTAL_TRIALS; cycle++)); do
   trial_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   kubectl apply -f "${trial_dir}/workload.yaml" > "${trial_dir}/apply-workload.txt"
   wait_for_ready_pods "${TRIAL_NAMESPACE}" "${pod_selector}"
+  run_trial_hook "${TIER_C_SMOKE_SCRIPT}" smoke "${trial_dir}"
+  wait_for_computedomain_ready "${TRIAL_NAMESPACE}" "${COMPUTE_DOMAIN_NAME}" \
+    "${TIER_C_COMPUTE_DOMAIN_READY_TIMEOUT_SECONDS}"
 
   kubectl get pods -n "${TRIAL_NAMESPACE}" -l "${pod_selector}" -o json > "${trial_dir}/pods.json"
   kubectl get resourceclaims -n "${TRIAL_NAMESPACE}" -o json > "${trial_dir}/claims.json"
@@ -818,7 +853,6 @@ for ((cycle = 1; cycle <= TOTAL_TRIALS; cycle++)); do
   fi
   go run ./hack/tools/persistent-agent-timeline "${analyzer_args[@]}"
 
-  run_trial_hook "${TIER_C_SMOKE_SCRIPT}" smoke "${trial_dir}"
   if run_data_plane_for_cycle "${measured_index}"; then
     run_trial_hook "${TIER_C_DATA_PLANE_SCRIPT}" data-plane "${trial_dir}"
   else

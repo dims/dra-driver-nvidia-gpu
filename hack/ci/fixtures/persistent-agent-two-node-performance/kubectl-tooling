@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Synthetic kubectl used only by the Tier C tooling regression test.
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${MOCK_STATE_DIR:?}"
+
+case "${1:-}" in
+  logs)
+    count_file="${MOCK_STATE_DIR}/log-attempts"
+    count=0
+    if [[ -f "${count_file}" ]]; then
+      count="$(<"${count_file}")"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "${count}" > "${count_file}"
+    if [[ "${MOCK_LOG_PERMANENT:-false}" == "true" ]]; then
+      echo 'previous terminated container "compute-domains" not found' >&2
+      exit 1
+    fi
+    if (( count < ${MOCK_LOG_SUCCEED_ON:-1} )); then
+      echo "transient log failure ${count}" >&2
+      exit 1
+    fi
+    echo "complete log payload"
+    ;;
+  exec)
+    if [[ "${MOCK_SMOKE_CASE:-success}" == "success" ]]; then
+      exit 0
+    fi
+    echo "synthetic exec failure" >&2
+    exit 1
+    ;;
+  get)
+    case "${2:-}" in
+      pods)
+        printf '%s\n' '{"items":[{"metadata":{"name":"worker-0"}},{"metadata":{"name":"worker-1"}}]}'
+        ;;
+      pod)
+        case "${MOCK_SMOKE_CASE:-success}" in
+          completed)
+            printf '%s\n' '{"status":{"phase":"Succeeded","containerStatuses":[{"name":"mpi-worker","state":{"terminated":{}}}]}}'
+            ;;
+          notfound)
+            echo 'Error from server (NotFound): pods "worker" not found' >&2
+            exit 1
+            ;;
+          running)
+            printf '%s\n' '{"status":{"phase":"Running","containerStatuses":[{"name":"mpi-worker","state":{"running":{"startedAt":"2026-08-20T00:00:00Z"}}}]}}'
+            ;;
+          *)
+            echo "ERROR: unsupported smoke case ${MOCK_SMOKE_CASE:-}" >&2
+            exit 1
+            ;;
+        esac
+        ;;
+      computedomain)
+        count_file="${MOCK_STATE_DIR}/computedomain-gets"
+        count=0
+        if [[ -f "${count_file}" ]]; then
+          count="$(<"${count_file}")"
+        fi
+        count=$((count + 1))
+        printf '%s\n' "${count}" > "${count_file}"
+        if (( count < ${MOCK_COMPUTEDOMAIN_READY_ON:-1} )); then
+          printf '%s\n' '{"status":{"status":"NotReady"}}'
+        else
+          printf '%s\n' '{"status":{"status":"Ready"}}'
+        fi
+        ;;
+      *)
+        echo "ERROR: unexpected get resource ${2:-}" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "ERROR: unexpected tooling kubectl invocation: $*" >&2
+    exit 1
+    ;;
+esac
